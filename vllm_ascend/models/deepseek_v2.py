@@ -39,7 +39,7 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce,
                               tensor_model_parallel_reduce_scatter)
-from vllm.distributed.parallel_state import get_dp_group,get_world_group,get_ae_group_new,DefaultProcessGroupSwitcher,get_new_default_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group,get_world_group,get_ae_group_new,DefaultProcessGroupSwitcher,get_new_default_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
