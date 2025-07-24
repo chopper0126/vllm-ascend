@@ -148,6 +148,8 @@ class NPUPlatform(Platform):
             parallel_config.expert_parallel_size = (
                 parallel_config.world_size_across_dp //
                 parallel_config.expert_tensor_parallel_size)
+            if parallel_config.enable_attn_export_split:
+                parallel_config.expert_parallel_size = parallel_config.expert_parallel_size // 2
 
         if model_config is None:
             logger.warning("Model config is missing. This may indicate "
