@@ -8,6 +8,7 @@ from vllm.distributed.parallel_state import (GroupCoordinator, get_world_group,
 # customize parallel solution
 _EP: Optional[GroupCoordinator] = None
 _ETP: Optional[GroupCoordinator] = None
+_AE: Optional[GroupCoordinator] = None
 
 
 def get_ep_group() -> GroupCoordinator:
@@ -19,6 +20,10 @@ def get_etp_group() -> GroupCoordinator:
     assert _ETP is not None, (
         "expert tensor parallel group is not initialized")
     return _ETP
+
+def get_ae_group() -> GroupCoordinator:
+    assert _AE is not None, ("tensor model parallel group is not initialized")
+    return _AE  
 
 
 def model_parallel_initialized():
@@ -122,16 +127,16 @@ def init_ascend_model_parallel_for_AE_split(
     #                                     backend,
     #                                     group_name="tp")
     
-    # global _AE
-    # group_ranks = []
-    # for i in range(expert_parallel_size):
-    #     ranks = list(range(i, expert_parallel_size * 2, expert_parallel_size))
-    #     group_ranks.append(ranks)
-    # print(f"_AE group_ranks is === {group_ranks}")
-    # _AE = init_model_parallel_group(group_ranks,
-    #                                 get_world_group().local_rank,
-    #                                 backend,
-    #                                 group_name="ae")
+    global _AE
+    group_ranks = []
+    for i in range(expert_parallel_size):
+        ranks = list(range(i, expert_parallel_size * 2, expert_parallel_size))
+        group_ranks.append(ranks)
+    #print(f"_AE group_ranks is === {group_ranks}")
+    _AE = init_model_parallel_group(group_ranks,
+                                    get_world_group().local_rank,
+                                    backend,
+                                    group_name="ae")
 
     group_ranks = []
     global _ETP
@@ -146,7 +151,10 @@ def init_ascend_model_parallel_for_AE_split(
                                         get_world_group().local_rank,
                                         backend,
                                         group_name="etp")
-    
+
+
+
+
 
 def destory_ascend_model_parallel():
     global _EP
