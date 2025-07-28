@@ -394,20 +394,10 @@ class CustomDeepseekV2MoE(nn.Module):
             is_prefill = is_prefill
             enable_force_load_balance = enable_force_load_balance
         else:
-            if attn_metadata is None:
-                attn_metadata = get_forward_context().attn_metadata
-            # when profile runs, force experts to load balanced tokens
-            # to avoid high memory consumption on a single rank.
-            # TODO: need a better flag to indicate whether in profile run or not.
-            if attn_metadata is None:
-                # for profile run
-                is_prefill = True
-                enable_force_load_balance = True
-            else:
-                is_prefill = attn_metadata.num_prefills > 0
-                enable_force_load_balance = False
-                if hasattr(attn_metadata, 'with_prefill_across_dp'):
-                    is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
+            forward_context = get_forward_context()
+            enable_force_load_balance = forward_context.in_profile_run
+            is_prefill = forward_context.with_prefill
+
         # If this node is kv_consumer, we force the moe always runs in decode path to make sure
         # the behaviour aligned between dummy_run and normal model_execute.
         if self.kv_consumer:
@@ -589,9 +579,10 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             hidden_states: torch.Tensor,
             kv_cache: Optional[torch.Tensor] = None,
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
+        forward_context = get_forward_context()
         enable_multistream_mla = (self.enable_multistream_mla
                                   and attn_metadata is not None
-                                  and not attn_metadata.with_prefill_across_dp
+                                  and not forward_context.with_prefill
                                   and attn_metadata.num_decodes > 0)
         forward_kwargs = {"enable_multistream_mla": enable_multistream_mla}
         if self.q_lora_rank is not None:
