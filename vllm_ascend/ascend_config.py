@@ -49,6 +49,9 @@ class AscendConfig:
         self.expert_map_path = additional_config.get("expert_map_path", None)
         self.chunked_prefill_for_mla = additional_config.get(
             "chunked_prefill_for_mla", False)
+        
+        self.enable_attn_export_split = additional_config.get(
+            "enable_attn_export_split", False)
 
 
 class TorchairGraphConfig:
