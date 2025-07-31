@@ -309,6 +309,8 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         parallel_config = self.vllm_config.parallel_config
+        enable_attn_export_split = self.vllm_config.additional_config.get(
+            "enable_attn_export_split", False)
         # if is_AE_split():
         #     global_world_size = self.parallel_config.tensor_parallel_size + \
         #         self.parallel_config.expert_parallel_size
@@ -320,7 +322,7 @@ class NPUWorker(WorkerBase):
             self.parallel_config.pipeline_parallel_size)
         from vllm.distributed.parallel_state import get_world_group
         # print(f"_init_worker_distributed_environment === {get_world_group().local_rank}")
-        if parallel_config.enable_attn_export_split:
+        if enable_attn_export_split:
             init_ascend_model_parallel_for_AE_split(
                 parallel_config.expert_parallel_size,
                 parallel_config.expert_tensor_parallel_size,
