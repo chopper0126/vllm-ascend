@@ -1128,6 +1128,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                 continue
             # for less layer
             import re
+            if "module" in name:
+                continue
 
             _id = "".join(re.findall(r'model\.layers\.(\d+)\.', name))
             _id = int(_id) if _id != '' else 0
