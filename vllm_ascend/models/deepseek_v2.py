@@ -627,7 +627,51 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.tp_rank = get_tp_group().rank_in_group
         ascend_config = get_ascend_config()
         rank = get_world_group().rank_in_group
-        if rank < self.tp_size:
+        if self.enable_attn_export_split:
+            if rank < self.tp_size:
+                # TODO: enable mla in vllm-ascend
+                if model_config.use_mla:
+                    attn_cls = CustomDeepseekV2MLAAttention
+                else:
+                    attn_cls = DeepseekV2Attention
+                self.self_attn = attn_cls(
+                    config=config,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    qk_nope_head_dim=config.qk_nope_head_dim,
+                    qk_rope_head_dim=config.qk_rope_head_dim,
+                    v_head_dim=config.v_head_dim,
+                    q_lora_rank=config.q_lora_rank
+                    if hasattr(config, "q_lora_rank") else None,
+                    kv_lora_rank=config.kv_lora_rank,
+                    rope_theta=rope_theta,
+                    rope_scaling=rope_scaling,
+                    max_position_embeddings=max_position_embeddings,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                )   
+            else:
+                if (config.n_routed_experts is not None
+                        and layer_idx >= config.first_k_dense_replace
+                        and layer_idx % config.moe_layer_freq == 0):
+                    self.mlp = CustomDeepseekV2MoE(
+                        config=config,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp",
+                    )
+                    self.mla_moe_communication = ascend_config.torchair_graph_config.enable_multistream_moe \
+                        and model_config.use_mla and self.tp_size > 1
+                else:
+                    self.mlp = CustomDeepseekV2MLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=config.intermediate_size,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp",
+                    )
+                    self.mla_moe_communication = False
+        else:
             # TODO: enable mla in vllm-ascend
             if model_config.use_mla:
                 attn_cls = CustomDeepseekV2MLAAttention
@@ -649,9 +693,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
-            )
-            
-        else:
+            )   
             if (config.n_routed_experts is not None
                     and layer_idx >= config.first_k_dense_replace
                     and layer_idx % config.moe_layer_freq == 0):
@@ -927,6 +969,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.enable_attn_export_split = vllm_config.additional_config.get(
+            "enable_attn_export_split", False)
         self.model = CustomDeepseekV2Model(vllm_config=vllm_config,
                                            prefix=maybe_prefix(
                                                prefix, "model"))
@@ -974,7 +1018,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
-            if rank < tp_size and self.is_moe(name):
+            if rank < tp_size and self.is_moe(name) and self.enable_attn_export_split:
                 continue
 
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
@@ -1025,7 +1069,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     # load expert gate up down ,without share expert
                     break
                 else:
-                    if rank > tp_size - 1 and not self.is_moe(name) and not self.is_moe_other(name):
+                    if rank > tp_size - 1 and not self.is_moe(name) and not self.is_moe_other(name) \
+                        and self.enable_attn_export_split:
                         continue
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
