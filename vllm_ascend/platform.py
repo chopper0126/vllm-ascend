@@ -150,9 +150,7 @@ class NPUPlatform(Platform):
             parallel_config.expert_parallel_size = (
                 parallel_config.world_size_across_dp //
                 parallel_config.expert_tensor_parallel_size)
-            if enable_attn_export_split:
-                # vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
-                vllm_config.parallel_config.world_size = vllm_config.parallel_config.tensor_parallel_size + vllm_config.parallel_config.expert_parallel_size
+           
 
         if model_config is None:
             logger.warning("Model config is missing. This may indicate "

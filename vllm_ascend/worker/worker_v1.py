@@ -322,18 +322,12 @@ class NPUWorker(WorkerBase):
             self.parallel_config.pipeline_parallel_size)
         from vllm.distributed.parallel_state import get_world_group
         # print(f"_init_worker_distributed_environment === {get_world_group().local_rank}")
-        if enable_attn_export_split:
-            init_ascend_model_parallel_for_AE_split(
-                parallel_config.expert_parallel_size,
-                parallel_config.expert_tensor_parallel_size,
-                parallel_config.world_size_across_dp,
-            )
-        else:
-            init_ascend_model_parallel(
-                parallel_config.expert_parallel_size,
-                parallel_config.expert_tensor_parallel_size,
-                parallel_config.world_size_across_dp,
-            )
+
+        init_ascend_model_parallel(
+            parallel_config.expert_parallel_size,
+            parallel_config.expert_tensor_parallel_size,
+            parallel_config.world_size_across_dp,
+        )
         ensure_kv_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):

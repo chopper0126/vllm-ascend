@@ -52,7 +52,12 @@ class AscendConfig:
         
         self.enable_attn_export_split = additional_config.get(
             "enable_attn_export_split", False)
-
+        
+        self.attn_ranks = list(
+            additional_config.get("attn_ranks", [0, 1]))
+        
+        self.ffn_ranks = list(
+            additional_config.get("ffn_ranks", [2, 3]))
 
 class TorchairGraphConfig:
     """
