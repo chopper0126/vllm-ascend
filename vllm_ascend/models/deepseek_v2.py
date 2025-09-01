@@ -39,7 +39,7 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce,
                               tensor_model_parallel_reduce_scatter)
-from vllm.distributed.parallel_state import get_dp_group,get_world_group
+from vllm.distributed.parallel_state import get_dp_group,get_world_group,get_ae_group_new,DefaultProcessGroupSwitcher,get_new_default_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -74,6 +74,10 @@ from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor, npu_prefetch
+from typing import Any, Optional, Union
+from torch.distributed.distributed_c10d import (
+    _get_default_group,
+)
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -371,23 +375,33 @@ class CustomDeepseekV2MoE(nn.Module):
     def forward(self,
                 hidden_states: torch.Tensor,
                 attn_metadata: Optional[AttentionMetadata] = None,
-                replace_allreduce: bool = False) -> torch.Tensor:
-
-        if attn_metadata is None:
-            attn_metadata = get_forward_context().attn_metadata
-        # when profile runs, force experts to load balanced tokens
-        # to avoid high memory consumption on a single rank.
-        # TODO: need a better flag to indicate whether in profile run or not.
-        if attn_metadata is None:
-            # for profile run
-            is_prefill = True
-            enable_force_load_balance = True
+                replace_allreduce: bool = False,
+                **kwargs) -> torch.Tensor:
+        is_prefill = kwargs.get("is_prefill",False)
+        enable_force_load_balance = kwargs.get("enable_force_load_balance",False)
+        is_ffn = kwargs.get("is_ffn",False)
+        # print(f'enable_force_load_balance is {enable_force_load_balance}')
+        # print(f'is_prefill is {is_prefill}')
+        # print(f'is_ffn is {is_ffn}')
+        if is_ffn:
+            is_prefill = is_prefill
+            enable_force_load_balance = enable_force_load_balance
         else:
-            is_prefill = attn_metadata.num_prefills > 0
-            enable_force_load_balance = False
-            if hasattr(attn_metadata, 'with_prefill_across_dp'):
-                is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
-
+            if attn_metadata is None:
+                attn_metadata = get_forward_context().attn_metadata
+            # when profile runs, force experts to load balanced tokens
+            # to avoid high memory consumption on a single rank.
+            # TODO: need a better flag to indicate whether in profile run or not.
+            if attn_metadata is None:
+                # for profile run
+                is_prefill = True
+                enable_force_load_balance = True
+            else:
+                is_prefill = attn_metadata.num_prefills > 0
+                enable_force_load_balance = False
+                if hasattr(attn_metadata, 'with_prefill_across_dp'):
+                    is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
+        
         # router_logits: (num_tokens, n_experts)
         router_logits = None
         if not self.rm_router_logits:
@@ -626,9 +640,16 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tp_group().rank_in_group
         ascend_config = get_ascend_config()
-        rank = get_world_group().rank_in_group
+        ffn_ranks = ascend_config.ffn_ranks
+        new_default_group = get_new_default_group()
+        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+        self.is_ffn = False
+        with default_pg_switcher:
+            rank = get_world_group().rank_in_group
+            if rank in ffn_ranks:
+                self.is_ffn = True
         if self.enable_attn_export_split:
-            if rank < self.tp_size:
+            if not self.is_ffn:
                 # TODO: enable mla in vllm-ascend
                 if model_config.use_mla:
                     attn_cls = CustomDeepseekV2MLAAttention
@@ -751,63 +772,71 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         rank = get_world_group().rank_in_group
 
         if self.enable_attn_export_split:
-            # 如果是Attn就计算一次Attn，否则就不计算
-            if rank < self.tp_size:
-                # print(f"rank is == {rank} , start attn")
-                # 计算attention
-                hidden_states = self.self_attn(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                )
-                # Fully Connected
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual)
-                # 发送给对应的exprot
-                # AE分离场景下，attention 所在的卡（例如卡0）需要将hidden_states、attn_metadata
-                # send 给export所在的卡（例如卡4）
-                ae_group = get_ae_group()
+            hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+        )
+            if mla_moe_communication and residual.shape[0] != hidden_states.shape[
+                    0]:
+                chunk_hidden_states = torch.tensor_split(residual,
+                                                        self.tp_size,
+                                                        dim=0)
+                residual = chunk_hidden_states[self.tp_rank]
+
+            if hidden_states.dtype == torch.float16:
+                # Fix FP16 overflow
+                # We scale both hidden_states and residual before
+                # rmsnorm, and rmsnorm result would not affect by scale.
+                hidden_states *= 1. / self.routed_scaling_factor
+                if self.layer_idx == 0:
+                    # The residual is shared by all layers, we only scale it on
+                    # first layer.
+                    residual *= 1. / self.routed_scaling_factor
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            # print(f'hidden_states.shape is {hidden_states.shape}')
+            # print(f'residual.shape is {residual.shape}')
+            # switcher, update default group to new_default_group
+            new_default_group = get_new_default_group()
+            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+
+            with default_pg_switcher:
+                #-----------------------
+                ae_group = get_ae_group_new()
+                dst = (ae_group.rank_in_group + 1) % ae_group.world_size
+
+                #----------send ffn_need_metadata ------------#
+                if attn_metadata is None:
+                    attn_metadata = get_forward_context().attn_metadata
+                if attn_metadata is None:
+                    # for profile run
+                    is_prefill = True
+                    enable_force_load_balance = True
+                else:
+                    is_prefill = attn_metadata.num_prefills > 0
+                    enable_force_load_balance = False
+                    if hasattr(attn_metadata, 'with_prefill_across_dp'):
+                        is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
+                
+                ffn_need_metadata = FFNNeedMetadata(is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
+                
+                ae_group.send_object(ffn_need_metadata,dst=dst)
+                #----------send attn_metadata ------------#
+                ae_group.send_object(attn_metadata,dst=dst)
+                #----------------------#
+                size_tensor = torch.tensor(hidden_states.size()).npu()
+                ae_group.send(size_tensor)
                 ae_group.send(hidden_states)
-                ae_group.send(residual)
+                # ae_group.send(residual)
+                # print(f"self.layer_idx is {self.layer_idx},after attn send hidden_states is == {hidden_states}")
                 # recv
                 # 接收export发送的数据
                 hidden_states = ae_group.recv(hidden_states.size(),dtype=hidden_states.dtype)
-                # print(f"接收export发送的数据 recv_matedata_list is == {hidden_states.shape}")
-            # export
-            else:
-                # print(f"rank is == {rank} , start export")
-                # recv
-                # 接收attn发送的数据
-                ae_group = get_ae_group()
-                hidden_states = ae_group.recv(hidden_states.size(),dtype=hidden_states.dtype)
-                residual = ae_group.recv(residual.size(),dtype=residual.dtype)
-                # print(f"接收attn发送的数据 recv_matedata_list is == {hidden_states.shape}")
-                # 计算mlp
-                if isinstance(self.mlp, CustomDeepseekV2MoE):
-                    hidden_states = self.mlp(hidden_states,
-                                        attn_metadata,
-                                        replace_allreduce=mla_moe_communication)
-                else:
-                    hidden_states = self.mlp(hidden_states)
-                
-                if isinstance(
-                    self.mlp,
-                    CustomDeepseekV2MLP) and hidden_states.dtype == torch.float16:
-                    # Fix FP16 overflow
-                    # Scaling the DeepseekV2MLP output, it is the input of
-                    # input_layernorm of next decoder layer.
-                    # The scaling of DeepseekV2MOE output would be done in the forward
-                    # of DeepseekV2MOE
-                    hidden_states *= 1. / self.routed_scaling_factor
-                
-                if mla_moe_communication and self.layer_idx == self.layers - 1:
-                    hidden_states = tensor_model_parallel_all_gather(hidden_states,
-                                                                    dim=0)
-                    residual = tensor_model_parallel_all_gather(residual, dim=0)
-                # send
-                # dst_rank = src_rank
-                ae_group.send(hidden_states)
+                # print(f"self.layer_idx is {self.layer_idx},接收export发送的数据 hidden_states is == {hidden_states}")
         else:
             #=============================
             hidden_states = self.self_attn(
@@ -861,6 +890,68 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         # print(f"rank == {rank} 最后的 residual is == {residual}")
         return hidden_states, residual
 
+    # ----------------------------------------- afd-related --------------------------------------------
+    def ffn_forward(
+        self,
+    ) -> torch.Tensor:
+        # switcher, update default group to new_default_group
+        new_default_group = get_new_default_group()
+        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+
+        with default_pg_switcher:
+            # recv:接收attn发送的数据
+            ae_group = get_ae_group_new()
+            src = (ae_group.rank_in_group - 1) % ae_group.world_size
+
+            #------------recv------------------#
+            ffn_need_metadata_obj = ae_group.recv_object(src=src)
+            attn_metadata = ae_group.recv_object(src=src)
+            size_tensor = ae_group.recv(2,dtype=torch.int64)
+            # The hidden_states is a two-dimensional matrix.
+            size_tensor = torch.zeros([size_tensor[0],size_tensor[1]])
+            hidden_states = ae_group.recv(size_tensor.size(),dtype=torch.bfloat16)
+            # print(f"self.layer_idx is {self.layer_idx},接收attn发送的数据 hidden_states is == {hidden_states}")
+            # 计算mlp
+            ffn_need_metadata_obj.is_ffn = True
+            # print(f'recv side ffn_need_metadata_obj.is_ffn is {ffn_need_metadata_obj.is_ffn}')
+
+            if isinstance(self.mlp, CustomDeepseekV2MoE):
+                hidden_states = self.mlp(hidden_states=hidden_states,
+                                        attn_metadata=attn_metadata,
+                                        replace_allreduce=False,
+                                        is_prefill = ffn_need_metadata_obj.is_prefill,
+                                        enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
+                                        is_ffn = ffn_need_metadata_obj.is_ffn,
+                                        )
+            else:
+                hidden_states = self.mlp(hidden_states)
+         
+            if isinstance(
+                    self.mlp,
+                    CustomDeepseekV2MLP) and hidden_states.dtype == torch.float16:
+                    # Fix FP16 overflow
+                    # Scaling the DeepseekV2MLP output, it is the input of
+                    # input_layernorm of next decoder layer.
+                    # The scaling of DeepseekV2MOE output would be done in the forward
+                    # of DeepseekV2MOE
+                    hidden_states *= 1. / self.routed_scaling_factor
+                
+
+            # print(f"self.layer_idx is {self.layer_idx},mlp 计算完成 hidden_states is == {hidden_states}")
+            # send
+            ae_group.send(hidden_states)
+            # print(f"self.layer_idx is {self.layer_idx},mlp 发送完成")
+    
+    
+class FFNNeedMetadata():
+
+    def __init__(self,
+                is_prefill: bool = False,
+                enable_force_load_balance: bool = False,
+                is_ffn: bool = False):
+        self.is_prefill = is_prefill
+        self.enable_force_load_balance = enable_force_load_balance
+        self.is_ffn = is_ffn
 
 class CustomDeepseekV2Model(nn.Module):
 
@@ -994,6 +1085,15 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         """"""
         rank = get_world_group().rank_in_group
         tp_size = get_tensor_model_parallel_world_size()
+        ascend_config = get_ascend_config()
+        ffn_ranks = ascend_config.ffn_ranks
+        new_default_group = get_new_default_group()
+        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+        is_ffn = False
+        with default_pg_switcher:
+            rank = get_world_group().rank_in_group
+            if rank in ffn_ranks:
+                is_ffn = True
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1018,7 +1118,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
-            if rank < tp_size and self.is_moe(name) and self.enable_attn_export_split:
+            if not is_ffn and self.is_moe(name) and self.enable_attn_export_split:
                 continue
 
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
@@ -1069,7 +1169,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     # load expert gate up down ,without share expert
                     break
                 else:
-                    if rank > tp_size - 1 and not self.is_moe(name) and not self.is_moe_other(name) \
+                    if is_ffn and not self.is_moe(name) and not self.is_moe_other(name) \
                         and self.enable_attn_export_split:
                         continue
                     # Skip loading extra bias for GPTQ models.
