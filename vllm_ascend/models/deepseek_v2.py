@@ -641,14 +641,14 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.tp_rank = get_tp_group().rank_in_group
         ascend_config = get_ascend_config()
         ffn_ranks = ascend_config.ffn_ranks
-        new_default_group = get_new_default_group()
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
-        self.is_ffn = False
-        with default_pg_switcher:
-            rank = get_world_group().rank_in_group
-            if rank in ffn_ranks:
-                self.is_ffn = True
         if self.enable_attn_export_split:
+            new_default_group = get_new_default_group()
+            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+            self.is_ffn = False
+            with default_pg_switcher:
+                rank = get_world_group().rank_in_group
+                if rank in ffn_ranks:
+                    self.is_ffn = True
             if not self.is_ffn:
                 # TODO: enable mla in vllm-ascend
                 if model_config.use_mla:
@@ -1087,13 +1087,14 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         tp_size = get_tensor_model_parallel_world_size()
         ascend_config = get_ascend_config()
         ffn_ranks = ascend_config.ffn_ranks
-        new_default_group = get_new_default_group()
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
         is_ffn = False
-        with default_pg_switcher:
-            rank = get_world_group().rank_in_group
-            if rank in ffn_ranks:
-                is_ffn = True
+        if ascend_config.enable_attn_export_split:
+            new_default_group = get_new_default_group()
+            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+            with default_pg_switcher:
+                rank = get_world_group().rank_in_group
+                if rank in ffn_ranks:
+                    is_ffn = True
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
