@@ -623,7 +623,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         model_config: ModelConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        enable_attn_export_split: bool = False
+        enable_afd: bool = False
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
@@ -631,7 +631,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.enable_attn_export_split = enable_attn_export_split
+        self.enable_afd = enable_afd
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
@@ -641,14 +641,9 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.tp_rank = get_tp_group().rank_in_group
         ascend_config = get_ascend_config()
         ffn_ranks = ascend_config.ffn_ranks
-        if self.enable_attn_export_split:
-            new_default_group = get_new_default_group()
-            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
-            self.is_ffn = False
-            with default_pg_switcher:
-                rank = get_world_group().rank_in_group
-                if rank in ffn_ranks:
-                    self.is_ffn = True
+        role = ascend_config.role
+        if self.enable_afd:
+            self.is_ffn = True if role == "ffn" else False
             if not self.is_ffn:
                 # TODO: enable mla in vllm-ascend
                 if model_config.use_mla:
@@ -771,7 +766,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                                              dim=0)
         rank = get_world_group().rank_in_group
 
-        if self.enable_attn_export_split:
+        if self.enable_afd:
             hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -968,8 +963,8 @@ class CustomDeepseekV2Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.enable_attn_export_split = vllm_config.additional_config.get(
-            "enable_attn_export_split", False)
+        self.enable_afd = vllm_config.additional_config.get(
+            "enable_afd", False)
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -988,7 +983,7 @@ class CustomDeepseekV2Model(nn.Module):
                 model_config=model_config,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                enable_attn_export_split = self.enable_attn_export_split
+                enable_afd = self.enable_afd
             ),
             prefix=f"{prefix}.layers")
 
@@ -1060,8 +1055,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.enable_attn_export_split = vllm_config.additional_config.get(
-            "enable_attn_export_split", False)
+        self.enable_afd = vllm_config.additional_config.get(
+            "enable_afd", False)
         self.model = CustomDeepseekV2Model(vllm_config=vllm_config,
                                            prefix=maybe_prefix(
                                                prefix, "model"))
@@ -1086,15 +1081,11 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         rank = get_world_group().rank_in_group
         tp_size = get_tensor_model_parallel_world_size()
         ascend_config = get_ascend_config()
-        ffn_ranks = ascend_config.ffn_ranks
-        is_ffn = False
-        if ascend_config.enable_attn_export_split:
-            new_default_group = get_new_default_group()
-            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
-            with default_pg_switcher:
-                rank = get_world_group().rank_in_group
-                if rank in ffn_ranks:
-                    is_ffn = True
+
+        if ascend_config.enable_afd:
+            role = ascend_config.role
+            is_ffn = True if role == "ffn" else False
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1119,7 +1110,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
-            if not is_ffn and self.is_moe(name) and self.enable_attn_export_split:
+            if not is_ffn and self.is_moe(name) and self.enable_afd:
                 continue
 
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
@@ -1171,7 +1162,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     break
                 else:
                     if is_ffn and not self.is_moe(name) and not self.is_moe_other(name) \
-                        and self.enable_attn_export_split:
+                        and self.enable_afd:
                         continue
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
