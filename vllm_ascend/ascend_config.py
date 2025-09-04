@@ -50,14 +50,16 @@ class AscendConfig:
         self.chunked_prefill_for_mla = additional_config.get(
             "chunked_prefill_for_mla", False)
         
-        self.enable_attn_export_split = additional_config.get(
-            "enable_attn_export_split", False)
+        self.enable_afd = additional_config.get(
+            "enable_afd", False)
         
         self.attn_ranks = list(
             additional_config.get("attn_ranks", [0, 1]))
         
         self.ffn_ranks = list(
             additional_config.get("ffn_ranks", [2, 3]))
+        
+        self.role = additional_config.get("role")
 
 class TorchairGraphConfig:
     """

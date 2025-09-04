@@ -72,11 +72,10 @@ def creat_hccl_process_group(rank, world_size):
     )
     return new_default_group
     
-    
-def run_ffn_process(rank, world_size,attn_size, ffn_size):
+def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
     print(f"进程 {rank} 启动，参数: world_size={world_size}, "
           f"attn_size={attn_size}, ffn_size={ffn_size}")
-    if rank == 2: time.sleep(1); print('======================================================================')
+    if rank == 1: time.sleep(1); print('======================================================================')
     import torch
     torch.npu.set_device(rank)
     init_method = 'tcp://127.0.0.1:29503'
@@ -86,50 +85,33 @@ def run_ffn_process(rank, world_size,attn_size, ffn_size):
             rank=rank % attn_size, 
             world_size=ffn_size
         )
+    return ffn_default_group
+
+def run_ffn(rank, world_size,attn_size, ffn_size):
+
+    ffn_default_group = create_ffn_process_group(rank, world_size,attn_size, ffn_size)
+    
+    config = create_config()
+    attn_ranks = list(config.additional_config.get("attn_ranks"))
+    ffn_ranks = list(config.additional_config.get("ffn_ranks"))
+    role = config.additional_config.get("role")
+    print(f'attn_ranks is {attn_ranks}')
     # new_default_group
     # global _NEW_DEFAULT_GROUP
-    ps._NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, world_size)
+    ps._NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, len(attn_ranks) + len(ffn_ranks))
     # switcher, update default group to new_default_group
     default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), ps._NEW_DEFAULT_GROUP)
     # create sub_group in new_default_group
     with default_pg_switcher:
-        sub_group_ranks = [[0, 2], [1, 3]]
+        sub_group_ranks = []
+        for i in range(len(ffn_ranks)):
+            ranks = list([attn_ranks[i],ffn_ranks[i]])
+            sub_group_ranks.append(ranks)
         ps._AE_GROUP = init_model_parallel_group(sub_group_ranks,
                                     rank,
                                     backend='hccl', 
                                     group_name="ae")
-        print(f'_AE_GROUP is {ps._AE_GROUP.device_group.group_desc}')
-        # for sub_group_rank in sub_group_ranks:
-        #     tmp_group = dist.new_group(sub_group_rank)
-        #     if rank in sub_group_rank:
-        #         sub_group = tmp_group
-
-    print(f'rank={rank},start to test global hccl')      
-    # all-reduce in ffn_default_group   [[0, 1], [2, 3]]
-    data = torch.tensor([rank]).npu()
-    print(f'ffn_default_group Group all-reduce Before: rank={rank}, data={data}') 
-    dist.all_reduce(data, group=ffn_default_group)
-    print(f'ffn_default_group Group all-reduce After: rank={rank}, data={data}')  
-    dist.barrier(group=ps._NEW_DEFAULT_GROUP)
-
-    # all-reduce in sub_group       [[0, 2], [1, 3]]
-    data = torch.tensor([rank]).npu()
-    with default_pg_switcher:
-        print(f'Sub Group all-reduce Before: rank={rank}, data={data}') # [0, 1, 2, 3]
-        dist.all_reduce(data, group=ps._AE_GROUP.device_group)
-        dist.barrier(group=ps._NEW_DEFAULT_GROUP)
-        print(f'Sub Group all-reduce After: rank={rank}, data={data}')  # [2, 4, 2, 4]
-   
-    # send/recv in sub_group       [[0, 2], [1, 3]]
-    data = torch.tensor([rank]).npu()
-    with default_pg_switcher:
-        print(f'Sub Group send/recv Before: rank={rank}, data={data}') # [0, 1, 2, 3]
-        # dist.recv(tensor=data, src=rank - 2,group=_AE_GROUP.device_group)
-        ps._AE_GROUP.recv(data.size(),dtype=data.dtype)
-        dist.barrier(group=ps._NEW_DEFAULT_GROUP)
-        print(f'Sub Group send/recv After: rank={rank}, data={data}')  # 
-    print(f'rank={rank},end to test global hccl') 
-
+    print(f'rank={rank},create global process group success')   
     print(f'rank={rank},start to run model') 
     
     """Initialize the worker for Ascend."""
@@ -144,22 +126,15 @@ def run_ffn_process(rank, world_size,attn_size, ffn_size):
     _register_atb_extensions()
     # # init ascend config
     # init_ascend_config(vllm_config)
-    seed = 100
-    block_size = 32
-    num_gpu_blocks = 2048 // block_size
-    model_name = "/data/weight/DeepSeek-V2-Lite"
 
+    
+    
     ffn_worker = create_worker(
         FFNWorker,
-        model_name,
-        block_size= block_size,
-        num_gpu_blocks=num_gpu_blocks,
-        seed=seed,
         model_runner_cls=FFNModelRunner,
-        init_method = 'tcp://127.0.0.1:29503',
+        engine_config = config,
         rank = rank,
-        attn_size = attn_size,
-        ffn_size = ffn_size,
+        ffn_size = ffn_size
     )
 
     
@@ -272,45 +247,45 @@ class FFNWorker(NPUWorker):
         output = self.model_runner.execute_model()
         return output
 
+def create_config() -> VllmConfig:
     
-    
-def create_worker(cls: Callable[..., T],
-                  model_name: str,
-                  block_size: int,
-                  num_gpu_blocks: int,
-                  seed: int,
-                  is_driver_worker: bool = True,
-                  enforce_eager: bool = True,
-                  model_runner_cls: Optional[ModelRunner] = None,
-                  dtype: Optional[str] = "auto",
-                  **kargs) -> T:
     engine_args = EngineArgs(
-        model=model_name,
-        seed=seed,
-        block_size=block_size,
-        enforce_eager=enforce_eager,
-        dtype=dtype,
+        model="/data/weight/DeepSeek-V2-Lite",
+        enforce_eager=True,
         trust_remote_code=True,
         tensor_parallel_size=2,
         enable_expert_parallel=True,
+        additional_config={
+            # 关闭chunked_prefill ,调度器走vllm-ascend 重写的调度器，V0
+            'ascend_scheduler_config':{
+                'enabled': True,},
+            "enable_afd":True,
+            "enable_ms_afd":False,
+            "attn_ranks": [0,1],
+            "ffn_ranks": [2,3],
+            "role":"ffn"
+            }
     )
-    init_method = kargs.get('init_method')
+    engine_config = engine_args.create_engine_config()  
+    return engine_config
+    
+def create_worker(cls: Callable[..., T],
+                  model_runner_cls: Optional[ModelRunner] = None,
+                  engine_config: VllmConfig = None,
+                  **kargs) -> T:
     rank = kargs.get('rank')
-    attn_size = kargs.get('attn_size')
     ffn_size = kargs.get('ffn_size')
-
-    engine_config = engine_args.create_engine_config()
 
     distributed_init_method = get_distributed_init_method(
         get_ip(), get_open_port())
     print(f'create worker rank is ========= {rank}')
     worker = cls(
-        vllm_config=engine_config,
-        local_rank=rank% attn_size ,
+        vllm_config = engine_config,
+        local_rank = rank % ffn_size ,
         rank= rank,
-        distributed_init_method=distributed_init_method,
-        is_driver_worker=False,
-        model_runner_cls=model_runner_cls,
+        distributed_init_method = distributed_init_method,
+        is_driver_worker = False,
+        model_runner_cls = model_runner_cls,
     )
 
     worker.init_device()
@@ -347,7 +322,7 @@ if __name__ == '__main__':
 
     hccl_processes = []
     for rank in range(ffn_size,hccl_world_size):
-        p = mp.Process(target=run_ffn_process, args=(rank, hccl_world_size, attn_size, ffn_size))
+        p = mp.Process(target=run_ffn, args=(rank, hccl_world_size, attn_size, ffn_size))
         hccl_processes.append(p)
         p.start()
 

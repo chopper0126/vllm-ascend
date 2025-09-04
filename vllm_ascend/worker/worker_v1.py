@@ -309,8 +309,8 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         parallel_config = self.vllm_config.parallel_config
-        enable_attn_export_split = self.vllm_config.additional_config.get(
-            "enable_attn_export_split", False)
+        enable_afd = self.vllm_config.additional_config.get(
+            "enable_afd", False)
         # if is_AE_split():
         #     global_world_size = self.parallel_config.tensor_parallel_size + \
         #         self.parallel_config.expert_parallel_size

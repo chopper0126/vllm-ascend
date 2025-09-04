@@ -128,8 +128,8 @@ class NPUPlatform(Platform):
         cache_config = vllm_config.cache_config
         kv_cache_dtype = vllm_config.additional_config.get(
             "kv_cache_dtype", None)
-        enable_attn_export_split = vllm_config.additional_config.get(
-            "enable_attn_export_split", False)
+        enable_afd = vllm_config.additional_config.get(
+            "enable_afd", False)
         if kv_cache_dtype is not None:
             vllm_config.cache_config.cache_dtype = kv_cache_dtype
 
