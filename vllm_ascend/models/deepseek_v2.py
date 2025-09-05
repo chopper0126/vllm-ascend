@@ -78,6 +78,7 @@ from typing import Any, Optional, Union
 from torch.distributed.distributed_c10d import (
     _get_default_group,
 )
+from vllm_ascend.distributed import CAMAFDConnector
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -793,45 +794,23 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
-            # print(f'hidden_states.shape is {hidden_states.shape}')
-            # print(f'residual.shape is {residual.shape}')
-            # switcher, update default group to new_default_group
-            new_default_group = get_new_default_group()
-            default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
-
-            with default_pg_switcher:
-                #-----------------------
-                ae_group = get_ae_group_new()
-                dst = (ae_group.rank_in_group + 1) % ae_group.world_size
-
-                #----------send ffn_need_metadata ------------#
-                if attn_metadata is None:
-                    attn_metadata = get_forward_context().attn_metadata
-                if attn_metadata is None:
-                    # for profile run
-                    is_prefill = True
-                    enable_force_load_balance = True
-                else:
-                    is_prefill = attn_metadata.num_prefills > 0
-                    enable_force_load_balance = False
-                    if hasattr(attn_metadata, 'with_prefill_across_dp'):
-                        is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
-                
-                ffn_need_metadata = FFNNeedMetadata(is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
-                
-                ae_group.send_object(ffn_need_metadata,dst=dst)
-                #----------send attn_metadata ------------#
-                ae_group.send_object(attn_metadata,dst=dst)
-                #----------------------#
-                size_tensor = torch.tensor(hidden_states.size()).npu()
-                ae_group.send(size_tensor)
-                ae_group.send(hidden_states)
-                # ae_group.send(residual)
-                # print(f"self.layer_idx is {self.layer_idx},after attn send hidden_states is == {hidden_states}")
-                # recv
-                # 接收export发送的数据
-                hidden_states = ae_group.recv(hidden_states.size(),dtype=hidden_states.dtype)
-                # print(f"self.layer_idx is {self.layer_idx},接收export发送的数据 hidden_states is == {hidden_states}")
+            
+            if attn_metadata is None:
+                attn_metadata = get_forward_context().attn_metadata
+            if attn_metadata is None:
+                # for profile run
+                is_prefill = True
+                enable_force_load_balance = True
+            else:
+                is_prefill = attn_metadata.num_prefills > 0
+                enable_force_load_balance = False
+                if hasattr(attn_metadata, 'with_prefill_across_dp'):
+                    is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
+            
+            ffn_need_metadata = FFNNeedMetadata(is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
+            
+            AFDConnector.send_attn_output(hidden_states, ffn_need_metadata, attn_metadata)
+            hidden_states = AFDConnector.recv_ffn_output(hidden_states)
         else:
             #=============================
             hidden_states = self.self_attn(
@@ -889,53 +868,34 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     def ffn_forward(
         self,
     ) -> torch.Tensor:
-        # switcher, update default group to new_default_group
-        new_default_group = get_new_default_group()
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), new_default_group)
+        ffn_need_metadata_obj, attn_metadata, hidden_states = AFDConnector.recv_attn_output()
 
-        with default_pg_switcher:
-            # recv:接收attn发送的数据
-            ae_group = get_ae_group_new()
-            src = (ae_group.rank_in_group - 1) % ae_group.world_size
 
-            #------------recv------------------#
-            ffn_need_metadata_obj = ae_group.recv_object(src=src)
-            attn_metadata = ae_group.recv_object(src=src)
-            size_tensor = ae_group.recv(2,dtype=torch.int64)
-            # The hidden_states is a two-dimensional matrix.
-            size_tensor = torch.zeros([size_tensor[0],size_tensor[1]])
-            hidden_states = ae_group.recv(size_tensor.size(),dtype=torch.bfloat16)
-            # print(f"self.layer_idx is {self.layer_idx},接收attn发送的数据 hidden_states is == {hidden_states}")
-            # 计算mlp
-            ffn_need_metadata_obj.is_ffn = True
-            # print(f'recv side ffn_need_metadata_obj.is_ffn is {ffn_need_metadata_obj.is_ffn}')
-
-            if isinstance(self.mlp, CustomDeepseekV2MoE):
-                hidden_states = self.mlp(hidden_states=hidden_states,
-                                        attn_metadata=attn_metadata,
-                                        replace_allreduce=False,
-                                        is_prefill = ffn_need_metadata_obj.is_prefill,
-                                        enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
-                                        is_ffn = ffn_need_metadata_obj.is_ffn,
-                                        )
-            else:
-                hidden_states = self.mlp(hidden_states)
-         
-            if isinstance(
-                    self.mlp,
-                    CustomDeepseekV2MLP) and hidden_states.dtype == torch.float16:
-                    # Fix FP16 overflow
-                    # Scaling the DeepseekV2MLP output, it is the input of
-                    # input_layernorm of next decoder layer.
-                    # The scaling of DeepseekV2MOE output would be done in the forward
-                    # of DeepseekV2MOE
-                    hidden_states *= 1. / self.routed_scaling_factor
-                
-
-            # print(f"self.layer_idx is {self.layer_idx},mlp 计算完成 hidden_states is == {hidden_states}")
-            # send
-            ae_group.send(hidden_states)
-            # print(f"self.layer_idx is {self.layer_idx},mlp 发送完成")
+        # 计算mlp
+        ffn_need_metadata_obj.is_ffn = True
+        # print(f'recv side ffn_need_metadata_obj.is_ffn is {ffn_need_metadata_obj.is_ffn}')
+        if isinstance(self.mlp, CustomDeepseekV2MoE):
+            hidden_states = self.mlp(hidden_states=hidden_states,
+                                    attn_metadata=attn_metadata,
+                                    replace_allreduce=False,
+                                    is_prefill = ffn_need_metadata_obj.is_prefill,
+                                    enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
+                                    is_ffn = ffn_need_metadata_obj.is_ffn,
+                                    )
+        else:
+            hidden_states = self.mlp(hidden_states)
+        
+        if isinstance(
+                self.mlp,
+                CustomDeepseekV2MLP) and hidden_states.dtype == torch.float16:
+                # Fix FP16 overflow
+                # Scaling the DeepseekV2MLP output, it is the input of
+                # input_layernorm of next decoder layer.
+                # The scaling of DeepseekV2MOE output would be done in the forward
+                # of DeepseekV2MOE
+                hidden_states *= 1. / self.routed_scaling_factor
+        # send
+        AFDConnector.send_ffn_output(hidden_states)
     
     
 class FFNNeedMetadata():
@@ -1070,6 +1030,10 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        # init AFDConnector
+        ae_default_group = get_new_default_group()
+        global AFDConnector
+        AFDConnector = CAMAFDConnector(ae_default_group)
 
     # NOTE: This `load_weights` is mainly copied from
     # https://github.com/vllm-project/vllm/commit/07b8fae219b1fff51ef115c38c44b51395be5bb5
