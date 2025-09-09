@@ -78,7 +78,7 @@ from typing import Any, Optional, Union
 from torch.distributed.distributed_c10d import (
     _get_default_group,
 )
-from vllm_ascend.distributed import CAMAFDConnector
+from vllm_ascend.distributed import CAMAFDConnector, AFDConnectorMetadata
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -809,7 +809,10 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             
             ffn_need_metadata = FFNNeedMetadata(is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
             
-            AFDConnector.send_attn_output(hidden_states, ffn_need_metadata, attn_metadata)
+            afd_connector_metadata.set_ffn_need_metadata(ffn_need_metadata)
+            afd_connector_metadata.set_attn_metadata(attn_metadata)
+            
+            AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
             hidden_states = AFDConnector.recv_ffn_output(hidden_states)
         else:
             #=============================
@@ -1034,6 +1037,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         ae_default_group = get_new_default_group()
         global AFDConnector
         AFDConnector = CAMAFDConnector(ae_default_group)
+        global afd_connector_metadata
+        afd_connector_metadata = AFDConnectorMetadata(layer_idx=0, stage_idx=0, seq_lens=[])
 
     # NOTE: This `load_weights` is mainly copied from
     # https://github.com/vllm-project/vllm/commit/07b8fae219b1fff51ef115c38c44b51395be5bb5
