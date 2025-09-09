@@ -62,9 +62,8 @@ def creat_hccl_process_group(rank, world_size):
     import torch
     import torch_npu
     import os
-    torch.npu.set_device(rank)
+
     new_default_group = init_process_group(
-        init_method='tcp://127.0.0.1:29500',
         backend='gloo', 
         rank=rank, 
         world_size=world_size, 
@@ -75,9 +74,11 @@ def creat_hccl_process_group(rank, world_size):
 def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
     print(f"进程 {rank} 启动，参数: world_size={world_size}, "
           f"attn_size={attn_size}, ffn_size={ffn_size}")
-    if rank == 1: time.sleep(1); print('======================================================================')
+    if rank == 2: time.sleep(1); print('======================================================================')
     import torch
+    
     torch.npu.set_device(rank)
+    #TODO:remove hard code
     init_method = 'tcp://127.0.0.1:29503'
     ffn_default_group = dist.init_process_group(
             init_method=init_method,
@@ -88,14 +89,19 @@ def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
     return ffn_default_group
 
 def run_ffn(rank, world_size,attn_size, ffn_size):
-
-    ffn_default_group = create_ffn_process_group(rank, world_size,attn_size, ffn_size)
-    
     config = create_config()
     attn_ranks = list(config.additional_config.get("attn_ranks"))
     ffn_ranks = list(config.additional_config.get("ffn_ranks"))
     role = config.additional_config.get("role")
+    node_num = int(config.additional_config.get("node_num"))
     print(f'attn_ranks is {attn_ranks}')
+    if node_num > 1:
+        local_rank = rank % ffn_size
+        ffn_default_group = create_ffn_process_group(local_rank, world_size,attn_size, ffn_size)
+    else:
+        ffn_default_group = create_ffn_process_group(rank, world_size,attn_size, ffn_size)
+    
+    
     # new_default_group
     # global _NEW_DEFAULT_GROUP
     ps._NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, len(attn_ranks) + len(ffn_ranks))
@@ -222,12 +228,11 @@ class FFNWorker(NPUWorker):
                          is_driver_worker=is_driver_worker)
 
     def init_device(self):
-        # TODO: when cross machine,use self.local_rank
-        # from vllm_ascend.ascend_config import get_ascend_config
-        # ascend_config = get_ascend_config()
-        # ffn_ranks = ascend_config.ffn_ranks
-        # device = torch.device(f"npu:{self.local_rank + len(ffn_ranks)}")
-        device = torch.device(f"npu:{self.rank}")
+        node_num = int(self.vllm_config.additional_config.get("node_num"))
+        if node_num > 1:
+            device = torch.device(f"npu:{self.local_rank}")
+        else:
+            device = torch.device(f"npu:{self.rank}")
         NPUPlatform.set_device(device)
         NPUPlatform.empty_cache()
         self.init_npu_memory = NPUPlatform.mem_get_info()[0]
@@ -250,7 +255,7 @@ class FFNWorker(NPUWorker):
 def create_config() -> VllmConfig:
     
     engine_args = EngineArgs(
-        model="/data/weight/DeepSeek-V2-Lite",
+        model="/home/data/DeepSeek-V2-Lite",
         enforce_eager=True,
         trust_remote_code=True,
         tensor_parallel_size=2,
@@ -263,7 +268,10 @@ def create_config() -> VllmConfig:
             "enable_ms_afd":False,
             "attn_ranks": [0,1],
             "ffn_ranks": [2,3],
-            "role":"ffn"
+            "role":"ffn",
+            "attn_num": 1,
+            "ffn_num": 1,
+            "node_num": 1
             }
     )
     engine_config = engine_args.create_engine_config()  

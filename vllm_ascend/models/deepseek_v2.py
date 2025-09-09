@@ -1081,7 +1081,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         rank = get_world_group().rank_in_group
         tp_size = get_tensor_model_parallel_world_size()
         ascend_config = get_ascend_config()
-
+        is_ffn = False
         if ascend_config.enable_afd:
             role = ascend_config.role
             is_ffn = True if role == "ffn" else False
