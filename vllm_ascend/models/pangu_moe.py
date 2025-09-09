@@ -657,7 +657,7 @@ class PanguProMoEDecoderLayer(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        enable_attn_export_split: bool = False
+        enable_afd: bool = False
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -665,7 +665,7 @@ class PanguProMoEDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.enable_attn_export_split = enable_attn_export_split
+        self.enable_afd = enable_afd
         # # Attention
         # if is_the_first_4_cards():
         #     self.mlp = None
@@ -777,7 +777,7 @@ class PanguProMoEDecoderLayer(nn.Module):
                 if need_h2p_pad:
                     hidden_states = hidden_states.index_select(
                         dim=0, index=h2p_unpad_idx)
-        if self.enable_attn_export_split:
+        if self.enable_afd:
             import torch.distributed as dist
             # 如果是Attn就计算一次Attn，否则就不计算
             if rank < 4:
@@ -876,8 +876,8 @@ class PanguProMoEModel(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        self.enable_attn_export_split = vllm_config.additional_config.get(
-            "enable_attn_export_split", False)
+        self.enable_afd = vllm_config.additional_config.get(
+            "enable_afd", False)
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -894,7 +894,7 @@ class PanguProMoEModel(nn.Module):
                                                    cache_config=cache_config,
                                                    quant_config=quant_config,
                                                    prefix=prefix,
-                                                   enable_attn_export_split = self.enable_attn_export_split),
+                                                   enable_afd = self.enable_afd),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
