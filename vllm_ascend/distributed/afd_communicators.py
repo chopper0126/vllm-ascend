@@ -9,6 +9,8 @@ from datetime import timedelta
 from typing import Any, Optional, Union
 from abc import ABC, abstractmethod
 
+import torch
+import torch.distributed
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -21,7 +23,8 @@ from torch.distributed.distributed_c10d import (
     _update_default_pg,
 )
 
-from vllm.distributed.parallel_state import get_dp_group,get_world_group,get_ae_group_new,DefaultProcessGroupSwitcher,get_new_default_group
+from vllm.distributed.parallel_state import (get_dp_group,get_world_group,get_new_default_group,GroupCoordinator, 
+                                                creat_hccl_process_group, init_model_parallel_group)
 
 class FFNNeedMetadata():
 
@@ -70,7 +73,7 @@ class DefaultProcessGroupSwitcher:
     def __exit__(self, exc_type, exc_value, traceback):
         _update_default_pg(self.default_group)  
 
-def creat_hccl_process_group(rank, world_size, attn_size, ffn_size):
+def creat_hccl_process_group(rank, world_size):
     import torch
     torch.npu.set_device(rank)
     new_default_group = init_process_group(
@@ -130,6 +133,10 @@ def init_process_group(
 
     return pg
 
+def get_ae_group_new() -> GroupCoordinator:
+    assert _AE_GROUP is not None, ("afd group is not initialized")
+    return _AE_GROUP
+
 class AFDConnectorBase(ABC):
     # Attention Worker Interface (sends FFN requests)
     @abstractmethod
@@ -150,9 +157,26 @@ class AFDConnectorBase(ABC):
         pass
 
 class CAMAFDConnector(AFDConnectorBase):
-    def __init__(self, group: dist.ProcessGroup):
-        self.default_group = group
-
+    def __init__(self, rank: int, attn_size: int, ffn_size: int, is_ffn: bool):
+        backend = "hccl"
+        global _NEW_DEFAULT_GROUP
+        if is_ffn:
+            rank = rank+attn_size
+        _NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, ffn_size+attn_size)
+        self.default_group = _NEW_DEFAULT_GROUP
+        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), _NEW_DEFAULT_GROUP)
+        # create sub_group in new_default_group
+        with default_pg_switcher:
+            sub_group_ranks = []
+            for i in range(ffn_size):
+                ranks = list([i, ffn_size+i])
+                sub_group_ranks.append(ranks)
+            global _AE_GROUP
+            _AE_GROUP = init_model_parallel_group(sub_group_ranks,
+                                    rank,
+                                    backend,
+                                    group_name="ae")
+                                    
     # ATTN发给MOE（ATTN发送）
     def send_attn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata) -> Any:    
         default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
