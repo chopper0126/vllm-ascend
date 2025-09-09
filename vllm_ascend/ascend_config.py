@@ -53,13 +53,16 @@ class AscendConfig:
         self.enable_afd = additional_config.get(
             "enable_afd", False)
         
-        self.attn_ranks = list(
-            additional_config.get("attn_ranks", [0, 1]))
+        self.attn_num = int(
+            additional_config.get("attn_num", 0))
         
-        self.ffn_ranks = list(
-            additional_config.get("ffn_ranks", [2, 3]))
+        self.ffn_num = int(
+            additional_config.get("ffn_num", 0))
+
+        self.is_ffn = additional_config.get(
+            "is_ffn", None)
         
-        self.role = additional_config.get("role")
+        # self.role = additional_config.get("role")
 
 class TorchairGraphConfig:
     """
