@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import time
@@ -8,8 +9,6 @@ from datetime import timedelta
 from typing import Any, Optional, Union
 from abc import ABC, abstractmethod
 
-import torch
-import torch.distributed
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -23,6 +22,42 @@ from torch.distributed.distributed_c10d import (
 )
 
 from vllm.distributed.parallel_state import get_dp_group,get_world_group,get_ae_group_new,DefaultProcessGroupSwitcher,get_new_default_group
+
+class FFNNeedMetadata():
+
+    def __init__(self,
+                is_prefill: bool = False,
+                enable_force_load_balance: bool = False,
+                is_ffn: bool = False):
+        self.is_prefill = is_prefill
+        self.enable_force_load_balance = enable_force_load_balance
+        self.is_ffn = is_ffn
+
+@dataclass
+class AFDConnectorMetadata:
+    layer_idx: int              # Layer index for computation
+    stage_idx: int              # Pipeline stage index  
+    seq_lens: list[int]         # Sequence lengths for each request
+    dtype: torch.dtype          # Tensor data type
+    device: torch.device        # Compute device
+    request_id: Optional[str]   # Request identifier
+    timestamp: Optional[float]  # Timestamp for debugging
+    group : dist.ProcessGroup # communication domain    
+    topk_idx: Optional[torch.Tensor] # indices token which expert to be sended
+    topk_weights: Optional[torch.Tensor] # the expert weights
+    moe_expert_num: Optional[int] # number of moe experts
+    shared_expert_num: Optional[int] # number of share experts
+    handle: Optional[torch.Tensor] # the communication handle given by the recv_attn_output
+    def __init__(self, layer_idx: int, stage_idx: int, seq_lens: list[int]):
+        self.layer_idx = layer_idx
+        self.stage_idx = stage_idx
+        self.seq_lens = seq_lens
+
+    def set_attn_metadata(self, attn_metadata):
+        self.attn_metadata = attn_metadata
+
+    def set_ffn_need_metadata(self, ffn_need_metadata):
+        self.ffn_need_metadata = ffn_need_metadata
 
 class DefaultProcessGroupSwitcher:
     def __init__(self, default_group, new_default_group):
@@ -95,7 +130,6 @@ def init_process_group(
 
     return pg
 
-
 class AFDConnectorBase(ABC):
     # Attention Worker Interface (sends FFN requests)
     @abstractmethod
@@ -115,18 +149,19 @@ class AFDConnectorBase(ABC):
     def send_ffn_output(self, ffn_output: torch.Tensor) -> None:
         pass
 
-
 class CAMAFDConnector(AFDConnectorBase):
     def __init__(self, group: dist.ProcessGroup):
         self.default_group = group
 
     # ATTN发给MOE（ATTN发送）
-    def send_attn_output(self, hidden_states: torch.Tensor, ffn_need_metadata, attn_metadata) -> Any:    
+    def send_attn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata) -> Any:    
         default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
         with default_pg_switcher:
             ae_group = get_ae_group_new()
             dst = (ae_group.rank_in_group + 1) % ae_group.world_size
+            ffn_need_metadata = metadata.ffn_need_metadata
             ae_group.send_object(ffn_need_metadata, dst=dst)
+            attn_metadata = metadata.attn_metadata
             ae_group.send_object(attn_metadata, dst=dst)
             size_tensor = torch.tensor(hidden_states.size()).npu()
             ae_group.send(size_tensor)
@@ -160,22 +195,5 @@ class CAMAFDConnector(AFDConnectorBase):
             size_tensor = ae_group.recv(2,dtype=torch.int64)
             size_tensor = torch.zeros([size_tensor[0],size_tensor[1]])
             hidden_states = ae_group.recv(size_tensor.size(),dtype=torch.bfloat16)
+        
         return ffn_need_metadata_obj, attn_metadata, hidden_states
-
-
-
-class AFDConnectorMetadata:
-    layer_idx: int              # Layer index for computation
-    stage_idx: int              # Pipeline stage index  
-    seq_lens: list[int]         # Sequence lengths for each request
-    dtype: torch.dtype          # Tensor data type
-    device: torch.device        # Compute device
-    request_id: Optional[str]   # Request identifier
-    timestamp: Optional[float]  # Timestamp for debugging
-    group : dist.ProcessGroup # communication domain    
-    topk_idx: Optional[torch.Tensor] # indices token which expert to be sended
-    topk_weights: Optional[torch.Tensor] # the expert weights
-    moe_expert_num: Optional[int] # number of moe experts
-    shared_expert_num: Optional[int] # number of share experts
-    handle: Optional[torch.Tensor] # the communication handle given by the recv_attn_output
-    
