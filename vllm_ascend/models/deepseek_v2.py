@@ -78,7 +78,7 @@ from typing import Any, Optional, Union
 from torch.distributed.distributed_c10d import (
     _get_default_group,
 )
-from vllm_ascend.distributed import CAMAFDConnector, AFDConnectorMetadata
+from vllm_ascend.distributed import P2PAFDConnector, P2PAFDConnectorMetadata
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -1035,9 +1035,9 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         # init AFDConnector
         global AFDConnector
         rank = get_world_group().rank_in_group
-        AFDConnector = CAMAFDConnector(rank, self.attn_num, self.ffn_num, self.is_ffn)
+        AFDConnector = P2PAFDConnector(rank, self.attn_num, self.ffn_num, self.is_ffn)
         global afd_connector_metadata
-        afd_connector_metadata = AFDConnectorMetadata(layer_idx=0, stage_idx=0, seq_lens=[])
+        afd_connector_metadata = P2PAFDConnectorMetadata(layer_idx=0, stage_idx=0, seq_lens=[])
 
     # NOTE: This `load_weights` is mainly copied from
     # https://github.com/vllm-project/vllm/commit/07b8fae219b1fff51ef115c38c44b51395be5bb5
