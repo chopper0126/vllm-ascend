@@ -26,4 +26,6 @@ KVConnectorFactory.register_connector(
     "AscendSimpleConnector",
     "vllm_ascend.distributed.kv_transfer.simple_connector", "SimpleConnector")
 
-from .afd_communicators import *
+from .AFDConnector import *
+from .P2PAFDConnector import *
+from .CAMAFDConnector import *
