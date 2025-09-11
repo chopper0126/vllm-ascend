@@ -12,6 +12,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.worker.model_runner import ModelRunner
 from vllm.worker.worker import Worker
+from vllm.config import set_current_vllm_config
 
 T = TypeVar("T", bound=Worker)
 
@@ -71,7 +72,7 @@ def creat_hccl_process_group(rank, world_size):
         group_name="new_hccl"
     )
     return new_default_group
-    
+
 def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
     print(f"进程 {rank} 启动，参数: world_size={world_size}, "
           f"attn_size={attn_size}, ffn_size={ffn_size}")
@@ -90,30 +91,10 @@ def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
 def run_ffn(rank, world_size,attn_size, ffn_size):
 
     ffn_default_group = create_ffn_process_group(rank, world_size,attn_size, ffn_size)
-    
+
     config = create_config()
-    attn_ranks = list(config.additional_config.get("attn_ranks"))
-    ffn_ranks = list(config.additional_config.get("ffn_ranks"))
-    role = config.additional_config.get("role")
-    print(f'attn_ranks is {attn_ranks}')
-    # new_default_group
-    # global _NEW_DEFAULT_GROUP
-    ps._NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, len(attn_ranks) + len(ffn_ranks))
-    # switcher, update default group to new_default_group
-    default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), ps._NEW_DEFAULT_GROUP)
-    # create sub_group in new_default_group
-    with default_pg_switcher:
-        sub_group_ranks = []
-        for i in range(len(ffn_ranks)):
-            ranks = list([attn_ranks[i],ffn_ranks[i]])
-            sub_group_ranks.append(ranks)
-        ps._AE_GROUP = init_model_parallel_group(sub_group_ranks,
-                                    rank,
-                                    backend='hccl', 
-                                    group_name="ae")
-    print(f'rank={rank},create global process group success')   
-    print(f'rank={rank},start to run model') 
-    
+    set_current_vllm_config(config)
+
     """Initialize the worker for Ascend."""
     # register patch for vllm
     from vllm_ascend.utils import adapt_patch
@@ -124,11 +105,7 @@ def run_ffn(rank, world_size,attn_size, ffn_size):
     from vllm_ascend import ops
     ops.register_dummy_fusion_op()
     _register_atb_extensions()
-    # # init ascend config
-    # init_ascend_config(vllm_config)
 
-    
-    
     ffn_worker = create_worker(
         FFNWorker,
         model_runner_cls=FFNModelRunner,
@@ -137,7 +114,7 @@ def run_ffn(rank, world_size,attn_size, ffn_size):
         ffn_size = ffn_size
     )
 
-    
+
 def init_process_group(
     backend: Union[str, Backend] = None,
     init_method: Optional[str] = None,
@@ -190,6 +167,7 @@ def init_process_group(
 from vllm_ascend.platform import NPUPlatform
 import threading
 
+
 class FFNWorker(NPUWorker):
 
     def __init__(
@@ -201,7 +179,7 @@ class FFNWorker(NPUWorker):
             is_driver_worker: bool = False,
             # Additional parameters for compatibility with vllm
             **kwargs):
-        
+
         """Initialize the worker for Ascend."""
         # register patch for vllm
         from vllm_ascend.utils import adapt_patch
@@ -231,12 +209,11 @@ class FFNWorker(NPUWorker):
         NPUPlatform.set_device(device)
         NPUPlatform.empty_cache()
         self.init_npu_memory = NPUPlatform.mem_get_info()[0]
-
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
         # Set random seed.
         NPUPlatform.seed_everything(self.model_config.seed)
-
+        
         # Init ModelRunner here, so that we have access to self.device.
         self.model_runner = FFNModelRunner(self.vllm_config, device)
 
@@ -248,7 +225,7 @@ class FFNWorker(NPUWorker):
         return output
 
 def create_config() -> VllmConfig:
-    
+
     engine_args = EngineArgs(
         model="/data/weight/DeepSeek-V2-Lite",
         enforce_eager=True,
@@ -261,14 +238,14 @@ def create_config() -> VllmConfig:
                 'enabled': True,},
             "enable_afd":True,
             "enable_ms_afd":False,
-            "attn_ranks": [0,1],
-            "ffn_ranks": [2,3],
-            "role":"ffn"
+            "attn_num": 2,
+            "ffn_num": 2,
+            "is_ffn": True
             }
     )
     engine_config = engine_args.create_engine_config()  
     return engine_config
-    
+
 def create_worker(cls: Callable[..., T],
                   model_runner_cls: Optional[ModelRunner] = None,
                   engine_config: VllmConfig = None,
@@ -287,7 +264,6 @@ def create_worker(cls: Callable[..., T],
         is_driver_worker = False,
         model_runner_cls = model_runner_cls,
     )
-
     worker.init_device()
     worker.load_model()
     worker.execute_model()
@@ -304,7 +280,7 @@ class FFNModelRunner(NPUModelRunner):
                          device=device)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-    
+
     def execute_model(self):
         """Execute FFN computation for a single request batch"""
         print('ffn forward begain')
@@ -314,7 +290,7 @@ class FFNModelRunner(NPUModelRunner):
             for i in range(layers_num):
                 self.model.model.layers[i].ffn_forward()
         print('ffn forward finished')
-     
+
 if __name__ == '__main__':
     hccl_world_size = 4
     attn_size = 2
