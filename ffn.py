@@ -285,10 +285,8 @@ class FFNModelRunner(NPUModelRunner):
         """Execute FFN computation for a single request batch"""
         print('ffn forward begain')
         # TODO: use event replace
-        while True:
-            layers_num = len(self.model.model.layers)
-            for i in range(layers_num):
-                self.model.model.layers[i].ffn_forward()
+        while True:          
+            self.model.model.ffn_forward()
         print('ffn forward finished')
 
 if __name__ == '__main__':
