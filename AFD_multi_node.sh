@@ -1,3 +1,5 @@
+# if use torchair graph,
+#export  VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE=0
 # 指定master addr 、master port
 export MASTER_ADDR="141.61.41.134" 
 export MASTER_PORT="29500"

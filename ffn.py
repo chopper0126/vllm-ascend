@@ -45,7 +45,18 @@ from vllm.config import  VllmConfig
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.worker.worker_v1 import NPUWorker
 from vllm.distributed import parallel_state as ps
+# from vllm.distributed.parallel_state import default_process_group_switcher,get_new_default_group
 
+
+from contextlib import contextmanager
+
+@contextmanager
+def default_process_group_switcher(default_group, new_default_group):
+    try:
+        _update_default_pg(new_default_group)
+        yield
+    finally:
+        _update_default_pg(default_group)
 
 class DefaultProcessGroupSwitcher:
     def __init__(self, default_group, new_default_group):
@@ -57,6 +68,18 @@ class DefaultProcessGroupSwitcher:
 
     def __exit__(self, exc_type, exc_value, traceback):
         _update_default_pg(self.default_group)
+
+# @torch._dynamo.disable(recursive=False)
+# @torch._dynamo.skip
+@torch.compiler.disable(recursive=False)
+def set_process_group(new_default_group):
+    _update_default_pg(new_default_group)  # 切换进程组
+
+# @torch._dynamo.disable(recursive=False)
+# @torch._dynamo.skip
+@torch.compiler.disable(recursive=False)
+def reset_process_group(default_group):
+    _update_default_pg(default_group)  # 恢复原进程组
 
 def creat_hccl_process_group(rank, world_size):
     import torch
@@ -79,7 +102,7 @@ def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
     
     torch.npu.set_device(rank)
     #TODO:remove hard code
-    init_method = 'tcp://127.0.0.1:29503'
+    init_method = 'tcp://127.0.0.1:29504'
     ffn_default_group = dist.init_process_group(
             init_method=init_method,
             backend='hccl', 
@@ -106,17 +129,20 @@ def run_ffn(rank, world_size,attn_size, ffn_size):
     # global _NEW_DEFAULT_GROUP
     ps._NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, len(attn_ranks) + len(ffn_ranks))
     # switcher, update default group to new_default_group
-    default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), ps._NEW_DEFAULT_GROUP)
+    pre_default_group = _get_default_group()
+    set_process_group(ps._NEW_DEFAULT_GROUP)
+    # default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), ps._NEW_DEFAULT_GROUP)
     # create sub_group in new_default_group
-    with default_pg_switcher:
-        sub_group_ranks = []
-        for i in range(len(ffn_ranks)):
-            ranks = list([attn_ranks[i],ffn_ranks[i]])
-            sub_group_ranks.append(ranks)
-        ps._AE_GROUP = init_model_parallel_group(sub_group_ranks,
-                                    rank,
-                                    backend='hccl', 
-                                    group_name="ae")
+    # with default_process_group_switcher(_get_default_group(), ps._NEW_DEFAULT_GROUP):
+    sub_group_ranks = []
+    for i in range(len(ffn_ranks)):
+        ranks = list([attn_ranks[i],ffn_ranks[i]])
+        sub_group_ranks.append(ranks)
+    ps._AE_GROUP = init_model_parallel_group(sub_group_ranks,
+                                rank,
+                                backend='hccl', 
+                                group_name="ae")
+    reset_process_group(pre_default_group)
     print(f'rank={rank},create global process group success')   
     print(f'rank={rank},start to run model') 
     
@@ -255,10 +281,11 @@ class FFNWorker(NPUWorker):
 def create_config() -> VllmConfig:
     
     engine_args = EngineArgs(
-        model="/home/data/DeepSeek-V2-Lite",
-        enforce_eager=True,
+        model="/home/data/DeepSeek-V3.1_w8a8mix_mtp",
+        enforce_eager=False,
         trust_remote_code=True,
-        tensor_parallel_size=2,
+        quantization="ascend",
+        tensor_parallel_size=1,
         enable_expert_parallel=True,
         additional_config={
             # 关闭chunked_prefill ,调度器走vllm-ascend 重写的调度器，V0
@@ -266,12 +293,21 @@ def create_config() -> VllmConfig:
                 'enabled': True,},
             "enable_afd":True,
             "enable_ms_afd":False,
-            "attn_ranks": [0,1],
-            "ffn_ranks": [2,3],
+            "attn_ranks": [0],
+            "ffn_ranks": [1],
             "role":"ffn",
             "attn_num": 1,
             "ffn_num": 1,
-            "node_num": 1
+            "node_num": 1,
+            "torchair_graph_config":{
+                     "enabled":True,
+                    #  "enable_kv_nz":False,
+                    #  "enable_multistream_mla":False,
+                    #  "enable_multistream_moe":False,
+                    #  "graph_batch_sizes":[28],
+                    #  "enable_super_kernel":False, 
+                    #  "use_cached_graph":False
+                    }
             }
     )
     engine_config = engine_args.create_engine_config()  
@@ -324,9 +360,9 @@ class FFNModelRunner(NPUModelRunner):
         print('ffn forward finished')
      
 if __name__ == '__main__':
-    hccl_world_size = 4
-    attn_size = 2
-    ffn_size = 2
+    hccl_world_size = 2
+    attn_size = 1
+    ffn_size = 1
 
     hccl_processes = []
     for rank in range(ffn_size,hccl_world_size):
