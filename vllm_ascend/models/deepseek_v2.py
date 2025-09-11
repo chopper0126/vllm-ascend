@@ -923,6 +923,11 @@ class CustomDeepseekV2Model(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.enable_afd = vllm_config.additional_config.get(
             "enable_afd", False)
+        self.first_k_dense_replace = config.first_k_dense_replace
+        self.enable_ms_for_afd = vllm_config.additional_config.get(
+            "enable_ms_for_afd", False)
+        self.is_ffn = vllm_config.additional_config.get(
+            "is_ffn", False)
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -976,18 +981,31 @@ class CustomDeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        replace_allreduce = hidden_states.shape[0] % self.tp_size == 0
+        num_normal_layers = (self.first_k_dense_replace
+                            if self.enable_ms_for_afd and self.can_run_ms()
+                             else self.end_layer - self.start_layer)
 
-        for i in range(self.start_layer, self.end_layer):
+        moe_start_layer = self.start_layer + num_normal_layers
+        print('moe_start_layer', moe_start_layer, self.start_layer, self.end_layer)
+        for i in range(self.start_layer, min(moe_start_layer, self.end_layer)):
+            print('i=', i)
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
+                positions, hidden_states, residual,
                 kv_caches[i -
-                          self.start_layer] if kv_caches is not None else None,
-                attn_metadata,
-                replace_allreduce=replace_allreduce)
+                        self.start_layer] if kv_caches is not None else None,
+                attn_metadata)
+
+        if moe_start_layer < self.end_layer:
+            print('moe_start_layer < self.end_layer 进入多流逻辑')
+            # if we enable multistream/dbo, process sparse layers here
+            hidden_states, residual = self._forward_ms_layers(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                moe_start_layer=moe_start_layer,
+                kv_caches=kv_caches,
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -998,6 +1016,28 @@ class CustomDeepseekV2Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def ffn_forward(self):
+        num_normal_layers = (self.first_k_dense_replace
+                            if self.enable_ms_for_afd and self.can_run_ms()
+                             else self.end_layer - self.start_layer)
+
+        moe_start_layer = self.start_layer + num_normal_layers
+        print('moe_start_layer', moe_start_layer, self.start_layer, self.end_layer)
+        for i in range(self.start_layer, min(moe_start_layer, self.end_layer)):
+            print('i=', i)
+            layer = self.layers[i]
+            layer.ffn_forward()
+
+        if moe_start_layer < self.end_layer:
+            print('moe_start_layer < self.end_layer 进入多流逻辑')
+            # if we enable multistream/dbo, process sparse layers here
+            hidden_states, residual = self._forward_ms_layers(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                moe_start_layer=moe_start_layer,
+                kv_caches=kv_caches,
+            )
 
 class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
     # add `packed_modules_mapping` in `DeepseekV2ForCausalLM` to support weight merging
