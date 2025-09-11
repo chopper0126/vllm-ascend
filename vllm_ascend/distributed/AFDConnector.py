@@ -37,6 +37,8 @@ class AFDConnectorMetadata:
     topk_weights: Optional[torch.Tensor] # the expert weights
     moe_expert_num: Optional[int] # number of moe experts
     shared_expert_num: Optional[int] # number of share experts
+    scale: Optional[torch.Tensor] #  quant scale
+    expertTokenNumsOut: Optional[torch.Tensor] # The number of tokens received by each expert is used as input for the subsequent GMM.
     handle: Optional[torch.Tensor] # the communication handle given by the recv_attn_output
 
 class DefaultProcessGroupSwitcher:
