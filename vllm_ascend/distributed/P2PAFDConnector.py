@@ -91,6 +91,8 @@ class P2PAFDConnector(AFDConnectorBase):
     # ATTN发给MOE（ATTN发送）
     def send_attn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata) -> Any:    
         default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
+        topk_weights = metadata.ffn_need_metadata.topk_weights
+        topk_ids = metadata.ffn_need_metadata.topk_ids
         with default_pg_switcher:
             ae_group = get_ae_group_new()
             dst = (ae_group.rank_in_group + 1) % ae_group.world_size
@@ -99,8 +101,18 @@ class P2PAFDConnector(AFDConnectorBase):
             attn_metadata = metadata.attn_metadata
             ae_group.send_object(attn_metadata, dst=dst)
             size_tensor = torch.tensor(hidden_states.size()).npu()
+            topk_weights_size = torch.tensor(topk_weights.size()).npu()
+            topk_ids_size = torch.tensor(topk_ids.size()).npu()
             ae_group.send(size_tensor)
             ae_group.send(hidden_states)
+
+            ae_group.send(topk_weights_size)            
+            ae_group.send(topk_weights)
+            print(topk_weights_size, topk_weights.size())
+
+            ae_group.send(topk_ids_size)
+            ae_group.send(topk_ids)
+            print(topk_ids_size, topk_ids.size())
         return
 
     # MOE发给ATTN（ATTN接收）hidden_states只负责提供shape和dtype
@@ -130,5 +142,18 @@ class P2PAFDConnector(AFDConnectorBase):
             size_tensor = ae_group.recv(2,dtype=torch.int64)
             size_tensor = torch.zeros([size_tensor[0],size_tensor[1]])
             hidden_states = ae_group.recv(size_tensor.size(),dtype=torch.bfloat16)
+
+            topk_weights_size = ae_group.recv(2,dtype=torch.int64)
+            topk_weights = torch.zeros([topk_weights_size[0],topk_weights_size[1]])
+            topk_weights = ae_group.recv(topk_weights.size(),dtype=torch.bfloat16)
+
+            topk_ids_size = ae_group.recv(2,dtype=torch.int64)
+            topk_ids = torch.zeros([topk_ids_size[0],topk_ids_size[1]])
+            topk_ids = ae_group.recv(topk_ids.size(),dtype=torch.int32)
+            print(topk_ids_size, topk_ids.size())
+
+            ffn_need_metadata_obj.topk_weights = topk_weights
+            ffn_need_metadata_obj.topk_ids = topk_ids
+            
         
         return ffn_need_metadata_obj, attn_metadata, hidden_states
