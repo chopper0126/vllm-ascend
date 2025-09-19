@@ -384,6 +384,7 @@ class CustomDeepseekV2MoE(nn.Module):
             hidden_states: torch.Tensor,
             w1: torch.Tensor,
             w2: torch.Tensor,
+            group_list,
         ):
         w1 = w1.transpose(1, 2)
         gate_up_out_list = torch_npu.npu_grouped_matmul(
@@ -392,7 +393,7 @@ class CustomDeepseekV2MoE(nn.Module):
             split_item=2,
             group_list_type=0,
             group_type=0,
-            group_list=expert_tokens,
+            group_list=group_list,
         )
 
         gate_up_out = torch.cat(gate_up_out_list, dim=0)
@@ -405,7 +406,7 @@ class CustomDeepseekV2MoE(nn.Module):
             split_item=2,
             group_list_type=0,
             group_type=0,
-            group_list=expert_tokens,
+            group_list=group_list,
         )
 
         down_out_list = torch.cat(down_out_list, dim=0)
@@ -419,11 +420,10 @@ class CustomDeepseekV2MoE(nn.Module):
 
         self.layer_index += 1
 
-        is_prefill = kwargs.get("is_prefill",False)
-        enable_force_load_balance = kwargs.get("enable_force_load_balance",False)
-        is_ffn = kwargs.get("is_ffn",False)
-        topk_weights = kwargs.get("topk_weights",None)
-        topk_ids = kwargs.get("topk_ids",None)
+        is_prefill = kwargs.get("is_prefill", False)
+        enable_force_load_balance = kwargs.get("enable_force_load_balance", False)
+        is_ffn = kwargs.get("is_ffn", False)
+        group_list = kwargs.get("group_list", None)
         if is_ffn:
             is_prefill = is_prefill
             enable_force_load_balance = enable_force_load_balance
@@ -445,7 +445,9 @@ class CustomDeepseekV2MoE(nn.Module):
 
         hidden_states = self.gmm_compute(hidden_states=hidden_states,
                                  w1=self.experts.w13_weight,
-                                 w2=self.experts.w2_weight)
+                                 w2=self.experts.w2_weight,
+                                 group_list=group_list
+                                 )
 
         return hidden_states
 
@@ -853,11 +855,13 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             router_logits, _ = self.gate(hidden_states)
             topk_weights, topk_ids = select_experts(hidden_states, router_logits, self.top_k, use_grouped_topk=True, renormalize=True, topk_group=self.topk_group, num_expert_group=self.num_expert_group)   
             
+            # TODO 这里的metadata对M2N算子应该是不需要的，需要替换成获取metadata的逻辑
+            #------------
             ffn_need_metadata = FFNNeedMetadata(topk_weights, topk_ids,is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
             
             afd_connector_metadata.set_ffn_need_metadata(ffn_need_metadata)
             afd_connector_metadata.set_attn_metadata(attn_metadata)
-            
+            #------------
             AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
             hidden_states = AFDConnector.recv_ffn_output(hidden_states)
         else:
@@ -917,6 +921,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     def ffn_forward(
         self,
     ) -> torch.Tensor:
+        # TODO 这里recv到的东西应该只剩metadata了,并从Metadata中获取group_list，记得更改
         ffn_need_metadata_obj, attn_metadata, hidden_states = AFDConnector.recv_attn_output()
 
 
@@ -930,8 +935,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                     is_prefill = ffn_need_metadata_obj.is_prefill,
                                     enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
                                     is_ffn = ffn_need_metadata_obj.is_ffn,
-                                    topk_weights = ffn_need_metadata_obj.topk_weights,
-                                    topk_ids = ffn_need_metadata_obj.topk_ids,
+                                    group_list = group_list
                                     )
         else:
             hidden_states = self.mlp(hidden_states)
@@ -1123,6 +1127,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
         # init AFDConnector
+        # TODO 这里要改成待接入的算子
         global AFDConnector
         rank = get_world_group().rank_in_group
         AFDConnector = P2PAFDConnector(rank, self.attn_num, self.ffn_num, self.is_ffn)
