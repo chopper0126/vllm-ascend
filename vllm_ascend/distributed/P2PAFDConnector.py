@@ -73,6 +73,7 @@ class P2PAFDConnector(AFDConnectorBase):
         global _NEW_DEFAULT_GROUP
         if is_ffn:
             rank = rank+attn_size
+        print('rank=', rank)
         _NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, ffn_size+attn_size)
         self.default_group = _NEW_DEFAULT_GROUP
         default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), _NEW_DEFAULT_GROUP)
@@ -108,11 +109,11 @@ class P2PAFDConnector(AFDConnectorBase):
 
             ae_group.send(topk_weights_size)            
             ae_group.send(topk_weights)
-            print(topk_weights_size, topk_weights.size())
+            # print(topk_weights_size, topk_weights.size())
 
             ae_group.send(topk_ids_size)
             ae_group.send(topk_ids)
-            print(topk_ids_size, topk_ids.size())
+            # print(topk_ids_size, topk_ids.size())
         return
 
     # MOE发给ATTN（ATTN接收）hidden_states只负责提供shape和dtype
@@ -144,13 +145,14 @@ class P2PAFDConnector(AFDConnectorBase):
             hidden_states = ae_group.recv(size_tensor.size(),dtype=torch.bfloat16)
 
             topk_weights_size = ae_group.recv(2,dtype=torch.int64)
-            topk_weights = torch.zeros([topk_weights_size[0],topk_weights_size[1]])
-            topk_weights = ae_group.recv(topk_weights.size(),dtype=torch.bfloat16)
+            topk_weights = torch.empty([topk_weights_size[0],topk_weights_size[1]])
+            topk_weights = ae_group.recv(topk_weights.size(),dtype=torch.float32)
+            topk_weights = topk_weights.to(torch.bfloat16)
 
             topk_ids_size = ae_group.recv(2,dtype=torch.int64)
-            topk_ids = torch.zeros([topk_ids_size[0],topk_ids_size[1]])
+            topk_ids = torch.empty([topk_ids_size[0],topk_ids_size[1]])
             topk_ids = ae_group.recv(topk_ids.size(),dtype=torch.int32)
-            print(topk_ids_size, topk_ids.size())
+            # print(topk_ids_size, topk_ids.size())
 
             ffn_need_metadata_obj.topk_weights = topk_weights
             ffn_need_metadata_obj.topk_ids = topk_ids
