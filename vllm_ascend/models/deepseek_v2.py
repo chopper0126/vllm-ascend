@@ -422,56 +422,28 @@ class CustomDeepseekV2MoE(nn.Module):
                                 expert_load_balancer.get_rank_placement_map(
                                                 self.moe_instance_id,
                                                 get_ep_group().rank_in_group)
-            # self.log2phy = expert_load_balancer.get_rank_log2phy_map(
-            #     self.moe_instance_id,
-            #     get_ep_group().rank_in_group)
-            # self.global_redundant_expert_num = \
-            #             expert_load_balancer.get_global_redundant_expert_num()
         else:
             # Create a tensor of size num_experts filled with -1
             self.local_num_experts, self.expert_map = determine_expert_map(
                 self.ep_size,
                 get_ep_group().rank_in_group, self.global_num_experts)
-        # ## 调用fused_expert
-            
-        # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_hidden_states_before_l2.pt')
 
-        hidden_states = fused_experts(hidden_states=hidden_states,
+        shared_hidden_states = self.shared_experts(hidden_states)
+
+        experts_hidden_states = fused_experts(hidden_states=hidden_states,
                                  w1=self.experts.w13_weight,
                                  w2=self.experts.w2_weight,
                                  topk_weights=topk_weights,
                                  topk_ids=topk_ids,
                                  top_k=self.top_k,
                                  expert_map=self.expert_map)
-        # if self.layer_index == 2:
-        #     torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_hidden_states_after_l2.pt')
-        #     torch.save({'topk_weights': topk_weights, 'topk_ids': topk_ids}, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_topk_l2.pt')
-        # hidden_states = fused_experts_with_all2all(hidden_states=hidden_states,
-        #                              w1=self.experts.w13_weight,
-        #                             w2=self.experts.w2_weight,
-        #                             topk_weights=topk_weights,
-        #                             topk_ids=topk_ids,
-        #                             top_k=self.top_k,
-        #                             expert_map=self.expert_map,
-        #                             ep_group=get_ep_group())
 
-
-        # experts_hidden_states = self.experts(
-        #     hidden_states=hidden_states,
-        #     router_logits=router_logits,
-        #     is_prefill=is_prefill,
-        #     top_k=CustomDeepseekV2MoE.top_k,
-        #     enable_force_load_balance=enable_force_load_balance,
-        #     shared_experts=self.shared_experts,
-        #     gate=self.gate,
-        #     replace_allreduce=replace_allreduce)
-
-        # hidden_states = (
-        #     experts_hidden_states[0] * self.routed_scaling_factor +
-        #     experts_hidden_states[1])
-        # if self.all_reduce_merge:
-        #     # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
-        #     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = (
+            experts_hidden_states * self.routed_scaling_factor +
+            shared_hidden_states)
+        if self.all_reduce_merge:
+            # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         return hidden_states
 
@@ -621,19 +593,6 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             o_proj=self.o_proj,
         )
 
-        # self.gate = ReplicatedLinear(config.hidden_size,
-        #                              config.n_routed_experts,
-        #                              bias=False,
-        #                              quant_config=None,
-        #                              prefix=f"{prefix}.gate")
-        # if config.topk_method == "noaux_tc":
-        #     self.gate.e_score_correction_bias = nn.Parameter(
-        #         torch.empty(config.n_routed_experts))
-        # else:
-        #     self.gate.e_score_correction_bias = None
-
-        # self.top_k = config.num_experts_per_tok
-
     def forward(
             self,
             positions: torch.Tensor,
@@ -641,8 +600,6 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             kv_cache: Optional[torch.Tensor] = None,
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
         self.layer_index += 1
-        # print('刚传进来的hidden_states=', hidden_states)
-        # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/Custom_forward_hidden_states_l'+str(self.layer_index)+'_before.pt')              
         enable_multistream_mla = (self.enable_multistream_mla
                                   and attn_metadata is not None
                                   and not attn_metadata.with_prefill_across_dp
@@ -652,19 +609,11 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             npu_prefetch(self.q_a_proj.weight,
                          hidden_states,
                          enabled=enable_multistream_mla)
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/q_a_proj_hidden_states_l'+str(self.layer_index)+'_before.pt')
-
             ckq = self.q_a_proj(hidden_states)[0]
-
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/q_a_proj_ckq_l'+str(self.layer_index)+'.pt')
-
             hidden_states_or_q_c = self.q_a_layernorm(ckq)
             forward_kwargs['ckq'] = ckq
         else:
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/not_q_a_proj_hidden_states_l'+str(self.layer_index)+'_before.pt')              
             hidden_states_or_q_c = hidden_states
-            # print('hidden_states_or_q_c=', hidden_states_or_q_c)
-            # torch.save(hidden_states_or_q_c, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/not_q_a_proj_hidden_states_l'+str(self.layer_index)+'_after.pt')
         if self.torchair_graph_enabled:
             output_shape = hidden_states.shape
             output = torch.empty(output_shape,
@@ -677,35 +626,14 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                                 attn_metadata,
                                                 **forward_kwargs)
             hidden_states = output.view(-1, output_shape[-1])
-            # return output
         else:
             kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/CustomDeepseekV2MLAAttention_hidden_states_l'+str(self.layer_index)+'_before.pt')
-            # print('kv_c_normed=', kv_c_normed)
-            # print('k_pe=', k_pe)
             hidden_states = self.mla_attn(hidden_states_or_q_c,
                                  kv_c_normed,
                                  k_pe,
                                  output_shape=hidden_states.shape)
-            
-
-            # print('mla_attn之后的hidden_states_after=', hidden_states)
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/CustomDeepseekV2MLAAttention_hidden_states_l'+str(self.layer_index)+'_after.pt')
-            
-            # # router_logits: (num_tokens, n_experts)
-            # router_logits = None
-            # # if not self.rm_router_logits:
-            # router_logits, _ = self.gate(hidden_states)
-            # # print('router_logits=', router_logits)
-            # # torch.save(router_logits, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_router_logits_l'+str(self.layer_index)+'.pt')
-            #     # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_hidden_states_l1.pt')
-            # topk_weights, topk_ids = select_experts(hidden_states, router_logits, self.top_k, False, True)
-            # # print('topk_weights=', topk_weights)
-            # # print('topk_ids=', topk_ids)
-            # return hidden_states, topk_weights, topk_ids
             return hidden_states
 
 
@@ -740,7 +668,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             if not self.is_ffn:
                 # TODO: enable mla in vllm-ascend
                 if model_config.use_mla:
-                    # print('layer里是CustomDeepseekV2MLAAttention', self.layer_idx)
                     attn_cls = CustomDeepseekV2MLAAttention
                 else:
                     attn_cls = DeepseekV2Attention
@@ -855,9 +782,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         attn_metadata: Optional[AttentionMetadata] = None,
         replace_allreduce: bool = False,
     ) -> torch.Tensor:
-        if self.layer_idx == 0:
-            print('l')
-        # print('最开始的hs:', hidden_states)
         # Self Attention
         if attn_metadata is not None and attn_metadata.num_decodes > 0:
             mla_moe_communication = self.mla_moe_communication and replace_allreduce
@@ -879,18 +803,14 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                                              dim=0)
         rank = get_world_group().rank_in_group
 
-        if self.enable_afd:
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_hidden_states_l'+str(self.layer_idx)+'_before.pt')
-            # print('hidden_states_before=', hidden_states)    
+        if self.enable_afd:  
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
                 attn_metadata=attn_metadata,
             )
-            # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_hidden_states_l'+str(self.layer_idx)+'_after.pt')
-            # torch.save({'topk_weights': topk_weights, 'topk_ids': topk_ids}, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_topk_attn_l'+str(self.layer_idx)+'_after.pt')
-                
+            
             if mla_moe_communication and residual.shape[0] != hidden_states.shape[
                     0]:
                 chunk_hidden_states = torch.tensor_split(residual,
@@ -928,12 +848,12 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             router_logits = None
             # if not self.rm_router_logits:
             router_logits, _ = self.gate(hidden_states)
-            # print('router_logits=', router_logits)
-            # torch.save(router_logits, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_router_logits_l'+str(self.layer_index)+'.pt')
-                # torch.save(hidden_states, '/home/y00889327/vllm-yxj/code/test-vllm-ascend/data/v2_hidden_states_l1.pt')
-            topk_weights, topk_ids = select_experts(hidden_states, router_logits, self.top_k, use_grouped_topk=True, renormalize=False, topk_group=self.topk_group, num_expert_group=self.num_expert_group)
-            # print('topk_weights=', topk_weights)
-            # print('topk_ids=', topk_ids)          
+            topk_weights, topk_ids = select_experts(hidden_states, 
+                                                    router_logits, 
+                                                    self.top_k, 
+                                                    use_grouped_topk=True,
+                                                    renormalize=False, topk_group=self.topk_group, 
+                                                    num_expert_group=self.num_expert_group)    
             
             ffn_need_metadata = FFNNeedMetadata(topk_weights, topk_ids,is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
             
@@ -991,8 +911,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 hidden_states = tensor_model_parallel_all_gather(hidden_states,
                                                                 dim=0)
                 residual = tensor_model_parallel_all_gather(residual, dim=0)
-        # print(f"rank == {rank} 最后的 hidden_states is == {hidden_states}")
-        # print(f"rank == {rank} 最后的 residual is == {residual}")
         return hidden_states, residual
 
     # ----------------------------------------- afd-related --------------------------------------------
@@ -1119,15 +1037,12 @@ class CustomDeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        # print('model forward里的hidden_state', hidden_states)
         num_normal_layers = (self.first_k_dense_replace
                             if self.enable_ms_for_afd and self.can_run_ms()
                              else self.end_layer - self.start_layer)
 
         moe_start_layer = self.start_layer + num_normal_layers
-        # print('moe_start_layer', moe_start_layer, self.start_layer, self.end_layer)
         for i in range(self.start_layer, min(moe_start_layer, self.end_layer)):
-            # print('i=', i, hidden_states)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, residual,
@@ -1136,7 +1051,6 @@ class CustomDeepseekV2Model(nn.Module):
                 attn_metadata)
 
         if moe_start_layer < self.end_layer:
-            # print('moe_start_layer < self.end_layer 进入多流逻辑')
             # if we enable multistream/dbo, process sparse layers here
             hidden_states, residual = self._forward_ms_layers(
                 positions=positions,
@@ -1161,14 +1075,11 @@ class CustomDeepseekV2Model(nn.Module):
                              else self.end_layer - self.start_layer)
 
         moe_start_layer = self.start_layer + num_normal_layers
-        # print('moe_start_layer', moe_start_layer, self.start_layer, self.end_layer)
         for i in range(self.start_layer, min(moe_start_layer, self.end_layer)):
-            # print('i=', i)
             layer = self.layers[i]
             layer.ffn_forward()
 
         if moe_start_layer < self.end_layer:
-            # print('moe_start_layer < self.end_layer 进入多流逻辑')
             # if we enable multistream/dbo, process sparse layers here
             hidden_states, residual = self._forward_ms_layers(
                 positions=positions,
@@ -1225,7 +1136,6 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         """"""
-        # print('好像是这里出的问题')
         rank = get_world_group().rank_in_group
         tp_size = get_tensor_model_parallel_world_size()
         ascend_config = get_ascend_config()
@@ -1245,10 +1155,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
             num_experts=self.config.n_routed_experts)
 
         params_dict = dict(self.named_parameters())
-        # print(params_dict.keys())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            # print('name=', name)
             if 'mlp.gate.' in name:
                 print(name)
                 name = name.replace("mlp.gate.", "gate.")
