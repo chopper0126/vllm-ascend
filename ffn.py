@@ -2,6 +2,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import time
 import torch
+import os
 
 from typing import Callable, Optional, TypeVar, Union
 
@@ -76,10 +77,12 @@ def creat_hccl_process_group(rank, world_size):
 def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
     print(f"进程 {rank} 启动，参数: world_size={world_size}, "
           f"attn_size={attn_size}, ffn_size={ffn_size}")
-    if rank == 1: time.sleep(1); print('======================================================================')
+    if rank == 1: 
+        time.sleep(1)
+        print('======================================================================')
     import torch
     torch.npu.set_device(rank)
-    init_method = 'tcp://127.0.0.1:29503'
+    init_method = 'tcp://127.0.0.1:29505'
     ffn_default_group = dist.init_process_group(
             init_method=init_method,
             backend='hccl', 
@@ -88,11 +91,11 @@ def create_ffn_process_group(rank, world_size,attn_size, ffn_size):
         )
     return ffn_default_group
 
-def run_ffn(rank, world_size,attn_size, ffn_size):
+def run_ffn(model, rank, world_size,attn_size, ffn_size):
 
     ffn_default_group = create_ffn_process_group(rank, world_size,attn_size, ffn_size)
 
-    config = create_config()
+    config = create_config(model, attn_size, ffn_size)
     set_current_vllm_config(config)
 
     """Initialize the worker for Ascend."""
@@ -224,13 +227,13 @@ class FFNWorker(NPUWorker):
         output = self.model_runner.execute_model()
         return output
 
-def create_config() -> VllmConfig:
+def create_config(model, attn_size, ffn_size) -> VllmConfig:
 
     engine_args = EngineArgs(
-        model="/data/weight/DeepSeek-V2-Lite",
+        model=model,
         enforce_eager=True,
         trust_remote_code=True,
-        tensor_parallel_size=2,
+        tensor_parallel_size=ffn_size,
         enable_expert_parallel=True,
         additional_config={
             # 关闭chunked_prefill ,调度器走vllm-ascend 重写的调度器，V0
@@ -238,8 +241,8 @@ def create_config() -> VllmConfig:
                 'enabled': True,},
             "enable_afd":True,
             "enable_ms_afd":False,
-            "attn_num": 2,
-            "ffn_num": 2,
+            "attn_num": attn_size,
+            "ffn_num": ffn_size,
             "is_ffn": True
             }
     )
@@ -285,7 +288,7 @@ class FFNModelRunner(NPUModelRunner):
         """Execute FFN computation for a single request batch"""
         print('ffn forward begain')
         # TODO: use event replace
-        while True:          
+        while True:
             self.model.model.ffn_forward()
         print('ffn forward finished')
 
@@ -293,10 +296,11 @@ if __name__ == '__main__':
     hccl_world_size = 4
     attn_size = 2
     ffn_size = 2
+    model = "/data/weight/DeepSeek-V2-Lite"
 
     hccl_processes = []
     for rank in range(ffn_size,hccl_world_size):
-        p = mp.Process(target=run_ffn, args=(rank, hccl_world_size, attn_size, ffn_size))
+        p = mp.Process(target=run_ffn, args=(model, rank, hccl_world_size, attn_size, ffn_size))
         hccl_processes.append(p)
         p.start()
 
