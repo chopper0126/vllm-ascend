@@ -50,7 +50,7 @@ class CAMAFDConnector(AFDConnectorBase):
         torch.ops.umdk_cam_op_lib.cam_a2e(expandX = hidden_states, expertIds = metadata.topk_idx, 
                                           scales = metadata.topk_weights, commArgs0 = torch.tensor([], dtype=torch.float16, device='npu'), 
                                           expandXOutDType = self.expandXOutDType, 
-                                          commId0, batchSize = self.batch_size, hiddenSize = self.hidden_dim, topk = self.top_k, 
+                                          commId0=None, batchSize = self.batch_size, hiddenSize = self.hidden_dim, topk = self.top_k, 
                                           expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
                                           sharedExpertNum = metadata.shared_expert_num, totalExpertNum = metadata.moe_expert_num, rank = self.rank,
                                           loadBalancingRankNum=0, loadBalancingThreshold=1, dynamicQuant = self.dynamicQuant, 
@@ -61,7 +61,7 @@ class CAMAFDConnector(AFDConnectorBase):
     def recv_ffn_output(self, metadata: CAMAFDConnectorMetadata) -> torch.Tensor:
         output2 = torch.ops.umdk_cam_op_lib.cam_e2a(expandXOut, simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts,                                         
                                           commArgs = torch.tensor([], dtype=torch.float16, device='npu'), 
-                                          commId, 
+                                          commId=None, 
                                           batchSize = self.batch_size, hiddenSize = self.hidden_dim, topk = self.topk,
                                           expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
                                           sharedExpertNum = metadata.shared_expert_num, totalExpertNum = metadata.moe_expert_num,
@@ -76,7 +76,6 @@ class CAMAFDConnector(AFDConnectorBase):
                                           simulateExpertScales = self.simulateExpertScales, 
                                           expandIdx = self.expandIdx, epRecvCounts = self.epRecvCounts,
                                           commArgs = torch.tensor([], dtype=torch.float16, device='npu'), 
-                                          commId, 
                                           batchSize = self.batch_size, hiddenSize = self.hidden_dim, topk = self.topk,
                                           expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
                                           sharedExpertNum = metadata.shared_expert_num, totalExpertNum = metadata.moe_expert_num,
@@ -93,7 +92,7 @@ class CAMAFDConnector(AFDConnectorBase):
         output1 = torch.ops.umdk_cam_op_lib.cam_a2e(expandX, expertIds, expertScales, commArgs0, expandXOutDType, commId0,                                                    
                                                     batchSize = self.batch_size, hiddenSize = self.hidden_dim, topk = self.top_k,
                                                     expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
-                                                    sharedExpertNum, totalExpertNum, rank = self.rank,
+                                                    rank = self.rank,
                                                     loadBalancingRankNum=0, loadBalancingThreshold=1, 
                                                     ep_hcomm_info = self.default_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank))
         expandX, dynamicScales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales = output1[0:7]

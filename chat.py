@@ -34,15 +34,13 @@ if __name__ == "__main__":
 
     sampling_params = SamplingParams(temperature=0.6, top_p=0.95, top_k=40, max_tokens=100)
 
-    llm = LLM(model="/data/weight/DeepSeek-V2-Lite",
+    llm = LLM(
+            model="/home/y30059858/DeepSeek-V2-Lite",
+            enforce_eager=True,
+            trust_remote_code=True,
             tensor_parallel_size=2,
             enable_expert_parallel=True,
-            distributed_executor_backend="mp",
-            max_model_len=1024,
-            trust_remote_code=True,
-            enforce_eager=True,
-            max_num_batched_tokens=8192,
-            max_num_seqs=5,
+            load_format = "dummy",
             additional_config={
                 # 关闭chunked_prefill ,调度器走vllm-ascend 重写的调度器，V0
                 'ascend_scheduler_config':{
@@ -53,7 +51,7 @@ if __name__ == "__main__":
                 "attn_num": 2,
                 "ffn_num": 2,
                 }
-            )
+        )
 
     outputs = llm.generate(prompts, sampling_params)
     for output in outputs:

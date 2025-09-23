@@ -227,7 +227,8 @@ class FFNWorker(NPUWorker):
 def create_config() -> VllmConfig:
 
     engine_args = EngineArgs(
-        model="/data/weight/DeepSeek-V2-Lite",
+        model="/home/y30059858/DeepSeek-V2-Lite",
+        load_format = "dummy",
         enforce_eager=True,
         trust_remote_code=True,
         tensor_parallel_size=2,
@@ -237,7 +238,7 @@ def create_config() -> VllmConfig:
             'ascend_scheduler_config':{
                 'enabled': True,},
             "enable_afd":True,
-            "enable_ms_afd":False,
+            "enable_ms_afd":True,
             "attn_num": 2,
             "ffn_num": 2,
             "is_ffn": True
@@ -280,14 +281,29 @@ class FFNModelRunner(NPUModelRunner):
                          device=device)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        self.num_stages = 3
 
     def execute_model(self):
         """Execute FFN computation for a single request batch"""
         print('ffn forward begain')
         # TODO: use event replace
-        while True:          
-            self.model.model.ffn_forward()
-        print('ffn forward finished')
+        while True:
+            layers_num = len(self.model.model.layers)
+            print(f'+++++++++++++++++++++{layers_num}')
+            for i in range(layers_num):
+                layer = self.model.model.layers[i]
+                if i == layers_num - 1:
+                    layer.is_last = True
+                else:
+                    layer.is_last = False
+
+                for j in range(self.num_stages):
+                    print(f'ffn doing layer {i} stage {j}')
+                    layer.ffn_forward(j, self.model.afd_ms_context)
+                print(f'layer {i} finished')
+            print('ffn success!!!!!!!!!!!')
+            while True:
+                pass
 
 if __name__ == '__main__':
     hccl_world_size = 4

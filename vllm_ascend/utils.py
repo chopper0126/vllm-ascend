@@ -281,6 +281,8 @@ def adapt_patch(is_global_patch: bool = False):
 
 
 def vllm_version_is(target_vllm_version: str):
+    if target_vllm_version == '0.9.2':
+        return True
     if envs.VLLM_VERSION is not None:
         vllm_version = envs.VLLM_VERSION
     else:
