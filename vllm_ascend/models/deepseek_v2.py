@@ -72,7 +72,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_ep_group,get_ae_group
-from vllm_ascend.ops.fused_moe import AscendFusedMoE, select_experts, fused_experts, fused_experts_with_all2all
+from vllm_ascend.ops.fused_moe import *
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor, npu_prefetch
@@ -772,6 +772,67 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.top_k = config.num_experts_per_tok
         self.topk_group = config.topk_group
         self.num_expert_group =config.n_group
+        self.global_num_experts = config.n_routed_experts
+        self.renormalize = config.norm_topk_prob
+        self.scoring_func = config.scoring_func
+
+    def gating(self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        global_num_experts: int = -1,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        enable_force_load_balance: bool = False,
+    ):
+        is_deepseek_v3_r1 = global_num_experts == 256
+        # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
+        if is_deepseek_v3_r1:
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+                router_logits,
+                k=top_k,  # topk当前写8
+                bias=e_score_correction_bias,
+                k_group=topk_group,  # fix: 4
+                group_count=num_expert_group,  # fix 8
+                group_select_mode=1,  # 0: group中的最大; 1: topk2.sum(fix)
+                renorm=0,  # 0: softmax->topk(fix); 1: topk->softmax
+                norm_type=1,  # 0: softmax; 1: sigmoid(fix)
+                # out_flag=False, # todo new api; 第三个输出是否输出
+                # y2_flag=False, # old api; 第三个输出是否输出
+                routed_scaling_factor=1,
+                eps=float(1e-20))
+        elif SELECT_GATING_TOPK_SOTFMAX_EXPERTS:
+            topk_weights, topk_ids = select_gating_top_k_softmax_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                renormalize=renormalize)
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+            )
+
+        topk_weights = topk_weights.to(x.dtype)
+        # # this is a naive implementation for experts load balance so as
+        # # to avoid accumulating too much tokens on a single rank.
+        # # currently it is only activated when doing profile runs.
+        if enable_force_load_balance:
+            topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
+        return topk_weights, topk_ids
 
     def forward(
         self,
@@ -783,6 +844,8 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         replace_allreduce: bool = False,
     ) -> torch.Tensor:
         # Self Attention
+        if self.layer_idx == 0:
+            print('l')
         if attn_metadata is not None and attn_metadata.num_decodes > 0:
             mla_moe_communication = self.mla_moe_communication and replace_allreduce
         else:
@@ -848,12 +911,18 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             router_logits = None
             # if not self.rm_router_logits:
             router_logits, _ = self.gate(hidden_states)
-            topk_weights, topk_ids = select_experts(hidden_states, 
-                                                    router_logits, 
-                                                    self.top_k, 
-                                                    use_grouped_topk=True,
-                                                    renormalize=False, topk_group=self.topk_group, 
-                                                    num_expert_group=self.num_expert_group)    
+            topk_weights, topk_ids = self.gating(x=hidden_states, 
+                                                router_logits=router_logits, 
+                                                top_k=self.top_k,
+                                                renormalize=self.renormalize,
+                                                use_grouped_topk=True,
+                                                global_num_experts=self.global_num_experts,
+                                                topk_group=self.topk_group,
+                                                num_expert_group=self.num_expert_group,
+                                                scoring_func=self.scoring_func,
+                                                e_score_correction_bias=self.gate.e_score_correction_bias,
+                                                enable_force_load_balance=enable_force_load_balance, 
+                                                )
             
             ffn_need_metadata = FFNNeedMetadata(topk_weights, topk_ids,is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
             
