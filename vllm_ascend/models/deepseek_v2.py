@@ -81,6 +81,7 @@ from torch.distributed.distributed_c10d import (
     _get_default_group,
 )
 from vllm_ascend.distributed import P2PAFDConnector, P2PAFDConnectorMetadata
+from vllm_ascend.utils import get_fused_moe_state
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -378,6 +379,16 @@ class CustomDeepseekV2MoE(nn.Module):
 
         self.params_dtype = torch.get_default_dtype()
         self.rm_router_logits = self.experts.rm_router_logits
+        try:
+            device_group = self.ep_group.device_group
+            # TODO: Try local_rank = ep_group.rank_in_group
+            local_rank = torch.distributed.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
+                local_rank)
+        except AttributeError:
+            self.moe_all_to_all_group_name = None
+        self.is_deepseek_v3_r1 = self.global_num_experts == 256
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -430,13 +441,18 @@ class CustomDeepseekV2MoE(nn.Module):
 
         shared_hidden_states = self.shared_experts(hidden_states)
 
-        experts_hidden_states = fused_experts(hidden_states=hidden_states,
-                                 w1=self.experts.w13_weight,
-                                 w2=self.experts.w2_weight,
+        experts_hidden_states = self.expert_compute(
+                                 x=hidden_states,
+                                 layer=self.experts,
                                  topk_weights=topk_weights,
                                  topk_ids=topk_ids,
                                  top_k=self.top_k,
-                                 expert_map=self.expert_map)
+                                 expert_map=self.expert_map,
+                                 is_prefill=is_prefill,
+                                 is_deepseek_v3_r1=self.is_deepseek_v3_r1,
+                                 shared_experts=shared_experts if self.torchair_graph_enabled
+                                 and self.enable_multistream_moe and not is_prefill else None,
+                                 )
 
         hidden_states = (
             experts_hidden_states * self.routed_scaling_factor +
@@ -446,6 +462,64 @@ class CustomDeepseekV2MoE(nn.Module):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         return hidden_states
+
+    def expert_compute(self,
+                        x: torch.Tensor,
+                        layer: torch.nn.Module,
+                        topk_weights: torch.Tensor,
+                        topk_ids: torch.Tensor,
+                        top_k: int,
+                        is_prefill: bool,
+                        is_deepseek_v3_r1: bool,
+                        expert_map: torch.Tensor = None,
+                        apply_router_weight_on_input: bool = False,
+                        max_num_tokens: Optional[int] = None,
+                        shared_experts: Optional[Any] = None
+                        ):
+        fused_moe_state = get_fused_moe_state(self.ep_group.world_size,
+                                              is_prefill, is_deepseek_v3_r1)
+        if fused_moe_state == FusedMoEState.MC2:
+            return fused_experts_with_mc2(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=top_k,
+                expert_map=expert_map,
+                moe_all_to_all_group_name=self.moe_all_to_all_group_name,
+                shared_experts=shared_experts)
+        elif fused_moe_state in [
+                FusedMoEState.AllGather, FusedMoEState.NaiveMulticast
+        ]:
+            return fused_experts(hidden_states=x,
+                                 w1=layer.w13_weight,
+                                 w2=layer.w2_weight,
+                                 topk_weights=topk_weights,
+                                 topk_ids=topk_ids,
+                                 top_k=top_k,
+                                 expert_map=expert_map)
+        elif MOE_ALL2ALL_BUFFER:
+            return fused_experts_with_all2all_buffer(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=top_k,
+                max_model_len=self.max_model_len,
+                global_batch_size=self.global_batch_size,
+                expert_map=expert_map,
+                ep_group=get_ep_group())
+        else:
+            return fused_experts_with_all2all(hidden_states=x,
+                                              w1=layer.w13_weight,
+                                              w2=layer.w2_weight,
+                                              topk_weights=topk_weights,
+                                              topk_ids=topk_ids,
+                                              top_k=top_k,
+                                              expert_map=expert_map,
+                                              ep_group=get_ep_group())
 
 
 class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
