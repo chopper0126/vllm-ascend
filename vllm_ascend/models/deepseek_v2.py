@@ -75,13 +75,15 @@ from vllm_ascend.distributed.parallel_state import get_ep_group,get_ae_group
 from vllm_ascend.ops.fused_moe import *
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import dispose_tensor, npu_prefetch
+from vllm_ascend.utils import dispose_tensor, npu_prefetch, get_fused_moe_state
 from typing import Any, Optional, Union
 from torch.distributed.distributed_c10d import (
     _get_default_group,
 )
 from vllm_ascend.distributed import P2PAFDConnector, P2PAFDConnectorMetadata
-from vllm_ascend.utils import get_fused_moe_state
+
+import vllm_ascend.envs as envs_ascend
+SELECT_GATING_TOPK_SOTFMAX_EXPERTS: bool = envs_ascend.SELECT_GATING_TOPK_SOTFMAX_EXPERTS
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
