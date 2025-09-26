@@ -20,6 +20,8 @@ from torch.distributed.distributed_c10d import (
     _get_default_group,
     _update_default_pg,
 )
+import pickle
+from typing import Any, Callable, Optional, Union
 
 class DefaultProcessGroupSwitcher:
     def __init__(self, default_group, new_default_group):
@@ -91,3 +93,73 @@ def init_process_group(
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
     return pg
+
+
+def send_object(obj: Any, dst: int, group: dist.ProcessGroup) -> None:
+        """Send the input object list to the destination rank."""
+        """NOTE: `dst` is the local rank of the destination rank."""
+
+
+        # Serialize object to tensor and get the size as well
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+
+        size_tensor = torch.tensor([object_tensor.numel()],
+                                   dtype=torch.long,
+                                   device="cpu")
+
+        # Send object size
+
+        torch.distributed.send(size_tensor,
+                               dst=dst,
+                               group=group)
+
+        # Send object
+        torch.distributed.send(object_tensor,
+                               dst=dst,
+                               group=group)
+
+        return None
+
+def recv_object(src: int, group: dist.ProcessGroup) -> Any:
+    """Receive the input object list from the source rank."""
+    """NOTE: `src` is the local rank of the source rank."""
+
+
+    size_tensor = torch.empty(1, dtype=torch.long)
+
+    # Receive object size
+    rank_size = torch.distributed.recv(size_tensor,
+                                        src=src,
+                                        group=group)
+
+    # Tensor to receive serialized objects into.
+    object_tensor = torch.empty(  # type: ignore[call-overload]
+        size_tensor.item(),  # type: ignore[arg-type]
+        dtype=torch.uint8,
+        device="cpu")
+
+    rank_object = torch.distributed.recv(object_tensor,
+                                            src=src,
+                                        group=group)
+
+    assert rank_object == rank_size, (
+        "Received object sender rank does not match the size sender rank.")
+
+    obj = pickle.loads(object_tensor.numpy().tobytes())
+
+    return obj
+
+# from attn side send ffn need ascend forward context data
+class FFNNeedForwardData():
+
+    def __init__(self,
+                 moe_comm_method,
+                 num_input_tokens,
+                 with_prefill,
+                 total_num_scheduled_tokens,
+                 is_dummy_run:bool = False):
+        self.moe_comm_method = moe_comm_method
+        self.num_input_tokens = num_input_tokens
+        self.with_prefill = with_prefill
+        self.total_num_scheduled_tokens = total_num_scheduled_tokens
+        self.is_dummy_run = is_dummy_run

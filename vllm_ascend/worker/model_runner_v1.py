@@ -46,10 +46,10 @@ from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
-from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,
+from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,get_world_group,
                                              get_tp_group,
                                              is_global_first_rank)
-from vllm.forward_context import BatchDescriptor, get_forward_context
+from vllm.forward_context import AFDMetadata,BatchDescriptor, get_forward_context,DPMetadata,set_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -105,8 +105,14 @@ from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                AscendSocVersion, ProfileExecuteDuration,
                                get_ascend_soc_version, is_310p,
-                               lmhead_tp_enable)
+                               lmhead_tp_enable, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
+
+from vllm.distributed.parallel_state import get_world_group
+# from vllm.distributed.parallel_state import get_ep_group,get_world_group,get_new_default_group,get_new_cpu_default_group
+
+from vllm_ascend.distributed.afd_communicators import send_object,recv_object,FFNNeedForwardData
+from vllm.distributed.afd_transfer import AFDConnectorFactory
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -405,7 +411,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
-
+        
+        # init AFD config
+        self.afd_config = vllm_config.afd_config
+        if self.afd_config and self.afd_config.afd_role == "attention":
+            self.afd_connector = AFDConnectorFactory.create_connector(
+                get_world_group().rank,
+                get_world_group().local_rank, vllm_config)
+            self.afd_connector.init_afd_connector()
+            self.num_stages = self.afd_config.num_afd_stages
+        
         # kv role
         self.is_kv_producer = False
         self.is_kv_consumer = False
@@ -548,11 +563,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 to_update = model.pooler.get_pooling_updates(task)
                 to_update.apply(pooling_params)
 
+            backward_kwargs = {}
+            print(f'vllm_version = envs_ascend.VLLM_VERSION is {envs_ascend.VLLM_VERSION}')
+            if vllm_version_is("0.10.2"):
+                backward_kwargs["mm_kwargs"] = new_req_data.mm_kwargs
+                backward_kwargs["mm_hashes"] = new_req_data.mm_hashes
+                backward_kwargs["mm_positions"] = new_req_data.mm_positions
+            else:
+                backward_kwargs["mm_features"] = new_req_data.mm_features
+
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
-                mm_kwargs=new_req_data.mm_kwargs,
-                mm_positions=new_req_data.mm_positions,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
                 generator=generator,
@@ -560,7 +582,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
-                mm_hashes=new_req_data.mm_hashes,
+                **backward_kwargs,
             )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1082,7 +1104,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> tuple[dict[str, Any], torch.Tensor, np.ndarray, int, torch.Tensor,
                int, torch.Tensor, SpecDecodeMetadata, Optional[torch.Tensor],
-               Optional[torch.Tensor], Optional[torch.Tensor]]:
+               Optional[torch.Tensor], Optional[torch.Tensor],Optional[AFDMetadata]]:
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1340,7 +1362,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # # Fill unused with -1. Needed for reshape_and_cache in full cuda
             # # graph mode.
             # blk_table.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
-
+            query_start_loc=self.query_start_loc[:num_reqs + 1]
             # Make AscendCommonAttentionMetadata
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.query_start_loc[:num_reqs + 1],
@@ -1365,6 +1387,40 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 decode_token_per_req=self.decode_token_per_req,
             )
 
+            if self.afd_config and self.num_stages > 1:
+                if num_reqs >= self.num_stages:
+                    num_reqs_per_stage = num_reqs // self.num_stages
+                    afd_reqs_start_loc = [
+                        num_reqs_per_stage * i
+                        for i in range(self.num_stages + 1)
+                    ]
+                    afd_reqs_start_loc[-1] = num_reqs
+                else:
+                    afd_reqs_start_loc = [i for i in range(num_reqs + 1)]
+
+                # For prefill, compute tokens per stage based on actual token
+                # counts
+                afd_tokens_start_loc = [0]
+                afd_tokens_lens = []
+                for stage_idx in range(len(afd_reqs_start_loc) - 1):
+                    stage_start_req = afd_reqs_start_loc[stage_idx]
+                    stage_end_req = afd_reqs_start_loc[stage_idx + 1]
+                    stage_tokens = int(query_start_loc[stage_end_req] -
+                                       query_start_loc[stage_start_req])
+                    afd_tokens_lens.append(stage_tokens)
+                    afd_tokens_start_loc.append(afd_tokens_start_loc[-1] +
+                                                stage_tokens)
+
+                afd_metadata = AFDMetadata(
+                    afd_tokens_start_loc=afd_tokens_start_loc,
+                    afd_reqs_start_loc=afd_reqs_start_loc,
+                    afd_stage_idx=0,
+                    afd_connector=self.afd_connector,
+                    afd_tokens_lens=afd_tokens_lens,
+                )
+            else:
+                afd_metadata = None
+            print(f"afd_metadata in _prepare_inputs is {afd_metadata}")
             if self.speculative_config and \
                 spec_decode_common_attn_metadata is None:
                 spec_decode_common_attn_metadata = common_attn_metadata
@@ -1384,12 +1440,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     attn_metadata_i = builder.build(
                         common_prefix_len=common_prefix_len,
                         common_attn_metadata=common_attn_metadata,
+                        # afd_metadata=afd_metadata,
                         **extra_attn_metadata_args)
                 else:
                     attn_metadata_i = builder.build(
                         common_prefix_len=common_prefix_len,
                         common_attn_metadata=common_attn_metadata,
                         model=self.model,
+                        # afd_metadata=afd_metadata,
                         **extra_attn_metadata_args)
 
                 if self.vllm_config.model_config.use_mla:
@@ -1402,11 +1460,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logits_indices = nn.functional.pad(
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
+        
+        if afd_metadata:
+            (num_afd_pad, afd_tokens_start_loc,
+             afd_tokens_lens) = self.get_afd_padding(
+                 afd_metadata.afd_tokens_start_loc,
+                 afd_metadata.afd_tokens_lens)
+            afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
+            afd_metadata.afd_tokens_lens = afd_tokens_lens
+            num_tokens += num_afd_pad
+            num_tokens_across_dp = None
+
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
-                input_ids, inputs_embeds, intermediate_tensors)
+                input_ids, inputs_embeds, intermediate_tensors, afd_metadata)
 
     def _generate_process_reqs_hidden_states(self, attn_metadata, with_prefill,
                                              maybe_padded_num_tokens,
@@ -1624,6 +1693,55 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states, attn_metadata, aux_hidden_states)
         return draft_token_ids
 
+    def get_afd_padding(
+            self, afd_tokens_start_loc: list[int],
+            afd_tokens_lens: list[int]) -> tuple[int, list[int], list[int]]:
+
+        afd_tokens_start_loc = list(afd_tokens_start_loc)
+        afd_tokens_lens = list(afd_tokens_lens)
+        original_max_end_loc = afd_tokens_start_loc[-1]
+
+        # 1. Stage count padding: pad to reach required num_stages by adding
+        # dummy stages.
+        if len(afd_tokens_start_loc) - 1 < self.num_stages:
+            missing = self.num_stages - (len(afd_tokens_start_loc) - 1)
+            for _ in range(missing):
+                afd_tokens_lens.append(0)
+
+        # 2. Stage-wise DP padding: pad each stage to max tokens across DP
+        # ranks.
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            dp_size = self.vllm_config.parallel_config.data_parallel_size
+            dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            _, max_tokens_cpu = DPMetadata.num_stage_tokens_across_dp(
+                afd_tokens_lens, dp_size, dp_rank)
+            afd_tokens_lens = max_tokens_cpu.tolist()
+
+        # 3. If using CUDA graphs on attention server, pad each stage length
+        # up to the next configured cudagraph capture size so that each stage
+        # matches a captured graph size.
+        if (self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and self.afd_config and self.afd_config.is_attention_server):
+
+            def pad_to_capture_size(n: int) -> int:
+                for s in self.cudagraph_batch_sizes:
+                    if n <= s // self.num_stages:
+                        return s // self.num_stages
+                return n
+
+            afd_tokens_lens = [pad_to_capture_size(n) for n in afd_tokens_lens]
+
+        # Recompute start locations from lengths to ensure consistency after
+        # padding.
+        new_start_loc = [afd_tokens_start_loc[0]]
+        running = afd_tokens_start_loc[0]
+        for length in afd_tokens_lens:
+            running += length
+            new_start_loc.append(running)
+
+        num_pad = new_start_loc[-1] - original_max_end_loc
+        return num_pad, new_start_loc, afd_tokens_lens
+    
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -1739,17 +1857,53 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             (attn_metadata, positions, num_scheduled_tokens_np,
              num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
              logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
-             intermediate_tensors) = (self._prepare_inputs(
+             intermediate_tensors,afd_metadata) = (self._prepare_inputs(
                  scheduler_output, intermediate_tensors))
+
+        if afd_metadata:
+                # Padding for AFD
+                num_input_tokens = num_input_tokens
+                (num_pad_afd, afd_tokens_start_loc,
+                 afd_tokens_lens) = self.get_afd_padding(
+                     afd_metadata.afd_tokens_start_loc,
+                     afd_metadata.afd_tokens_lens)
+                afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
+                afd_metadata.afd_tokens_lens = afd_tokens_lens
+                num_input_tokens += num_pad_afd
+                num_tokens_across_dp = None
 
         moe_comm_method = self._select_moe_comm_method(num_input_tokens,
                                                        self.with_prefill)
 
         batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
                                            uniform_decode=False)
-        aclgraph_runtime_mode, batch_descriptor = \
+        if self.afd_config:
+                aclgraph_runtime_mode = CUDAGraphMode.NONE
+        else:
+            aclgraph_runtime_mode, batch_descriptor = \
             self.aclgraph_dispatcher.dispatch(batch_descriptor)
+        
+        if afd_metadata == None:
+            afd_metadata = AFDMetadata(
+                0,0,0,self.afd_connector,0
+            )
+        if self.vllm_config.additional_config.get(
+                        "enable_afd", False):
+            # send ffn_need_ascend_forward_data
+            new_cpu_default_group = get_new_cpu_default_group()
+            rank = get_world_group().rank_in_group
+            # TODO define a comptue_dst_rank function
+            dst = rank + 2
+            # moe_comm_method string
+            # num_input_tokens int
+            # self.with_prefill bool
+            # scheduler_output.total_num_scheduled_tokens int
+            # TODO send a whole tensor
+            ffn_need_forward_data = FFNNeedForwardData(moe_comm_method,num_input_tokens,self.with_prefill,scheduler_output.total_num_scheduled_tokens)
+            send_object(ffn_need_forward_data,dst=dst,group=new_cpu_default_group)
+            print(f'send_object is {ffn_need_forward_data}')
 
+        
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
@@ -1765,7 +1919,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     num_actual_tokens=scheduler_output.
                     total_num_scheduled_tokens,
                     prefetch_stream=self.prefetch_stream,
-                    model_instance=self.model):
+                    model_instance=self.model,
+                    afd_metadata=afd_metadata):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 hidden_states = self._generate_process_reqs_hidden_states(
@@ -2117,7 +2272,49 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         moe_comm_method = self._select_moe_comm_method(num_tokens,
                                                        with_prefill)
-
+        # AFD padding (stage-level alignment) before DP padding
+        if self.vllm_config.afd_config:
+            if num_tokens > self.vllm_config.afd_config.num_afd_stages:
+                num_tokens_per_stage = (
+                    num_tokens // self.vllm_config.afd_config.num_afd_stages)
+                max_num_reqs = self.scheduler_config.max_num_seqs
+                num_reqs = min(num_tokens, max_num_reqs)
+                num_reqs_per_stage = (
+                    num_reqs // self.vllm_config.afd_config.num_afd_stages)
+                afd_tokens_start_loc = [
+                    i * num_tokens_per_stage
+                    for i in range(self.vllm_config.afd_config.num_afd_stages +
+                                   1)
+                ]
+                afd_reqs_start_loc = [
+                    i * num_reqs_per_stage
+                    for i in range(self.vllm_config.afd_config.num_afd_stages +
+                                   1)
+                ]
+                afd_tokens_lens = [
+                    num_tokens_per_stage
+                    for _ in range(self.vllm_config.afd_config.num_afd_stages)
+                ]
+                afd_tokens_lens[-1] += num_tokens % num_tokens_per_stage
+                afd_tokens_start_loc[-1] = num_tokens
+                afd_metadata = AFDMetadata(
+                    afd_tokens_start_loc=afd_tokens_start_loc,
+                    afd_reqs_start_loc=afd_reqs_start_loc,
+                    afd_stage_idx=0,
+                    afd_connector=self.afd_connector,
+                    afd_tokens_lens=afd_tokens_lens,
+                )
+            else:
+                afd_metadata = AFDMetadata(
+                    afd_tokens_start_loc=list(range(num_tokens + 1)),
+                    afd_reqs_start_loc=list(range(num_tokens + 1)),
+                    afd_stage_idx=0,
+                    afd_connector=self.afd_connector,
+                    afd_tokens_lens=[1] * num_tokens,
+                )
+        else:
+            afd_metadata = None
+        print(f"afd_metadata in _dummy_run is {afd_metadata}")
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.seperate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.
@@ -2220,7 +2417,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 def dummy_compute_logits(hidden_states):
                     return self.model.compute_logits(
                         hidden_states[dummy_indices], None)
-
+                
+            # if self.vllm_config.additional_config.get(
+            #             "enable_afd", False):
+            #     # send ffn_need_ascend_forward_data
+            #     new_cpu_default_group = get_new_cpu_default_group()
+            #     rank = get_world_group().rank_in_group
+            #     # TODO define a comptue_dst_rank function
+            #     dst = rank + 2
+            #     # moe_comm_method string
+            #     # num_input_tokens int
+            #     # self.with_prefill bool
+            #     # scheduler_output.total_num_scheduled_tokens int
+            #     # TODO send a whole tensor
+            #     ffn_need_forward_data = FFNNeedForwardData(moe_comm_method,num_tokens,with_prefill,0,True)
+            #     send_object(ffn_need_forward_data,dst=dst,group=new_cpu_default_group)
+            #     print(f'_dummy_run send_object is {ffn_need_forward_data}')
+                
             with set_ascend_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -2234,7 +2447,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     prefetch_stream=self.prefetch_stream,
-                    model_instance=self.model):
+                    model_instance=self.model,
+                    afd_metadata = afd_metadata):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     with_prefill, is_torchair_compile, input_ids, positions,
                     attn_metadata, num_tokens, intermediate_tensors,
@@ -3060,3 +3274,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def _build_drafter_prepare_inputs_torchair_param(self):
         return False
+    
+    def initialize_afd_connector(self) -> None:
+        """Initialize AFD connector if available."""
+        if hasattr(self, 'afd_connector') and self.afd_connector:
+            self.afd_connector.init_afd_connector()
+
