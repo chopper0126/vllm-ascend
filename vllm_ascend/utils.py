@@ -69,11 +69,12 @@ _CURRENT_STREAM = None
 
 
 def is_310p():
-    global _IS_310P
-    if _IS_310P is None:
-        from vllm_ascend import _build_info  # type: ignore
-        _IS_310P = _build_info.__soc_version__.lower().startswith("ascend310p")
-    return _IS_310P
+    return False
+    # global _IS_310P
+    # if _IS_310P is None:
+    #     from vllm_ascend import _build_info  # type: ignore
+    #     _IS_310P = _build_info.__soc_version__.lower().startswith("ascend310p")
+    # return _IS_310P
 
 
 def sleep_mode_enabled():

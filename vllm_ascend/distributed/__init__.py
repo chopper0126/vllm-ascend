@@ -28,4 +28,4 @@ KVConnectorFactory.register_connector(
 
 from .AFDConnector import *
 from .P2PAFDConnector import *
-from .CAMAFDConnector import *
+# from .CAMAFDConnector import *
