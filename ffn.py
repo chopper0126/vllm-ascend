@@ -302,8 +302,6 @@ class FFNModelRunner(NPUModelRunner):
                     layer.ffn_forward(j, self.model.afd_ms_context)
                 print(f'layer {i} finished')
             print('ffn success!!!!!!!!!!!')
-            while True:
-                pass
 
 if __name__ == '__main__':
     hccl_world_size = 4
