@@ -288,20 +288,7 @@ class FFNModelRunner(NPUModelRunner):
         print('ffn forward begain')
         # TODO: use event replace
         while True:
-            layers_num = len(self.model.model.layers)
-            print(f'+++++++++++++++++++++{layers_num}')
-            for i in range(layers_num):
-                layer = self.model.model.layers[i]
-                if i == layers_num - 1:
-                    layer.is_last = True
-                else:
-                    layer.is_last = False
-
-                for j in range(self.num_stages):
-                    print(f'ffn doing layer {i} stage {j}')
-                    layer.ffn_forward(j, self.model.afd_ms_context)
-                print(f'layer {i} finished')
-            print('ffn success!!!!!!!!!!!')
+            self.model.model.ffn_forward(self.num_stages)
 
 if __name__ == '__main__':
     hccl_world_size = 4

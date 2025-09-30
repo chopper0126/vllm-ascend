@@ -1022,6 +1022,7 @@ class CustomDeepseekV2Model(nn.Module):
         attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        replace_allreduce: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1074,21 +1075,35 @@ class CustomDeepseekV2Model(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
         print(f'success!!!!!!!!!!!!!!!!!!!!!')
-        while True:
-            pass
         return hidden_states
 
-    def ffn_forward(self):
+    def ffn_forward(self, num_stages):
         num_normal_layers = (self.first_k_dense_replace
                             if self.enable_ms_for_afd and self.can_run_ms()
                              else self.end_layer - self.start_layer)
 
         moe_start_layer = self.start_layer + num_normal_layers
         print('moe_start_layer', moe_start_layer, self.start_layer, self.end_layer)
-        for i in range(self.start_layer, min(moe_start_layer, self.end_layer)):
+        layers_num = min(moe_start_layer, self.end_layer) - self.start_layer
+        print(f'+++++++++++++++++++++{layers_num}')
+        # clear
+        for i in range(num_stages):
+            print(f'clear stage {i}')
+            self.afd_ms_context.intermediate_tensors[i] = None
+
+        for i in range(layers_num):
             print('i=', i)
             layer = self.layers[i]
-            layer.ffn_forward()
+            if i == layers_num - 1:
+                layer.is_last = True
+            else:
+                layer.is_last = False
+
+            for j in range(num_stages):
+                print(f'ffn doing layer {i} stage {j}')
+                layer.ffn_forward(j, self.afd_ms_context)
+            print(f'layer {i} finished')
+        print('ffn success!!!!!!!!!!!')
 
         if moe_start_layer < self.end_layer:
             print('moe_start_layer < self.end_layer 进入多流逻辑')
