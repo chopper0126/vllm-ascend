@@ -288,7 +288,7 @@ class FFNModelRunner(NPUModelRunner):
         print('ffn forward begain')
         # TODO: use event replace
         while True:
-            self.model.model.ffn_forward(self.num_stages)
+            self.model.model.ffn_forward()
 
 if __name__ == '__main__':
     hccl_world_size = 4
