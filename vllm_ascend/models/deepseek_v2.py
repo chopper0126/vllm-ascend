@@ -72,7 +72,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_ep_group,get_ae_group
-from vllm_ascend.ops.fused_moe import *
+from vllm_ascend.ops.fused_moe import AscendFusedMoE, select_experts
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor, npu_prefetch
@@ -82,6 +82,7 @@ from torch.distributed.distributed_c10d import (
 )
 from vllm_ascend.distributed import P2PAFDConnector, P2PAFDConnectorMetadata
 from vllm_ascend.utils import get_fused_moe_state
+from vllm_ascend.distributed import M2NAFDConnector, M2NAFDConnectorMetadata
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -341,7 +342,7 @@ class CustomDeepseekV2MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
-            renormalize=config.norm_topk_prob,
+            renormalize=True,
             quant_config=quant_config,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -379,16 +380,40 @@ class CustomDeepseekV2MoE(nn.Module):
 
         self.params_dtype = torch.get_default_dtype()
         self.rm_router_logits = self.experts.rm_router_logits
-        try:
-            device_group = self.ep_group.device_group
-            # TODO: Try local_rank = ep_group.rank_in_group
-            local_rank = torch.distributed.get_rank(group=device_group)
-            backend = device_group._get_backend(torch.device("npu"))
-            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
-                local_rank)
-        except AttributeError:
-            self.moe_all_to_all_group_name = None
-        self.is_deepseek_v3_r1 = self.global_num_experts == 256
+    
+    def gmm_compute(
+            self,
+            hidden_states: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+            group_list,
+        ):
+        group_list = group_list.to(torch.int64)
+        w1 = w1.transpose(1, 2)
+        gate_up_out_list = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w1],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=group_list,
+        )
+
+        gate_up_out = torch.cat(gate_up_out_list, dim=0)
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+        w2 = w2.transpose(1, 2)
+        down_out_list = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out],
+            weight=[w2],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=group_list,
+        )
+
+        down_out_list = torch.cat(down_out_list, dim=0)
+        return down_out_list
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -398,11 +423,10 @@ class CustomDeepseekV2MoE(nn.Module):
 
         self.layer_index += 1
 
-        is_prefill = kwargs.get("is_prefill",False)
-        enable_force_load_balance = kwargs.get("enable_force_load_balance",False)
-        is_ffn = kwargs.get("is_ffn",False)
-        topk_weights = kwargs.get("topk_weights",None)
-        topk_ids = kwargs.get("topk_ids",None)
+        is_prefill = kwargs.get("is_prefill", False)
+        enable_force_load_balance = kwargs.get("enable_force_load_balance", False)
+        is_ffn = kwargs.get("is_ffn", False)
+        group_list = kwargs.get("group_list", None)
         if is_ffn:
             is_prefill = is_prefill
             enable_force_load_balance = enable_force_load_balance
@@ -439,20 +463,14 @@ class CustomDeepseekV2MoE(nn.Module):
                 self.ep_size,
                 get_ep_group().rank_in_group, self.global_num_experts)
 
-        shared_hidden_states = self.shared_experts(hidden_states)
+        experts_hidden_states = self.gmm_compute(hidden_states=hidden_states,
+                            w1=self.experts.w13_weight,
+                            w2=self.experts.w2_weight,
+                            group_list=group_list
+                            )
 
-        experts_hidden_states = self.expert_compute(
-                                 x=hidden_states,
-                                 layer=self.experts,
-                                 topk_weights=topk_weights,
-                                 topk_ids=topk_ids,
-                                 top_k=self.top_k,
-                                 expert_map=self.expert_map,
-                                 is_prefill=is_prefill,
-                                 is_deepseek_v3_r1=self.is_deepseek_v3_r1,
-                                 shared_experts=shared_experts if self.torchair_graph_enabled
-                                 and self.enable_multistream_moe and not is_prefill else None,
-                                 )
+        # TODO 这部分是共享专家的处理逻辑，可能需要单独处理
+        shared_hidden_states = self.shared_experts(hidden_states)
 
         hidden_states = (
             experts_hidden_states * self.routed_scaling_factor +
@@ -460,66 +478,7 @@ class CustomDeepseekV2MoE(nn.Module):
         if self.all_reduce_merge:
             # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-
         return hidden_states
-
-    def expert_compute(self,
-                        x: torch.Tensor,
-                        layer: torch.nn.Module,
-                        topk_weights: torch.Tensor,
-                        topk_ids: torch.Tensor,
-                        top_k: int,
-                        is_prefill: bool,
-                        is_deepseek_v3_r1: bool,
-                        expert_map: torch.Tensor = None,
-                        apply_router_weight_on_input: bool = False,
-                        max_num_tokens: Optional[int] = None,
-                        shared_experts: Optional[Any] = None
-                        ):
-        fused_moe_state = get_fused_moe_state(self.ep_group.world_size,
-                                              is_prefill, is_deepseek_v3_r1)
-        if fused_moe_state == FusedMoEState.MC2:
-            return fused_experts_with_mc2(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                top_k=top_k,
-                expert_map=expert_map,
-                moe_all_to_all_group_name=self.moe_all_to_all_group_name,
-                shared_experts=shared_experts)
-        elif fused_moe_state in [
-                FusedMoEState.AllGather, FusedMoEState.NaiveMulticast
-        ]:
-            return fused_experts(hidden_states=x,
-                                 w1=layer.w13_weight,
-                                 w2=layer.w2_weight,
-                                 topk_weights=topk_weights,
-                                 topk_ids=topk_ids,
-                                 top_k=top_k,
-                                 expert_map=expert_map)
-        elif MOE_ALL2ALL_BUFFER:
-            return fused_experts_with_all2all_buffer(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                top_k=top_k,
-                max_model_len=self.max_model_len,
-                global_batch_size=self.global_batch_size,
-                expert_map=expert_map,
-                ep_group=get_ep_group())
-        else:
-            return fused_experts_with_all2all(hidden_states=x,
-                                              w1=layer.w13_weight,
-                                              w2=layer.w2_weight,
-                                              topk_weights=topk_weights,
-                                              topk_ids=topk_ids,
-                                              top_k=top_k,
-                                              expert_map=expert_map,
-                                              ep_group=get_ep_group())
 
 
 class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
@@ -536,7 +495,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         kv_lora_rank: int,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
+        max_position_embeddings: int = 200,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -727,7 +686,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
+                                          200)
         self.enable_afd = enable_afd
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
@@ -760,6 +719,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )   
+        self.n_routed_experts = config.n_routed_experts
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
@@ -802,7 +762,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.topk_group = config.topk_group
         self.num_expert_group =config.n_group
         self.global_num_experts = config.n_routed_experts
-        self.renormalize = config.norm_topk_prob
+        self.renormalize = True
         self.scoring_func = config.scoring_func
 
     def gating(self,
@@ -856,6 +816,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             )
 
         topk_weights = topk_weights.to(x.dtype)
+        topk_weights = topk_weights.to(torch.float32)
         # # this is a naive implementation for experts load balance so as
         # # to avoid accumulating too much tokens on a single rank.
         # # currently it is only activated when doing profile runs.
@@ -956,13 +917,18 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                                     enable_force_load_balance=enable_force_load_balance, 
                                                     )
                 
-                ffn_need_metadata = FFNNeedMetadata(topk_weights, topk_ids,is_prefill=is_prefill,enable_force_load_balance=enable_force_load_balance)
+                afd_connector_metadata.topk_idx = topk_ids
                 
-                afd_connector_metadata.set_ffn_need_metadata(ffn_need_metadata)
-                afd_connector_metadata.set_attn_metadata(attn_metadata)
+                afd_connector_metadata.topk_weights = topk_weights
+                afd_connector_metadata.moe_expert_num = self.n_routed_experts
+                afd_connector_metadata.quant_mode = 0
+                afd_connector_metadata.aiv_num = 48
+                afd_connector_metadata.scale = None
+                handle = AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
                 
-                AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
-                hidden_states = AFDConnector.recv_ffn_output(hidden_states)
+                afd_connector_metadata.handle = handle
+                hidden_states = AFDConnector.recv_ffn_output(hidden_states, afd_connector_metadata)
+                
             else:
                 hidden_states = self.mlp(hidden_states)
                 if isinstance(
@@ -1034,21 +1000,32 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     def ffn_forward(
         self,
     ) -> torch.Tensor:
-        ffn_need_metadata_obj, attn_metadata, hidden_states = AFDConnector.recv_attn_output()
+        afd_connector_metadata.quant_mode = 0
+        afd_connector_metadata.expand_x_type = torch.bfloat16
+        afd_connector_metadata.moe_expert_num = self.n_routed_experts
+        afd_connector_metadata.batch_size = 3200
+        afd_connector_metadata.h = 2048
+        afd_connector_metadata.k = 8
+        afd_connector_metadata.expert_token_nums_type = 0
+        afd_connector_metadata.aiv_num = 48
+
+        expand_x, dynamic_scales, expert_token_nums, handle, expand_scales = AFDConnector.recv_attn_output(afd_connector_metadata)
 
         # 计算mlp
-        ffn_need_metadata_obj.is_ffn = True
         if isinstance(self.mlp, CustomDeepseekV2MoE):
-            hidden_states = self.mlp(hidden_states=hidden_states,
-                                    attn_metadata=attn_metadata,
+            hidden_states = self.mlp(hidden_states=expand_x,
+                                    attn_metadata=None,
                                     replace_allreduce=False,
-                                    is_prefill = ffn_need_metadata_obj.is_prefill,
-                                    enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
-                                    is_ffn = ffn_need_metadata_obj.is_ffn,
-                                    topk_weights = ffn_need_metadata_obj.topk_weights,
-                                    topk_ids = ffn_need_metadata_obj.topk_ids,
+                                    is_ffn = True,
+                                    group_list = expert_token_nums
                                     )
-        AFDConnector.send_ffn_output(hidden_states)
+        else:
+            hidden_states = self.mlp(expand_x)
+        
+        # # send
+        afd_connector_metadata.topk_weights = expand_scales
+        afd_connector_metadata.handle = handle
+        AFDConnector.send_ffn_output(hidden_states, afd_connector_metadata)
     
     
 class FFNNeedMetadata():
@@ -1230,9 +1207,9 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         # init AFDConnector
         global AFDConnector
         rank = get_world_group().rank_in_group
-        AFDConnector = P2PAFDConnector(rank, self.attn_num, self.ffn_num, self.is_ffn)
+        AFDConnector = M2NAFDConnector(rank, self.attn_num, self.ffn_num, self.is_ffn)
         global afd_connector_metadata
-        afd_connector_metadata = P2PAFDConnectorMetadata(layer_idx=0, stage_idx=0, seq_lens=[])
+        afd_connector_metadata = M2NAFDConnectorMetadata()
 
     # NOTE: This `load_weights` is mainly copied from
     # https://github.com/vllm-project/vllm/commit/07b8fae219b1fff51ef115c38c44b51395be5bb5
@@ -1263,7 +1240,6 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if 'mlp.gate.' in name:
-                print(name)
                 name = name.replace("mlp.gate.", "gate.")
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1308,9 +1284,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     if weight_name not in name:
                         continue
                     # 示例：把experts.0.down_proj 替换成 experts.w2_，把专家号给去除了
-                    # print('name before replace', name)
                     name = name.replace(weight_name, param_name)
-                    # print('name after replace', name)
                     if is_pp_missing_parameter(name, self):
                         continue
 
