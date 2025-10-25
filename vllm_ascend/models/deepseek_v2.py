@@ -496,11 +496,15 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                     parallel_config=parallel_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.mlp",
+                    enable_afd=True if self.role else False,
                 )
-                if self.mlp.gate.e_score_correction_bias is not None:
-                    self.mlp.gate.e_score_correction_bias.data = (
-                        self.mlp.gate.e_score_correction_bias.data.to(
-                            dtype=torch.get_default_dtype()))
+                if not self.role:
+                    if self.mlp.gate.e_score_correction_bias is not None:
+                        self.mlp.gate.e_score_correction_bias.data = (
+                            self.mlp.gate.e_score_correction_bias.data.to(
+                                dtype=torch.get_default_dtype()))
+            # elif self.role and self.role == "ffn" and layer_idx < config.first_k_dense_replace:
+            #     self.mlp = None
             else:
                 self.mlp = DeepseekV2MLP(
                     hidden_size=config.hidden_size,
@@ -511,27 +515,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 )
         
         if self.role is not None and self.role == "attention":
-            if layer_idx < config.first_k_dense_replace:
-                print('开始加载attn侧的mlp')
-                self.mlp = DeepseekV2MLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.intermediate_size,
-                    hidden_act=config.hidden_act,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp",
-                )
-            # 这里增加gating的初始化
-            self.gate = ReplicatedLinear(config.hidden_size,
-                                     config.n_routed_experts,
-                                     bias=False,
-                                     quant_config=None,
-                                     prefix=f"{prefix}.gate")
-            if config.topk_method == "noaux_tc":
-                self.gate.e_score_correction_bias = nn.Parameter(
-                    torch.empty(config.n_routed_experts, dtype=torch.float32))
-            else:
-                self.gate.e_score_correction_bias = None
-
             # Load balancing settings.
             eplb_config = parallel_config.eplb_config
             self.enable_eplb = parallel_config.enable_eplb
@@ -554,25 +537,48 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                         self.n_local_physical_experts)
 
             self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
-            self.afd_gating = AscendAFD(
-                num_experts=config.n_routed_experts,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                reduce_results=False,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                topk_group=config.topk_group,
-                prefix=f"{prefix}.experts",
-                scoring_func=config.scoring_func,
-                # we do scaling outside, set factor to 1.0 to avoid double mul
-                routed_scaling_factor=1.0,
-                e_score_correction_bias=self.gate.e_score_correction_bias,
-                enable_eplb=self.enable_eplb,
-                num_redundant_experts=self.n_redundant_experts,
-                is_sequence_parallel=self.is_sequence_parallel,)
+
+            if layer_idx < config.first_k_dense_replace:
+                print('开始加载attn侧的mlp')
+                self.mlp = DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.mlp",
+                )
+            else:
+                # 这里增加gating的初始化
+                self.gate = ReplicatedLinear(config.hidden_size,
+                                        config.n_routed_experts,
+                                        bias=False,
+                                        quant_config=None,
+                                        prefix=f"{prefix}.gate")
+                if config.topk_method == "noaux_tc":
+                    self.gate.e_score_correction_bias = nn.Parameter(
+                        torch.empty(config.n_routed_experts, dtype=torch.float32))
+                else:
+                    self.gate.e_score_correction_bias = None
+                self.afd_gating = AscendAFD(
+                    num_experts=config.n_routed_experts,
+                    top_k=config.num_experts_per_tok,
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    reduce_results=False,
+                    renormalize=config.norm_topk_prob,
+                    quant_config=quant_config,
+                    use_grouped_topk=True,
+                    num_expert_group=config.n_group,
+                    topk_group=config.topk_group,
+                    prefix=f"{prefix}.experts",
+                    scoring_func=config.scoring_func,
+                    # we do scaling outside, set factor to 1.0 to avoid double mul
+                    routed_scaling_factor=1.0,
+                    e_score_correction_bias=self.gate.e_score_correction_bias,
+                    enable_eplb=self.enable_eplb,
+                    num_redundant_experts=self.n_redundant_experts,
+                    is_sequence_parallel=self.is_sequence_parallel)
+
         
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -682,8 +688,8 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if 'mlp.gate.' in name:
-                print(name)
+            # if 'mlp.gate.' in name:
+            #     print(name)
             if self.role and self.role == "attention" and 'mlp.gate.' in name:
                 name = name.replace("mlp.gate.", "gate.")
             if "rotary_emb.inv_freq" in name:

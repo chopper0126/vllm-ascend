@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch_npu
+from torch.nn import Module  # 确保引入 nn.Module
 from vllm.config import CompilationLevel, get_current_vllm_config
 from vllm.distributed import (get_dp_group, get_ep_group, get_tp_group,
                               get_tensor_model_parallel_world_size,
@@ -156,190 +157,192 @@ class AscendAFD(FusedMoE):
     # def __init__(self,*args, **kwargs):
     #     super().__init__(*args, **kwargs)  
 
-    # def __init__(self, 
-    #     num_experts: int,  # Global number of experts
-    #     top_k: int,
-    #     hidden_size: int,
-    #     intermediate_size: int,
-    #     params_dtype: Optional[torch.dtype] = None,
-    #     reduce_results: bool = False,
-    #     renormalize: bool = True,
-    #     use_grouped_topk: bool = False,
-    #     num_expert_group: Optional[int] = None,
-    #     topk_group: Optional[int] = None,
-    #     quant_config: Optional[QuantizationConfig] = None,
-    #     tp_size: Optional[int] = None,
-    #     ep_size: Optional[int] = None,
-    #     dp_size: Optional[int] = None,
-    #     prefix: str = "",
-    #     custom_routing_function: Optional[Callable] = None,
-    #     scoring_func: str = "softmax",
-    #     routed_scaling_factor: float = 1.0,
-    #     e_score_correction_bias: Optional[torch.Tensor] = None,
-    #     apply_router_weight_on_input: bool = False,
-    #     activation: str = "silu",
-    #     num_redundant_experts: int = 0,
-    #     has_bias: bool = False,
-    #     is_sequence_parallel=False,
-    #     zero_expert_num: Optional[int] = 0,
-    #     zero_expert_type: Optional[str] = None,
-    #     *args, **kwargs):      
+    def __init__(self, 
+        num_experts: int,  # Global number of experts
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        dp_size: Optional[int] = None,
+        prefix: str = "",
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        num_redundant_experts: int = 0,
+        has_bias: bool = False,
+        is_sequence_parallel=False,
+        zero_expert_num: Optional[int] = 0,
+        zero_expert_type: Optional[str] = None,
+        *args, **kwargs): 
 
-    #     if params_dtype is None:
-    #         params_dtype = torch.get_default_dtype()
-    #     self.params_dtype = params_dtype
+        Module.__init__(self)  # 代替 super().__init__()，避免父类参数注册逻辑     
 
-    #     vllm_config = get_current_vllm_config()
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
 
-    #     # FIXME (varun): We should have a better way of inferring the activation
-    #     # datatype. This works for now as the tensor datatype entering the MoE
-    #     # operation is typically unquantized (i.e. float16/bfloat16).
-    #     if vllm_config.model_config is not None:
-    #         moe_in_dtype = vllm_config.model_config.dtype
-    #     else:
-    #         # TODO (bnell): This is a hack to get test_mixtral_moe to work
-    #         # since model_config is not set in the pytest test.
-    #         moe_in_dtype = params_dtype
+        vllm_config = get_current_vllm_config()
 
-    #     tp_size_ = (tp_size if tp_size is not None else
-    #                 get_tensor_model_parallel_world_size())
-    #     dp_size_ = (dp_size
-    #                 if dp_size is not None else get_dp_group().world_size)
+        # FIXME (varun): We should have a better way of inferring the activation
+        # datatype. This works for now as the tensor datatype entering the MoE
+        # operation is typically unquantized (i.e. float16/bfloat16).
+        if vllm_config.model_config is not None:
+            moe_in_dtype = vllm_config.model_config.dtype
+        else:
+            # TODO (bnell): This is a hack to get test_mixtral_moe to work
+            # since model_config is not set in the pytest test.
+            moe_in_dtype = params_dtype
 
-    #     self.is_sequence_parallel = is_sequence_parallel
-    #     self.sp_size = tp_size_ if is_sequence_parallel else 1
+        tp_size_ = (tp_size if tp_size is not None else
+                    get_tensor_model_parallel_world_size())
+        dp_size_ = (dp_size
+                    if dp_size is not None else get_dp_group().world_size)
 
-    #     self.moe_parallel_config: FusedMoEParallelConfig = (
-    #         FusedMoEParallelConfig.make(
-    #             tp_size_=tp_size_,
-    #             dp_size_=dp_size_,
-    #             vllm_parallel_config=vllm_config.parallel_config))
+        self.is_sequence_parallel = is_sequence_parallel
+        self.sp_size = tp_size_ if is_sequence_parallel else 1
 
-    #     self.global_num_experts = num_experts + num_redundant_experts
-    #     self.zero_expert_num = zero_expert_num
-    #     self.zero_expert_type = zero_expert_type
+        self.moe_parallel_config: FusedMoEParallelConfig = (
+            FusedMoEParallelConfig.make(
+                tp_size_=tp_size_,
+                dp_size_=dp_size_,
+                vllm_parallel_config=vllm_config.parallel_config))
 
-    #     # # Round up hidden size if needed.
-    #     # hidden_size = maybe_roundup_hidden_size(hidden_size, moe_in_dtype,
-    #     #                                         quant_config,
-    #     #                                         self.moe_parallel_config)
+        self.global_num_experts = num_experts + num_redundant_experts
+        self.zero_expert_num = zero_expert_num
+        self.zero_expert_type = zero_expert_type
 
-    #     # # For smuggling this layer into the fused moe custom op
-    #     # compilation_config = vllm_config.compilation_config
-    #     # if prefix in compilation_config.static_forward_context:
-    #     #     raise ValueError("Duplicate layer name: {}".format(prefix))
-    #     # compilation_config.static_forward_context[prefix] = self
-    #     # self.layer_name = prefix
+        # # Round up hidden size if needed.
+        # hidden_size = maybe_roundup_hidden_size(hidden_size, moe_in_dtype,
+        #                                         quant_config,
+        #                                         self.moe_parallel_config)
 
-    #             # Determine expert maps
+        # # For smuggling this layer into the fused moe custom op
+        # compilation_config = vllm_config.compilation_config
+        # if prefix in compilation_config.static_forward_context:
+        #     raise ValueError("Duplicate layer name: {}".format(prefix))
+        # compilation_config.static_forward_context[prefix] = self
+        # self.layer_name = prefix
+
+                # Determine expert maps
         
-    #     if self.moe_parallel_config.use_ep:
-    #         # if self.enable_eplb:
-    #         #     assert self.global_num_experts % self.ep_size == 0, \
-    #         #         "EPLB currently only supports even distribution of " \
-    #         #         "experts across ranks."
-    #         # else:
-    #         #     assert num_redundant_experts == 0, \
-    #         #         "Redundant experts are only supported with EPLB."
+        if self.moe_parallel_config.use_ep:
+            # if self.enable_eplb:
+            #     assert self.global_num_experts % self.ep_size == 0, \
+            #         "EPLB currently only supports even distribution of " \
+            #         "experts across ranks."
+            # else:
+            #     assert num_redundant_experts == 0, \
+            #         "Redundant experts are only supported with EPLB."
 
-    #         # expert_placement_strategy = (
-    #         #     vllm_config.parallel_config.expert_placement_strategy)
-    #         # if expert_placement_strategy == "round_robin":
-    #         #     # TODO(Bruce): will support round robin expert placement with
-    #         #     # EPLB enabled in the future.
-    #         #     round_robin_supported = ((num_expert_group is not None
-    #         #                               and num_expert_group > 1)
-    #         #                              and num_redundant_experts == 0
-    #         #                              and not self.enable_eplb)
+            # expert_placement_strategy = (
+            #     vllm_config.parallel_config.expert_placement_strategy)
+            # if expert_placement_strategy == "round_robin":
+            #     # TODO(Bruce): will support round robin expert placement with
+            #     # EPLB enabled in the future.
+            #     round_robin_supported = ((num_expert_group is not None
+            #                               and num_expert_group > 1)
+            #                              and num_redundant_experts == 0
+            #                              and not self.enable_eplb)
 
-    #         #     if not round_robin_supported:
-    #         #         logger.warning(
-    #         #             "Round-robin expert placement is only supported for "
-    #         #             "models with multiple expert groups and no redundant "
-    #         #             "experts. Falling back to linear expert placement.")
-    #         #         expert_placement_strategy = "linear"
+            #     if not round_robin_supported:
+            #         logger.warning(
+            #             "Round-robin expert placement is only supported for "
+            #             "models with multiple expert groups and no redundant "
+            #             "experts. Falling back to linear expert placement.")
+            #         expert_placement_strategy = "linear"
 
-    #         self.expert_map: Optional[torch.Tensor]
-    #         local_num_experts, expert_map = determine_expert_map(
-    #             ep_size=self.ep_size,
-    #             ep_rank=self.ep_rank,
-    #             global_num_experts=self.global_num_experts,
-    #             expert_placement_strategy=expert_placement_strategy,
-    #         )
-    #         self.local_num_experts = local_num_experts
-    #         self.register_buffer("expert_map", expert_map)
-    #         logger.info_once(
-    #             "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
-    #             "placement strategy: %s. Local/global"
-    #             " number of experts: %s/%s. Experts local to global index map:"
-    #             " %s.", self.ep_rank, self.ep_size, expert_placement_strategy,
-    #             self.local_num_experts, self.global_num_experts,
-    #             get_compressed_expert_map(self.expert_map))
-    #     else:
-    #         self.local_num_experts, self.expert_map = (self.global_num_experts,
-    #                                                    None)
+            self.expert_map: Optional[torch.Tensor]
+            local_num_experts, expert_map = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts,
+                expert_placement_strategy=expert_placement_strategy,
+            )
+            self.local_num_experts = local_num_experts
+            self.register_buffer("expert_map", expert_map)
+            logger.info_once(
+                "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
+                "placement strategy: %s. Local/global"
+                " number of experts: %s/%s. Experts local to global index map:"
+                " %s.", self.ep_rank, self.ep_size, expert_placement_strategy,
+                self.local_num_experts, self.global_num_experts,
+                get_compressed_expert_map(self.expert_map))
+        else:
+            self.local_num_experts, self.expert_map = (self.global_num_experts,
+                                                       None)
 
-    #     self.expert_load_view: Optional[torch.Tensor] = None
-    #     self.logical_to_physical_map: Optional[torch.Tensor] = None
-    #     self.logical_replica_count: Optional[torch.Tensor] = None
+        self.expert_load_view: Optional[torch.Tensor] = None
+        self.logical_to_physical_map: Optional[torch.Tensor] = None
+        self.logical_replica_count: Optional[torch.Tensor] = None
 
-    #     self.top_k = top_k
+        self.top_k = top_k
 
-    #     assert intermediate_size % self.tp_size == 0
-    #     self.hidden_size = hidden_size
-    #     self.intermediate_size_per_partition = intermediate_size // self.tp_size
-    #     self.reduce_results = reduce_results
-    #     self.renormalize = renormalize
-    #     self.use_grouped_topk = use_grouped_topk
-    #     if self.use_grouped_topk:
-    #         assert num_expert_group is not None and topk_group is not None
-    #     self.num_expert_group = num_expert_group
-    #     self.topk_group = topk_group
-    #     self.custom_routing_function = custom_routing_function
-    #     self.scoring_func = scoring_func
-    #     self.routed_scaling_factor = routed_scaling_factor
-    #     self.e_score_correction_bias = e_score_correction_bias
-    #     self.apply_router_weight_on_input = apply_router_weight_on_input
-    #     self.activation = activation
+        assert intermediate_size % self.tp_size == 0
+        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        self.reduce_results = reduce_results
+        self.renormalize = renormalize
+        self.use_grouped_topk = use_grouped_topk
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.custom_routing_function = custom_routing_function
+        self.scoring_func = scoring_func
+        self.routed_scaling_factor = routed_scaling_factor
+        self.e_score_correction_bias = e_score_correction_bias
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.activation = activation
 
-    #     if self.scoring_func != "softmax" and not self.use_grouped_topk:
-    #         raise ValueError("Only softmax scoring function is supported for "
-    #                          "non-grouped topk.")
+        if self.scoring_func != "softmax" and not self.use_grouped_topk:
+            raise ValueError("Only softmax scoring function is supported for "
+                             "non-grouped topk.")
 
-    #     moe = FusedMoEConfig(
-    #         num_experts=self.global_num_experts,
-    #         experts_per_token=top_k,
-    #         hidden_dim=hidden_size,
-    #         num_local_experts=self.local_num_experts,
-    #         moe_parallel_config=self.moe_parallel_config,
-    #         in_dtype=moe_in_dtype,
-    #         max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
-    #         has_bias=has_bias,
-    #     )
-    #     self.moe_config = moe
-    #     self.moe_quant_config: Optional[FusedMoEQuantConfig] = None
-    #     self.quant_config = quant_config
+        moe = FusedMoEConfig(
+            num_experts=self.global_num_experts,
+            experts_per_token=top_k,
+            hidden_dim=hidden_size,
+            num_local_experts=self.local_num_experts,
+            moe_parallel_config=self.moe_parallel_config,
+            in_dtype=moe_in_dtype,
+            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+            has_bias=has_bias,
+        )
+        self.moe_config = moe
+        self.moe_quant_config: Optional[FusedMoEQuantConfig] = None
+        self.quant_config = quant_config
 
-    #     # # Note: get_quant_method will look at the layer's local_num_experts
-    #     # # for heuristic purposes, so it must be initialized first.
-    #     # quant_method: Optional[QuantizeMethodBase] = None
-    #     # quant_method = (UnquantizedFusedMoEMethod(moe) if quant_config is None
-    #     #                 else quant_config.get_quant_method(self, prefix))
+        # # Note: get_quant_method will look at the layer's local_num_experts
+        # # for heuristic purposes, so it must be initialized first.
+        # quant_method: Optional[QuantizeMethodBase] = None
+        # quant_method = (UnquantizedFusedMoEMethod(moe) if quant_config is None
+        #                 else quant_config.get_quant_method(self, prefix))
 
-    #     # self.quant_method = quant_method
+        # self.quant_method = quant_method
 
 
-    #     # num_experts = kwargs["num_experts"]
-    #     # self.global_num_experts = num_experts
-    #     ascend_config = get_ascend_config()
-    #     self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
-    #     vllm_config = get_current_vllm_config()
-    #     if ascend_config.torchair_graph_config.enabled:
-    #         self.use_aclgraph = False
-    #     else:
-    #         self.use_aclgraph = (vllm_config.compilation_config.level
-    #                              == CompilationLevel.PIECEWISE and
-    #                              not vllm_config.model_config.enforce_eager)
+        # num_experts = kwargs["num_experts"]
+        # self.global_num_experts = num_experts
+        ascend_config = get_ascend_config()
+        self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+        vllm_config = get_current_vllm_config()
+        if ascend_config.torchair_graph_config.enabled:
+            self.use_aclgraph = False
+        else:
+            self.use_aclgraph = (vllm_config.compilation_config.level
+                                 == CompilationLevel.PIECEWISE and
+                                 not vllm_config.model_config.enforce_eager)
 
     def gating(self,
                 hidden_states: torch.Tensor,
