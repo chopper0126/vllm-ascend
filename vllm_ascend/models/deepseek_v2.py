@@ -682,7 +682,9 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if self.role and 'mlp.gate.' in name:
+            if 'mlp.gate.' in name:
+                print(name)
+            if self.role and self.role == "attention" and 'mlp.gate.' in name:
                 name = name.replace("mlp.gate.", "gate.")
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -770,17 +772,16 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         return loaded_params
 
     def is_moe_weight(self,name):
-        if "shared_experts" in name or "experts" in name or "gate_" in name \
+        # if "shared_experts" in name or "experts" in name or "gate_" in name \
+        #     or "up" in name or "down" in name:
+        #     return True
+        # return False
+        if 'mlp.gate_proj.weight' in name or 'mlp.up_proj.weight' in name or 'mlp.down_proj.weight' in name:
+            return False
+        if "shared_experts" in name or "experts" in name or "gate_" in name\
             or "up" in name or "down" in name:
             return True
         return False
-        # if 'mlp.gate_proj.weight' in name or 'mlp.up_proj.weight' in name or 'mlp.down_proj.weight' in name:
-        #     return False
-        # if "shared_experts" in name or "experts" in name or "gate_" in name\
-        #     or "up" in name or "down" in name:
-
-        #     return True
-        # return False
 
     def is_common_weight(self,name):
         if "lm_head" in name or "model.norm.weight" in name or "embed_tokens" in name \

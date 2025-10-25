@@ -119,7 +119,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                 topk_weights = afdConnectorMetadata.topk_weights
                 topk_ids = afdConnectorMetadata.topk_ids
                 row_idx = afdConnectorMetadata.row_idx
-                print('execute_model')
+                # print('execute_model')
                 with set_ascend_forward_context(
                         attn_metadata=None,
                         vllm_config=self.vllm_config,
@@ -131,7 +131,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                         num_actual_tokens=total_num_scheduled_tokens,
                         model_instance=self.model):
                     rank_ffn_output = self._execute_eager_mode(
-                        hidden_states, current_layer_idx)
+                        hidden_states, current_layer_idx, topk_weights, topk_ids, row_idx)
 
             self.connector.send_ffn_output(rank_ffn_output, None)
         except Exception as e:
@@ -180,7 +180,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                             row_idx: Optional[torch.Tensor] = None,):
         """Execute FFN computation in eager mode (fallback)."""
         # Handle TP case: all-gather tensors from all TP ranks
-        print('_execute_eager_mode')
+        # print('_execute_eager_mode')
         tp_world_size = get_tensor_model_parallel_world_size()
         if tp_world_size > 1:
             # All-gather hidden states from all TP ranks
@@ -196,7 +196,7 @@ class NPUFFNModelRunner(NPUModelRunner):
         else:
             # Single TP case
             rank_ffn_output = self.model.compute_ffn_output(
-                current_layer_idx, hidden_states)
+                current_layer_idx, hidden_states, topk_weights, topk_ids, row_idx)
 
         return rank_ffn_output
 
