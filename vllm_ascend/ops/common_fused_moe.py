@@ -734,10 +734,18 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
 
         forward_context = get_forward_context()
+        # Use a separate stream to run shared experts.
+        shared_out = self._shared_experts(hidden_states)
+
+        # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
+        forward_context = get_forward_context()
+        moe_comm_type = forward_context.moe_comm_type
+        if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2}:
+            shared_out = tensor_model_parallel_all_reduce(shared_out)
 
         final_hidden_states = forward_context.moe_comm_method.finalize(
             hidden_states=final_hidden_states,
             reduce_results=self.reduce_results)
 
-        return final_hidden_states
+        return shared_out, final_hidden_states
 

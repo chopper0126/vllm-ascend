@@ -82,10 +82,11 @@ class NPUFFNModelRunner(NPUModelRunner):
         self.connector.init_afd_connector()
 
     
-
+    #TODO HXY 现在的layer是算的，强制要求1:1且顺序来，后面得改成传过来，后续需要更改
     def _get_current_layer_idx(self) -> int:
-        return (self._counter //
-                self.afd_config.num_afd_stages) % self.num_layers
+        # return (self._counter //
+        #         self.afd_config.num_afd_stages) % self.num_layers
+        return ((self._counter // self.afd_config.num_afd_stages) % (self.num_layers - 1)) + 1
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output=None, intermediate_tensors=None):
@@ -119,6 +120,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                 topk_weights = afdConnectorMetadata.topk_weights
                 topk_ids = afdConnectorMetadata.topk_ids
                 row_idx = afdConnectorMetadata.row_idx
+                current_layer_idx = afdConnectorMetadata.layer_idx
                 # print('execute_model')
                 with set_ascend_forward_context(
                         attn_metadata=None,
