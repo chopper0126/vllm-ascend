@@ -22,7 +22,8 @@ import torch_npu
 from torch.nn import Module  # 确保引入 nn.Module
 from vllm.config import CompilationLevel, get_current_vllm_config
 from vllm.distributed import (get_dp_group, get_ep_group, get_tp_group,
-                              get_tensor_model_parallel_world_size,
+                              get_tensor_model_parallel_world_size, 
+                              get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
 import vllm.envs as envs
 from vllm.forward_context import get_forward_context
@@ -236,51 +237,51 @@ class AscendAFD(FusedMoE):
 
                 # Determine expert maps
         
-        if self.moe_parallel_config.use_ep:
-            # if self.enable_eplb:
-            #     assert self.global_num_experts % self.ep_size == 0, \
-            #         "EPLB currently only supports even distribution of " \
-            #         "experts across ranks."
-            # else:
-            #     assert num_redundant_experts == 0, \
-            #         "Redundant experts are only supported with EPLB."
+        # if self.moe_parallel_config.use_ep:
+        #     # if self.enable_eplb:
+        #     #     assert self.global_num_experts % self.ep_size == 0, \
+        #     #         "EPLB currently only supports even distribution of " \
+        #     #         "experts across ranks."
+        #     # else:
+        #     #     assert num_redundant_experts == 0, \
+        #     #         "Redundant experts are only supported with EPLB."
 
-            # expert_placement_strategy = (
-            #     vllm_config.parallel_config.expert_placement_strategy)
-            # if expert_placement_strategy == "round_robin":
-            #     # TODO(Bruce): will support round robin expert placement with
-            #     # EPLB enabled in the future.
-            #     round_robin_supported = ((num_expert_group is not None
-            #                               and num_expert_group > 1)
-            #                              and num_redundant_experts == 0
-            #                              and not self.enable_eplb)
+        #     expert_placement_strategy = (
+        #         vllm_config.parallel_config.expert_placement_strategy)
+        #     # if expert_placement_strategy == "round_robin":
+        #     #     # TODO(Bruce): will support round robin expert placement with
+        #     #     # EPLB enabled in the future.
+        #     #     round_robin_supported = ((num_expert_group is not None
+        #     #                               and num_expert_group > 1)
+        #     #                              and num_redundant_experts == 0
+        #     #                              and not self.enable_eplb)
 
-            #     if not round_robin_supported:
-            #         logger.warning(
-            #             "Round-robin expert placement is only supported for "
-            #             "models with multiple expert groups and no redundant "
-            #             "experts. Falling back to linear expert placement.")
-            #         expert_placement_strategy = "linear"
+        #     #     if not round_robin_supported:
+        #     #         logger.warning(
+        #     #             "Round-robin expert placement is only supported for "
+        #     #             "models with multiple expert groups and no redundant "
+        #     #             "experts. Falling back to linear expert placement.")
+        #     #         expert_placement_strategy = "linear"
 
-            self.expert_map: Optional[torch.Tensor]
-            local_num_experts, expert_map = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-                expert_placement_strategy=expert_placement_strategy,
-            )
-            self.local_num_experts = local_num_experts
-            self.register_buffer("expert_map", expert_map)
-            logger.info_once(
-                "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
-                "placement strategy: %s. Local/global"
-                " number of experts: %s/%s. Experts local to global index map:"
-                " %s.", self.ep_rank, self.ep_size, expert_placement_strategy,
-                self.local_num_experts, self.global_num_experts,
-                get_compressed_expert_map(self.expert_map))
-        else:
-            self.local_num_experts, self.expert_map = (self.global_num_experts,
-                                                       None)
+        #     self.expert_map: Optional[torch.Tensor]
+        #     local_num_experts, expert_map = determine_expert_map(
+        #         ep_size=self.ep_size,
+        #         ep_rank=self.ep_rank,
+        #         global_num_experts=self.global_num_experts,
+        #         expert_placement_strategy=expert_placement_strategy,
+        #     )
+        #     self.local_num_experts = local_num_experts
+        #     # self.register_buffer("expert_map", expert_map)
+        #     # logger.info_once(
+        #     #     "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
+        #     #     "placement strategy: %s. Local/global"
+        #     #     " number of experts: %s/%s. Experts local to global index map:"
+        #     #     " %s.", self.ep_rank, self.ep_size, expert_placement_strategy,
+        #     #     self.local_num_experts, self.global_num_experts,
+        #     #     get_compressed_expert_map(self.expert_map))
+        # else:
+        #     self.local_num_experts, self.expert_map = (self.global_num_experts,
+        #                                                None)
 
         self.expert_load_view: Optional[torch.Tensor] = None
         self.logical_to_physical_map: Optional[torch.Tensor] = None
@@ -309,19 +310,19 @@ class AscendAFD(FusedMoE):
             raise ValueError("Only softmax scoring function is supported for "
                              "non-grouped topk.")
 
-        moe = FusedMoEConfig(
-            num_experts=self.global_num_experts,
-            experts_per_token=top_k,
-            hidden_dim=hidden_size,
-            num_local_experts=self.local_num_experts,
-            moe_parallel_config=self.moe_parallel_config,
-            in_dtype=moe_in_dtype,
-            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
-            has_bias=has_bias,
-        )
-        self.moe_config = moe
-        self.moe_quant_config: Optional[FusedMoEQuantConfig] = None
-        self.quant_config = quant_config
+        # moe = FusedMoEConfig(
+        #     num_experts=self.global_num_experts,
+        #     experts_per_token=top_k,
+        #     hidden_dim=hidden_size,
+        #     num_local_experts=self.local_num_experts,
+        #     moe_parallel_config=self.moe_parallel_config,
+        #     in_dtype=moe_in_dtype,
+        #     max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+        #     has_bias=has_bias,
+        # )
+        # self.moe_config = moe
+        # self.moe_quant_config: Optional[FusedMoEQuantConfig] = None
+        # self.quant_config = quant_config
 
         # # Note: get_quant_method will look at the layer's local_num_experts
         # # for heuristic purposes, so it must be initialized first.
@@ -358,6 +359,47 @@ class AscendAFD(FusedMoE):
         # TODO: The community only considers load balancing when DP > 1.
         # This approach may overlook some extreme scenarios.
         enable_force_load_balance = forward_context.in_profile_run
+
+        # import torch.nn as nn
+        # forward_context = get_forward_context()
+        # moe_comm_method = forward_context.moe_comm_method
+
+        # # Load balancing for token distribution among experts in dummy_run
+        # # TODO: The community only considers load balancing when DP > 1.
+        # # This approach may overlook some extreme scenarios.
+        # enable_force_load_balance = forward_context.in_profile_run
+        
+        # tp_size = get_tensor_model_parallel_world_size()
+        # tp_rank = get_tensor_model_parallel_rank()
+        # print(f'topk_ids shape before split is {topk_ids.shape}')
+        
+        # num_tokens, _ = hidden_states.shape
+        # target_pad_length = forward_context.padded_num_tokens
+        # pad_size = target_pad_length - num_tokens
+        # print(f'pad_size is {pad_size}')
+        # # Pad if necessary (unless shared expert DP is enabled)
+        # if pad_size > 0:
+        #     topk_weights = nn.functional.pad(topk_weights,
+        #                                         (0, 0, 0, pad_size))
+        #     topk_ids = nn.functional.pad(topk_ids,
+        #                                         (0, 0, 0, pad_size))
+        #     row_idx = nn.functional.pad(row_idx,
+        #                                         (0, 0, 0, pad_size))
+        # if tp_size > 1:
+        #     split_topk_weights = torch.tensor_split(topk_weights,
+        #                                             tp_size,
+        #                                             dim=0)
+        #     split_topk_ids = torch.tensor_split(topk_ids,
+        #                                         tp_size,
+        #                                         dim=0)
+        #     split_row_idx = torch.tensor_split(row_idx,
+        #                                         tp_size,
+        #                                         dim=0)
+        #     topk_weights = split_topk_weights[tp_rank]
+        #     topk_ids = split_topk_ids[tp_rank]
+        #     row_idx = split_row_idx[tp_rank]
+
+        # print(f'topk_ids shape after split is {topk_ids.shape}')    
 
         # hidden_states, router_logits = forward_context.moe_comm_method.prepare(
         #     hidden_states=hidden_states,
@@ -706,13 +748,59 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         return shared_out, fused_output
 
 
-    # TODO 这里的weight的传入有问题，目测是没加载对
     def afd_ffn_compute(self, 
                 layer,
-                hidden_states: torch.Tensor, 
-                topk_weights: torch.Tensor,
-                topk_ids: torch.Tensor,
-                row_idx):
+                hidden_states: Optional[torch.Tensor] = None, 
+                router_logits: Optional[torch.Tensor] = None,
+                topk_weights: Optional[torch.Tensor] = None,
+                topk_ids: Optional[torch.Tensor] = None,
+                row_idx:Optional[torch.Tensor] = None):
+        # import torch.nn as nn
+        # forward_context = get_forward_context()
+        # moe_comm_method = forward_context.moe_comm_method
+
+        # # Load balancing for token distribution among experts in dummy_run
+        # # TODO: The community only considers load balancing when DP > 1.
+        # # This approach may overlook some extreme scenarios.
+        # enable_force_load_balance = forward_context.in_profile_run
+        
+        # tp_size = get_tensor_model_parallel_world_size()
+        # tp_rank = get_tensor_model_parallel_rank()
+        # # print(f'topk_ids shape before split is {topk_ids.shape}')
+        
+        # num_tokens, _ = hidden_states.shape
+        # target_pad_length = forward_context.padded_num_tokens
+        # pad_size = target_pad_length - num_tokens
+        # print(f'pad_size is {pad_size}')
+        # # Pad if necessary (unless shared expert DP is enabled)
+        # if pad_size > 0:
+        #     topk_weights = nn.functional.pad(topk_weights,
+        #                                         (0, 0, 0, pad_size))
+        #     topk_ids = nn.functional.pad(topk_ids,
+        #                                         (0, 0, 0, pad_size))
+        #     row_idx = nn.functional.pad(row_idx,
+        #                                         (0, 0, 0, pad_size))
+        # if tp_size > 1:
+        #     split_topk_weights = torch.tensor_split(topk_weights,
+        #                                             tp_size,
+        #                                             dim=0)
+        #     split_topk_ids = torch.tensor_split(topk_ids,
+        #                                         tp_size,
+        #                                         dim=0)
+        #     split_row_idx = torch.tensor_split(row_idx,
+        #                                         tp_size,
+        #                                         dim=0)
+        #     topk_weights = split_topk_weights[tp_rank]
+        #     topk_ids = split_topk_ids[tp_rank]
+        #     row_idx = split_row_idx[tp_rank]
+
+        # print(f'topk_ids shape after split is {topk_ids.shape}')   
+        # hidden_states, router_logits = forward_context.moe_comm_method.prepare(
+        #     hidden_states=hidden_states,
+        #     router_logits=router_logits,
+        #     replace_allreduce=forward_context.sp_enabled,
+        #     enable_shared_expert_dp=self.enable_shared_expert_dp)
+        
         moe_comm_method = get_forward_context().moe_comm_method
         final_hidden_states = moe_comm_method.fused_experts(
             hidden_states=hidden_states,

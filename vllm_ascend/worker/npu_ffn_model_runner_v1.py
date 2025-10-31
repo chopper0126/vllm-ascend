@@ -96,7 +96,7 @@ class NPUFFNModelRunner(NPUModelRunner):
         current_layer_idx = self._get_current_layer_idx()
         try:
             # AFDConnectorMetadata
-            hidden_states, afdConnectorMetadata = self.connector.recv_attn_output()
+            hidden_states,router_logits,topk_weights, topk_ids, row_idx, afdConnectorMetadata = self.connector.recv_attn_output()
             logger.info("*"*50)
             logger.info(f"layer {current_layer_idx} moe recv hidden states type:{type(hidden_states)}, shape:{hidden_states.shape}")
             num_tokens = hidden_states.shape[0]
@@ -117,10 +117,12 @@ class NPUFFNModelRunner(NPUModelRunner):
                 moe_comm_type = ffn_need_forward_data.moe_comm_type
                 num_input_tokens = ffn_need_forward_data.num_input_tokens
                 total_num_scheduled_tokens = ffn_need_forward_data.total_num_scheduled_tokens
-                topk_weights = afdConnectorMetadata.topk_weights
-                topk_ids = afdConnectorMetadata.topk_ids
-                row_idx = afdConnectorMetadata.row_idx
                 current_layer_idx = afdConnectorMetadata.layer_idx
+                # router_logits = None
+                # topk_weights = afdConnectorMetadata.topk_weights
+                # topk_ids = afdConnectorMetadata.topk_ids
+                # row_idx = afdConnectorMetadata.row_idx
+                # router_logits = afdConnectorMetadata.router_logits
                 # print('execute_model')
                 with set_ascend_forward_context(
                         attn_metadata=None,
@@ -133,7 +135,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                         num_actual_tokens=total_num_scheduled_tokens,
                         model_instance=self.model):
                     rank_ffn_output = self._execute_eager_mode(
-                        hidden_states, current_layer_idx, topk_weights, topk_ids, row_idx)
+                        hidden_states, current_layer_idx, router_logits, topk_weights, topk_ids, row_idx)
 
             self.connector.send_ffn_output(rank_ffn_output, None)
         except Exception as e:
@@ -177,6 +179,7 @@ class NPUFFNModelRunner(NPUModelRunner):
 
     def _execute_eager_mode(self, hidden_states: torch.Tensor,
                             current_layer_idx: int,
+                            router_logits: Optional[torch.Tensor] = None,
                             topk_weights: Optional[torch.Tensor] = None,
                             topk_ids: Optional[torch.Tensor] = None,
                             row_idx: Optional[torch.Tensor] = None,):
@@ -184,21 +187,24 @@ class NPUFFNModelRunner(NPUModelRunner):
         # Handle TP case: all-gather tensors from all TP ranks
         # print('_execute_eager_mode')
         tp_world_size = get_tensor_model_parallel_world_size()
-        if tp_world_size > 1:
-            # All-gather hidden states from all TP ranks
-            gathered_hidden_states = tensor_model_parallel_all_gather(
-                hidden_states, dim=0)
-            ffn_output = self.model.compute_ffn_output(current_layer_idx,
-                                                       gathered_hidden_states)
-            # Extract the output corresponding to current rank
-            start_idx = hidden_states.shape[
-                0] * get_tensor_model_parallel_rank()
-            end_idx = start_idx + hidden_states.shape[0]
-            rank_ffn_output = ffn_output[start_idx:end_idx, :]
-        else:
-            # Single TP case
-            rank_ffn_output = self.model.compute_ffn_output(
-                current_layer_idx, hidden_states, topk_weights, topk_ids, row_idx)
+        # if tp_world_size > 1:
+        #     # All-gather hidden states from all TP ranks
+        #     gathered_hidden_states = tensor_model_parallel_all_gather(
+        #         hidden_states, dim=0)
+        #     ffn_output = self.model.compute_ffn_output( #TODO HXY 注意下面的hidden_states还是gathered_hidden_states
+        #         current_layer_idx, gathered_hidden_states, router_logits, topk_weights, topk_ids, row_idx)
+        #     # Extract the output corresponding to current rank
+        #     start_idx = hidden_states.shape[
+        #         0] * get_tensor_model_parallel_rank()
+        #     end_idx = start_idx + hidden_states.shape[0]
+        #     rank_ffn_output = ffn_output[start_idx:end_idx, :]
+        # else:
+        #     # Single TP case
+        #     rank_ffn_output = self.model.compute_ffn_output(
+        #         current_layer_idx, hidden_states, router_logits, topk_weights, topk_ids, row_idx)
+
+        rank_ffn_output = self.model.compute_ffn_output(
+                current_layer_idx, hidden_states, router_logits, topk_weights, topk_ids, row_idx)
 
         return rank_ffn_output
 
