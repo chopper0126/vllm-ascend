@@ -897,7 +897,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     def ffn_forward(
         self,
     ) -> torch.Tensor:
-        ffn_need_metadata_obj, attn_metadata, hidden_states, handle2 = AFDConnector.recv_attn_output(layer_idx=self.layer_idx)
+        ffn_need_metadata_obj, attn_metadata, hidden_states, handle2 = AFDConnector.recv_attn_output()
         handle2.wait()
         # 计算mlp
         if isinstance(self.mlp, CustomDeepseekV2MoE):
