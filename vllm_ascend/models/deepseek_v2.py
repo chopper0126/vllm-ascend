@@ -78,7 +78,7 @@ from typing import Any, Optional, Union
 from torch.distributed.distributed_c10d import (
     _get_default_group,
 )
-from vllm_ascend.distributed import P2PAFDConnector, P2PAFDConnectorMetadata, get_ae_group_new
+from vllm_ascend.distributed import P2PAFDConnector, P2PAFDConnectorMetadata
 from vllm_ascend.multistream.base import MSEventKey
 from vllm_ascend.multistream.context import (
     advance_step_multistream_layer_context, get_multistream_comm_context,
@@ -555,6 +555,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         #     k_c.size(1) + k_pe.size(1) == kv_cache.size(2)
         # i.e.
         #     kv_lora_rank + qk_rope_head_dim == head_size
+        self.tensor1 = torch.randn(5120, 5120).npu()
         self.mla_attn = Attention(
             num_heads=self.num_local_heads,
             head_size=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -585,6 +586,8 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             hidden_states: torch.Tensor,
             kv_cache: Optional[torch.Tensor] = None,
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
+        torch.matmul(self.tensor1, self.tensor1)
+        return hidden_states
         enable_multistream_mla = (self.enable_multistream_mla
                                   and attn_metadata is not None
                                   and not attn_metadata.with_prefill_across_dp
@@ -622,6 +625,18 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                  output_shape=hidden_states.shape)
 
 
+class AFDMultiStreamContext:
+    def __init__(self, num_stages) -> None:
+        self.attn_recv_handles = [None] * num_stages
+        self.attn_send_handles = [None] * num_stages
+        self.ffn_recv_handles = [None] * num_stages
+        self.ffn_send_handles = [None] * num_stages
+
+        self.attn_recv_hidden_states = [None] * num_stages
+        self.ffn_recv_hidden_states = [None] * num_stages
+
+afd_ms_context = AFDMultiStreamContext(num_stages=4)
+
 class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
 
     def __init__(
@@ -640,7 +655,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
         self.enable_afd = enable_afd
-        self.num_stages = 3
+        self.num_stages = 4
         self.afd_ms_context = AFDMultiStreamContext(self.num_stages)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
@@ -650,16 +665,17 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.layers = config.num_hidden_layers
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tp_group().rank_in_group
+        self.afd_ms_context = afd_ms_context
         ascend_config = get_ascend_config()
         self.is_ffn = ascend_config.is_ffn
         if self.enable_afd:
             if not self.is_ffn:
                 # TODO: enable mla in vllm-ascend
-                if model_config.use_mla:
-                    attn_cls = CustomDeepseekV2MLAAttention
+                # if model_config.use_mla:
+                attn_cls = CustomDeepseekV2MLAAttention
 
-                else:
-                    attn_cls = DeepseekV2Attention
+                # else:
+                #     attn_cls = DeepseekV2Attention
                 self.self_attn = attn_cls(
                     config=config,
                     hidden_size=self.hidden_size,
@@ -745,6 +761,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                                 eps=config.rms_norm_eps)
         self.routed_scaling_factor = config.routed_scaling_factor
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.tensor1 = torch.randn(5120, 5120).npu()
 
     def forward(
         self,
@@ -769,8 +786,8 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 hidden_states, residual)
             # Dispose hidden_states and residual from the previous layer
             # to save npu memory because they're no longer used.
-            dispose_tensor(previous_hidden_states)
-            dispose_tensor(previous_residual)
+            # dispose_tensor(previous_hidden_states)
+            # dispose_tensor(previous_residual)
         if mla_moe_communication and self.layer_idx > self.first_k_dense_replace:
             hidden_states = tensor_model_parallel_all_gather(hidden_states,
                                                              dim=0)
@@ -821,8 +838,9 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             afd_connector_metadata.set_ffn_need_metadata(ffn_need_metadata)
             afd_connector_metadata.set_attn_metadata(attn_metadata)
             
-            AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
-            hidden_states, _ = AFDConnector.recv_ffn_output(hidden_states)
+            handle1, handle2 = AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
+            handle1.wait()
+            handle2.wait()
         else:
             #=============================
             hidden_states = self.self_attn(
@@ -880,19 +898,16 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     def ffn_forward(
         self,
     ) -> torch.Tensor:
-        ffn_need_metadata_obj, attn_metadata, hidden_states, _ = AFDConnector.recv_attn_output()
-
-
+        ffn_need_metadata_obj, attn_metadata, hidden_states, handle2 = AFDConnector.recv_attn_output(layer_idx=self.layer_idx)
+        handle2.wait()
         # 计算mlp
-        ffn_need_metadata_obj.is_ffn = True
-        # print(f'recv side ffn_need_metadata_obj.is_ffn is {ffn_need_metadata_obj.is_ffn}')
         if isinstance(self.mlp, CustomDeepseekV2MoE):
             hidden_states = self.mlp(hidden_states=hidden_states,
                                     attn_metadata=attn_metadata,
                                     replace_allreduce=False,
-                                    is_prefill = ffn_need_metadata_obj.is_prefill,
-                                    enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
-                                    is_ffn = ffn_need_metadata_obj.is_ffn,
+                                    is_prefill = False,
+                                    enable_force_load_balance=False,
+                                    is_ffn = True,
                                     )
         else:
             hidden_states = self.mlp(hidden_states)
@@ -907,7 +922,8 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 # of DeepseekV2MOE
                 hidden_states *= 1. / self.routed_scaling_factor
         # send
-        AFDConnector.send_ffn_output(hidden_states)
+        handle = AFDConnector.send_ffn_output(hidden_states)
+        handle.wait()
 
     # should split ops in Decoder Layer
     def _forward_ms_op_input_layernorm(
@@ -976,6 +992,12 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         #     mla_moe_communication = self.mla_moe_communication and replace_allreduce
         # else:
         #     mla_moe_communication = False
+        if self.layer_idx != 1:
+            if afd_ms_context.attn_recv_handles[stage_idx] is not None:
+                afd_ms_context.attn_recv_handles[stage_idx].wait()
+                afd_ms_context.attn_recv_handles[stage_idx] = None
+                hidden_states = afd_ms_context.attn_recv_hidden_states[stage_idx]
+
         mla_moe_communication = False
         if residual is None:
             residual = hidden_states
@@ -986,8 +1008,8 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 hidden_states, residual)
             # Dispose hidden_states and residual from the previous layer
             # to save npu memory because they're no longer used.
-            dispose_tensor(previous_hidden_states)
-            dispose_tensor(previous_residual)
+            # dispose_tensor(previous_hidden_states)
+            # dispose_tensor(previous_residual)
         if mla_moe_communication and self.layer_idx > self.first_k_dense_replace:
             hidden_states = tensor_model_parallel_all_gather(hidden_states,
                                                              dim=0)
@@ -1036,43 +1058,43 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         
         afd_connector_metadata.set_ffn_need_metadata(ffn_need_metadata)
         afd_connector_metadata.set_attn_metadata(attn_metadata)
-        
-        # print(f'attention sending hidden')
-        AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
-        
-        # prefetch 
-        # print(f'attention receiving from ffn')
-        next_hidden_states, handle = AFDConnector.recv_ffn_output(hidden_states)
-        ms_context.wait_handles[stage_idx] = handle
-        ms_context.intermediate_tensors[stage_idx] = next_hidden_states
 
+        # 这里handle不需要wait？
+        handle1, handle2 = AFDConnector.send_attn_output(hidden_states, afd_connector_metadata)
+
+        if stage_idx != 0:
+            recv_hidden_states, handle = AFDConnector.recv_ffn_output(hidden_states)
+            afd_ms_context.attn_recv_handles[(stage_idx - 1 + self.num_stages) % self.num_stages] = handle
+            afd_ms_context.attn_recv_hidden_states[(stage_idx - 1 + self.num_stages) % self.num_stages] = recv_hidden_states
         return hidden_states, residual
 
 
     def _forward_ffn_ms(
         self, stage_idx, ms_context
     ) -> torch.Tensor:
-        recv_outputs = ms_context.intermediate_tensors[stage_idx]
-        if recv_outputs is None:
-            ffn_need_metadata_obj, attn_metadata, hidden_states, handle = AFDConnector.recv_attn_output()
-            handle.wait()
+        attn_metadata = None
+        if self.layer_idx == 1 and stage_idx == 0:
+            ffn_need_metadata_obj, attn_metadata, hidden_states, handle2 = AFDConnector.recv_attn_output()
+            handle2.wait()
         else:
-            ffn_need_metadata_obj, attn_metadata, hidden_states, handle = recv_outputs
-            handle.wait()
-
+            if afd_ms_context.ffn_recv_handles[stage_idx] is not None:
+                afd_ms_context.ffn_recv_handles[stage_idx].wait()
+                afd_ms_context.ffn_recv_handles[stage_idx] = None
+                hidden_states = afd_ms_context.ffn_recv_hidden_states[stage_idx]
 
         # 计算mlp
-        ffn_need_metadata_obj.is_ffn = True
-        if isinstance(self.mlp, CustomDeepseekV2MoE):
-            hidden_states = self.mlp(hidden_states=hidden_states,
-                                    attn_metadata=attn_metadata,
-                                    replace_allreduce=False,
-                                    is_prefill = ffn_need_metadata_obj.is_prefill,
-                                    enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
-                                    is_ffn = ffn_need_metadata_obj.is_ffn,
-                                    )
-        else:
-            hidden_states = self.mlp(hidden_states)
+        # ffn_need_metadata_obj.is_ffn = True
+        # if isinstance(self.mlp, CustomDeepseekV2MoE):
+        #     hidden_states = self.mlp(hidden_states=hidden_states,
+        #                             attn_metadata=attn_metadata,
+        #                             replace_allreduce=False,
+        #                             is_prefill = ffn_need_metadata_obj.is_prefill,
+        #                             enable_force_load_balance=ffn_need_metadata_obj.enable_force_load_balance,
+        #                             is_ffn = ffn_need_metadata_obj.is_ffn,
+        #                             )
+        # else:
+        #     hidden_states = self.mlp(hidden_states)
+        torch.matmul(self.tensor1, self.tensor1)
         
         if isinstance(
                 self.mlp,
@@ -1084,15 +1106,14 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 # of DeepseekV2MOE
                 hidden_states *= 1. / self.routed_scaling_factor
         # send
-        print('ffn sending hidden')
-        AFDConnector.send_ffn_output(hidden_states)
-        print('ffn sent hidden')
+        if not (self.is_last and stage_idx == self.num_stages - 1):
+            ffn_need_metadata_obj, attn_metadata, recv_hidden_states, handle2 = AFDConnector.recv_attn_output()
+            afd_ms_context.ffn_recv_handles[(stage_idx + 1) % self.num_stages] = handle2
+            afd_ms_context.ffn_recv_hidden_states[(stage_idx + 1) % self.num_stages] = recv_hidden_states
 
-        if not (self.is_last and stage_idx == 2):
-            print('ffn prefetching hidden')
-            args = AFDConnector.recv_attn_output()
-            print('ffn prefetched hidden')
-            ms_context.intermediate_tensors[(stage_idx + 1) % 3] = args
+        if not self.is_last:
+            # 不需要wait？
+            handle = AFDConnector.send_ffn_output(hidden_states)
 
 
     def _forward_ms_layer(
@@ -1121,31 +1142,29 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         chunk_hidden_states = []
         rank = get_world_group().rank_in_group
 
-        torch.npu.synchronize()
+        # torch.npu.synchronize()
 
         for i in range(self.num_stages):
             # 如果是Attn就计算一次Attn，否则就不计算
             # TODO 对kvcache这块的处理和self.afd_ms_context的处理
             if not self.is_ffn:
-                if self.afd_ms_context.intermediate_tensors[i] is not None:
-                    hidden_states = self.afd_ms_context.intermediate_tensors[i]
-                    handle = self.afd_ms_context.wait_handles[i]
-                    handle.wait()
-                hidden_states, residual = self._forward_attn_ms(
-                    positions,
-                    hidden_states,
-                    residual,
+                # if self.afd_ms_context.intermediate_tensors[i] is not None:
+                #     hidden_states = self.afd_ms_context.intermediate_tensors[i]
+                #     handle = self.afd_ms_context.wait_handles[i]
+                #     handle.wait()
+                hidden_states[i], residual[i] = self._forward_attn_ms(
+                    positions[i],
+                    hidden_states[i],
+                    residual[i],
                     kv_cache,
-                    attn_metadata,
+                    attn_metadata if attn_metadata is not None else None,
                     replace_allreduce=False, 
                     stage_idx = i, 
                     ms_context = self.afd_ms_context)
-
             # export
             else:
-
                 # 阶段3: 在NPU1上计算 (与NPU0计算重叠)
-                self._forward_ffn_ms(self.layer_idx, self.afd_ms_context)
+                self._forward_ffn_ms(i, self.afd_ms_context)
         torch.npu.synchronize()
         return hidden_states, residual
     
@@ -1232,6 +1251,7 @@ class CustomDeepseekV2Model(nn.Module):
                 multistream_metadata)
             self.ms_post_layer = MultiStreamPostTransformerLayer(
                 multistream_metadata)
+        self.num_stages = 4
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1257,7 +1277,7 @@ class CustomDeepseekV2Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         num_normal_layers = (self.first_k_dense_replace
-                            if self.enable_ms_for_afd and self.can_run_ms()
+                            if self.enable_ms_for_afd
                              else self.end_layer - self.start_layer)
         # num_normal_layers = self.first_k_dense_replace
 
@@ -1297,7 +1317,7 @@ class CustomDeepseekV2Model(nn.Module):
 
     def ffn_forward(self):
         num_normal_layers = (self.first_k_dense_replace
-                            if self.enable_ms_for_afd and self.can_run_ms()
+                            if self.enable_ms_for_afd
                              else self.end_layer - self.start_layer)
 
         moe_start_layer = self.start_layer + num_normal_layers
@@ -1311,12 +1331,12 @@ class CustomDeepseekV2Model(nn.Module):
             print('moe_start_layer < self.end_layer 进入多流逻辑')
             # if we enable multistream/dbo, process sparse layers here
             hidden_states, residual = self._forward_ms_layers(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
+                positions=None,
+                hidden_states=None,
+                residual=None,
                 moe_start_layer=moe_start_layer,
                 is_ffn=True,
-                kv_caches=kv_caches,
+                kv_caches=None,
             )
 
     # 目前看起来是attn_metadata是空，得想办法搞下attn_metadata
@@ -1328,7 +1348,7 @@ class CustomDeepseekV2Model(nn.Module):
             return False
         # enable prefill overlap
         if attn_metadata is None:# or attn_metadata.num_prefills == 0:
-            print(attn_metadata)
+            # print(attn_metadata)
             # print(attn_metadata.num_prefills == 0)
             print('attn_metadata is None or attn_metadata.num_prefills == 0')
             return False
@@ -1366,12 +1386,26 @@ class CustomDeepseekV2Model(nn.Module):
         # attn_metadata, [positions, hidden_states,
         #                 residual] = self.ms_pre_layer(
         #                     [positions, hidden_states, residual], )
-        attn_metadata = get_forward_context().attn_metadata
+        # attn_metadata = get_forward_context().attn_metadata
+        if is_ffn:
+            attn_metadata = None
+        else:
+            attn_metadata = get_forward_context().attn_metadata
+
+        if not is_ffn:
+            hidden_states, handle = AFDConnector.recv_ffn_output(hidden_states)
+            handle.wait()
+            positions = torch.tensor_split(positions, self.num_stages, dim=0)
+            hidden_states = torch.tensor_split(hidden_states, self.num_stages, dim=0)
+            residual = torch.tensor_split(residual, self.num_stages, dim=0)
+            positions = [positions[i] for i in range(0, self.num_stages)]
+            hidden_states = [hidden_states[i] for i in range(0, self.num_stages)]
+            residual = [residual[i] for i in range(0, self.num_stages)]
         # the rest layers
         for i in range(moe_start_layer, self.end_layer):
             # print('moe layer', i)
             layer = self.layers[i]
-            if i == self.end_layer:
+            if i == self.end_layer - 1:
                 layer.is_last = True
 
             hidden_states, residual = layer._forward_ms_layer(
@@ -1385,8 +1419,11 @@ class CustomDeepseekV2Model(nn.Module):
                 is_prefill=is_prefill)
             advance_step_multistream_layer_context()
 
-        [hidden_states,
-         residual] = self.ms_post_layer([hidden_states, residual], )
+        # [hidden_states,
+        #  residual] = self.ms_post_layer([hidden_states, residual], )
+        if not is_ffn:
+            hidden_states = torch.concat(hidden_states, dim=0)
+            residual = torch.concat(residual, dim=0)
         return hidden_states, residual
 
 class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):

@@ -24,9 +24,10 @@ from torch.distributed.distributed_c10d import (
     _update_default_pg,
 )
 
+from .AFDConnector import *
+
 from vllm.distributed.parallel_state import (get_dp_group,get_world_group,get_new_default_group,GroupCoordinator, 
                                                 creat_hccl_process_group, init_model_parallel_group)
-from .AFDConnector import *
 
 class FFNNeedMetadata():
 
@@ -64,9 +65,15 @@ class P2PAFDConnectorMetadata(AFDConnectorMetadata):
     def set_ffn_need_metadata(self, ffn_need_metadata):
         self.ffn_need_metadata = ffn_need_metadata
 
-def get_ae_group_new() -> GroupCoordinator:
-    assert _AE_GROUP is not None, ("afd group is not initialized")
-    return _AE_GROUP
+def get_comm1_group_new() -> GroupCoordinator:
+    assert _COMM1_GROUP is not None, ("afd group is not initialized")
+    return _COMM1_GROUP
+
+def get_comm2_group_new() -> GroupCoordinator:
+    assert _COMM2_GROUP is not None, ("afd group is not initialized")
+    return _COMM2_GROUP
+
+tensor1 = torch.randn(5120, 5120).npu()
 
 class P2PAFDConnector(AFDConnectorBase):
     def __init__(self, rank: int, attn_size: int, ffn_size: int, is_ffn: bool):
@@ -74,77 +81,66 @@ class P2PAFDConnector(AFDConnectorBase):
         global _NEW_DEFAULT_GROUP
         if is_ffn:
             rank = rank+attn_size
-        _NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, ffn_size+attn_size)
+        _NEW_DEFAULT_GROUP = creat_hccl_process_group(rank, ffn_size+attn_size, backend=backend)
         self.default_group = _NEW_DEFAULT_GROUP
         default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), _NEW_DEFAULT_GROUP)
-        self.send_stream = torch_npu.npu.Stream()
-        self.recv_stream = torch_npu.npu.Stream()
+        self.comm_stream = torch_npu.npu.Stream()
         # create sub_group in new_default_group
         with default_pg_switcher:
             sub_group_ranks = []
             for i in range(ffn_size):
                 ranks = list([i, ffn_size+i])
                 sub_group_ranks.append(ranks)
-            global _AE_GROUP
-            _AE_GROUP = init_model_parallel_group(sub_group_ranks,
+            global _COMM1_GROUP
+            _COMM1_GROUP = init_model_parallel_group(sub_group_ranks,
+                                    rank,
+                                    backend,
+                                    group_name="ae")
+            global _COMM2_GROUP
+            _COMM2_GROUP = init_model_parallel_group(sub_group_ranks,
                                     rank,
                                     backend,
                                     group_name="ae")
                                     
-    # ATTN发给MOE（ATTN发送）
+    # attn send to moe  当前无需wait，在下个stage发送之前wait
     def send_attn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata) -> Any:    
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
-        self.send_stream.wait_stream(torch_npu.npu.current_stream())
-        with torch_npu.npu.stream(self.send_stream):
-            with default_pg_switcher:
-                ae_group = get_ae_group_new()
-                dst = (ae_group.rank_in_group + 1) % ae_group.world_size
-                ffn_need_metadata = metadata.ffn_need_metadata
-                ae_group.send_object(ffn_need_metadata, dst=dst)
-                attn_metadata = metadata.attn_metadata
-                ae_group.send_object(attn_metadata, dst=dst)
-                size_tensor = torch.tensor(hidden_states.size()).npu()
-                ae_group.send(size_tensor)
-                ae_group.send(hidden_states)
+        self.comm_stream.wait_stream(torch_npu.npu.current_stream())
+        with torch_npu.npu.stream(self.comm_stream):
+            ae_group = get_comm2_group_new()
+            dst = (ae_group.rank_in_group + 1) % ae_group.world_size
+            ffn_need_metadata = metadata.ffn_need_metadata
+            attn_metadata = metadata.attn_metadata
+            size_tensor = torch.tensor(hidden_states.size()).npu()
+            handle1 = dist.isend(tensor=size_tensor, dst=dst, group=ae_group.device_group)
+            handle2 = dist.isend(tensor=hidden_states, dst=dst, group=ae_group.device_group)
+        return handle1, handle2
 
-        return
-
-    # MOE发给ATTN（ATTN接收）hidden_states只负责提供shape和dtype
+    # attn recv from moe
     def recv_ffn_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
-        sync_event = torch_npu.npu.Event()
-        with torch_npu.npu.stream(self.recv_stream):
-            with default_pg_switcher:
-                ae_group = get_ae_group_new()
-                hidden_states = ae_group.recv(hidden_states.size(),dtype=hidden_states.dtype)
-            sync_event.record(stream = self.recv_stream)
-        
-        return hidden_states, sync_event
+        with torch_npu.npu.stream(self.comm_stream):
+            ae_group = get_comm1_group_new()
+            src = (ae_group.rank_in_group - 1) % ae_group.world_size
+            hidden_states = torch.empty(hidden_states.size(), dtype=hidden_states.dtype, device="npu")
+            handle = dist.irecv(tensor=hidden_states, group=ae_group.device_group, src=src)
+        return hidden_states, handle
     
-    # MOE发给ATTN(MOE发送) 
+    # moe send to attn  当前无需wait，在下个stage发送之前wait
     def send_ffn_output(self, ffn_output: torch.Tensor):
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
-        self.send_stream.wait_stream(torch_npu.npu.current_stream())
-        with torch_npu.npu.stream(self.send_stream):
-            with default_pg_switcher:
-                ae_group = get_ae_group_new()
-                ae_group.send(ffn_output)
-        return
-    
-    # ATTN发给MOE(MOE接收)
-    def recv_attn_output(self, timeout_ms: Optional[int] = None) -> Any:
-        default_pg_switcher = DefaultProcessGroupSwitcher(_get_default_group(), self.default_group)
-        sync_event = torch_npu.npu.Event()
+        self.comm_stream.wait_stream(torch_npu.npu.current_stream())
+        with torch_npu.npu.stream(self.comm_stream):
+            ae_group = get_comm1_group_new()
+            dst = (ae_group.rank_in_group + 1) % ae_group.world_size
+            handle = dist.isend(tensor=ffn_output, group=ae_group.device_group, dst=dst)
+        return handle
 
+    # moe recv from attn
+    def recv_attn_output(self, timeout_ms: Optional[int] = None) -> Any:
         with torch_npu.npu.stream(self.recv_stream):
-            with default_pg_switcher:
-                ae_group = get_ae_group_new()
-                src = (ae_group.rank_in_group - 1) % ae_group.world_size
-                ffn_need_metadata_obj = ae_group.recv_object(src=src)
-                attn_metadata = ae_group.recv_object(src=src)
-                size_tensor = ae_group.recv(2,dtype=torch.int64)
-                size_tensor = torch.zeros([size_tensor[0],size_tensor[1]])
-                hidden_states = ae_group.recv(size_tensor.size(), dtype=torch.bfloat16)
-            sync_event.record(stream = self.recv_stream)
-        
-        return ffn_need_metadata_obj, attn_metadata, hidden_states, sync_event
+            ae_group = get_comm2_group_new()
+            src = (ae_group.rank_in_group - 1) % ae_group.world_size
+            buffer = torch.empty(2, dtype=torch.int64, device="npu")
+            handle1 = dist.irecv(tensor=buffer, group=ae_group.device_group, src=src)
+            handle1.wait()
+            hidden_states = torch.empty((buffer[0], buffer[1]), dtype=torch.bfloat16, device="npu")
+            handle2 = dist.irecv(tensor=hidden_states, group=ae_group.device_group, src=src)
+        return None, None, hidden_states, handle2

@@ -559,6 +559,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.kv_a_layernorm = kwargs.get('kv_a_layernorm', None)
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tensor1 = torch.randn(10240, 10240).npu()
 
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
@@ -1043,9 +1044,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         ckq: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
-        if attn_metadata is None:
+        # if attn_metadata is None:
             # Profiling run.
-            return output
+            # return output
+        # afd 下需要切 attn_metadata
+        torch.matmul(self.tensor1, self.tensor1)
+        return output
         self.running_in_graph = self.torchair_graph_enabled and attn_metadata.attn_state in [
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]

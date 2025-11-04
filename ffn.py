@@ -228,19 +228,19 @@ def create_config() -> VllmConfig:
 
     engine_args = EngineArgs(
         model="/home/y30059858/DeepSeek-V2-Lite",
-        load_format = "dummy",
+        # load_format = "dummy",
         enforce_eager=True,
         trust_remote_code=True,
-        tensor_parallel_size=2,
+        tensor_parallel_size=1,
         enable_expert_parallel=True,
         additional_config={
             # 关闭chunked_prefill ,调度器走vllm-ascend 重写的调度器，V0
             'ascend_scheduler_config':{
                 'enabled': True,},
             "enable_afd":True,
-            "enable_ms_afd":True,
-            "attn_num": 2,
-            "ffn_num": 2,
+            "enable_ms_for_afd":True,
+            "attn_num": 1,
+            "ffn_num": 1,
             "is_ffn": True
             }
     )
@@ -291,18 +291,19 @@ class FFNModelRunner(NPUModelRunner):
             self.model.model.ffn_forward()
 
 if __name__ == '__main__':
-    hccl_world_size = 4
-    attn_size = 2
-    ffn_size = 2
+    hccl_world_size = 2
+    attn_size = 1
+    ffn_size = 1
 
     hccl_processes = []
-    for rank in range(ffn_size,hccl_world_size):
-        p = mp.Process(target=run_ffn, args=(rank, hccl_world_size, attn_size, ffn_size))
-        hccl_processes.append(p)
-        p.start()
-
-
-    for p in hccl_processes:
-        p.join()
+    # for rank in range(ffn_size,hccl_world_size):
+    #     p = mp.Process(target=run_ffn, args=(rank, hccl_world_size, attn_size, ffn_size))
+    #     hccl_processes.append(p)
+    #     p.start()
+    #
+    #
+    # for p in hccl_processes:
+    #     p.join()
+    run_ffn(1, hccl_world_size, attn_size, ffn_size)
 
     print("All processes finished")
