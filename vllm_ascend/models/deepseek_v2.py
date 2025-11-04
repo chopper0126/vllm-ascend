@@ -656,7 +656,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                           8192)
         self.enable_afd = enable_afd
         self.num_stages = 4
-        self.afd_ms_context = AFDMultiStreamContext(self.num_stages)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
@@ -1165,7 +1164,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             else:
                 # 阶段3: 在NPU1上计算 (与NPU0计算重叠)
                 self._forward_ffn_ms(i, self.afd_ms_context)
-        torch.npu.synchronize()
+        # torch.npu.synchronize()
         return hidden_states, residual
     
     
@@ -1179,11 +1178,6 @@ class FFNNeedMetadata():
         self.enable_force_load_balance = enable_force_load_balance
         self.is_ffn = is_ffn
 
-class AFDMultiStreamContext:
-    wait_handles: List[torch_npu.npu.Event]
-    def __init__(self, num_stages) -> None:
-        self.wait_handles = [None] * num_stages
-        self.intermediate_tensors = [None] * num_stages
 
 class CustomDeepseekV2Model(nn.Module):
 

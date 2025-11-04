@@ -135,7 +135,7 @@ class P2PAFDConnector(AFDConnectorBase):
 
     # moe recv from attn
     def recv_attn_output(self, timeout_ms: Optional[int] = None) -> Any:
-        with torch_npu.npu.stream(self.recv_stream):
+        with torch_npu.npu.stream(self.comm_stream):
             ae_group = get_comm2_group_new()
             src = (ae_group.rank_in_group - 1) % ae_group.world_size
             buffer = torch.empty(2, dtype=torch.int64, device="npu")
