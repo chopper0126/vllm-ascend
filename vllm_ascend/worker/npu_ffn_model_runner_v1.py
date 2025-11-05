@@ -102,6 +102,8 @@ class NPUFFNModelRunner(NPUModelRunner):
             # if current_layer_idx < 1:
             #     return
             # self.is_m2n = False
+            self.is_m2n = False
+            self.is_cam = True
             if self.is_m2n:
                 # TODO metadata
                 m2n_afdconnector_data = M2NAFDConnectorMetadata()
@@ -118,6 +120,12 @@ class NPUFFNModelRunner(NPUModelRunner):
                 print(f'recv_attn_output success ,layer id is {current_layer_idx}')
                 m2n_afdconnector_data.handle = handle
                 m2n_afdconnector_data.topk_weights = topk_weights
+            elif self.is_cam:
+                output1,afdConnectorMetadata = self.connector.recv_attn_output()
+                current_layer_idx = afdConnectorMetadata.layer_idx
+                hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
+                group_list = expertTokenNums.to(torch.int64)
+                topk_weights = simulateExpertScales
             else:
                 hidden_states,router_logits,topk_weights, topk_ids, row_idx, afdConnectorMetadata = self.connector.recv_attn_output()
                 m2n_afdconnector_data=None
@@ -165,6 +173,14 @@ class NPUFFNModelRunner(NPUModelRunner):
                             dynamic_scales=dynamic_scales,
                             topk_weights=topk_weights,
                             current_layer_idx=current_layer_idx)
+                    elif self.is_cam:
+                        # 未combine hidden
+                        rank_ffn_output = self._execute_eager_mode(
+                            hidden_states=hidden_states,
+                            group_list=group_list,
+                            dynamic_scales=dynamic_scales,
+                            topk_weights=topk_weights,
+                            current_layer_idx=current_layer_idx)
                     else:
                         rank_ffn_output = self._execute_eager_mode(
                             hidden_states = hidden_states,
@@ -174,8 +190,12 @@ class NPUFFNModelRunner(NPUModelRunner):
                             topk_ids = topk_ids,
                             row_idx = row_idx,)
 
-            
-            self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
+            if self.is_cam:
+                handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
+                afdConnectorMetadata.cam_afdconnector_data.handle = handle
+                self.connector.send_ffn_output(rank_ffn_output, afdConnectorMetadata)
+            else :
+                self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
         except Exception as e:
             raise ValueError(
                 f"Error computing FFN for layer {current_layer_idx}: {e}"
@@ -249,6 +269,15 @@ class NPUFFNModelRunner(NPUModelRunner):
                 dynamic_scales=dynamic_scales,
                 topk_weights=topk_weights, 
                 topk_ids=topk_ids)
+        if self.is_cam:
+            rank_ffn_output = self.model.compute_ffn_output(
+                layer_idx=current_layer_idx, 
+                hidden_states=hidden_states,
+                group_list=group_list,
+                dynamic_scales=dynamic_scales,
+                topk_weights=topk_weights, 
+                topk_ids=topk_ids,
+                row_idx=row_idx)
         else:
             print("_execute_eager_mode", topk_weights.shape)
             rank_ffn_output = self.model.compute_ffn_output(
