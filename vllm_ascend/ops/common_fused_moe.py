@@ -553,7 +553,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
-        # print(f'topk_ids shape before split is {topk_ids.shape}')
+        print(f'topk_ids shape before split is {topk_ids.shape}')
         
         shared_out = self._shared_experts(hidden_states)
 
@@ -565,7 +565,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         num_tokens, _ = hidden_states.shape
         target_pad_length = forward_context.padded_num_tokens
         pad_size = target_pad_length - num_tokens
-        # print(f'pad_size is {pad_size}')
+        print(f'pad_size is {pad_size}')
         # Pad if necessary (unless shared expert DP is enabled)
         if pad_size > 0:
             topk_weights = nn.functional.pad(topk_weights,

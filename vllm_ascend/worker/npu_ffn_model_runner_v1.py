@@ -58,6 +58,8 @@ class NPUFFNModelRunner(NPUModelRunner):
         self.cudagraph_batch_sizes = list(
             reversed(
                 self.vllm_config.compilation_config.cudagraph_capture_sizes))
+        
+        self.is_m2n = self.afd_config.afd_connector == "m2nconnector"
 
         # Storage for captured graphs
         self._cuda_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {
@@ -97,9 +99,9 @@ class NPUFFNModelRunner(NPUModelRunner):
         current_layer_idx = self._get_current_layer_idx()
         try:
             # AFDConnectorMetadata
-            if current_layer_idx < 1:
-                return
-            self.is_m2n = True
+            # if current_layer_idx < 1:
+            #     return
+            # self.is_m2n = False
             if self.is_m2n:
                 # TODO metadata
                 m2n_afdconnector_data = M2NAFDConnectorMetadata()
@@ -118,8 +120,10 @@ class NPUFFNModelRunner(NPUModelRunner):
                 m2n_afdconnector_data.topk_weights = topk_weights
             else:
                 hidden_states,router_logits,topk_weights, topk_ids, row_idx, afdConnectorMetadata = self.connector.recv_attn_output()
+                m2n_afdconnector_data=None
             logger.info("*"*50)
             logger.info(f"layer {current_layer_idx} moe recv hidden states type:{type(hidden_states)}, shape:{hidden_states.shape}")
+            print("execute_model", topk_weights.shape)
             num_tokens = hidden_states.shape[0]
 
             # Try to use CUDA graph if available
@@ -138,10 +142,11 @@ class NPUFFNModelRunner(NPUModelRunner):
                 moe_comm_type = ffn_need_forward_data.moe_comm_type
                 num_input_tokens = ffn_need_forward_data.num_input_tokens
                 total_num_scheduled_tokens = ffn_need_forward_data.total_num_scheduled_tokens
+                current_layer_idx = afdConnectorMetadata.layer_idx
                 # topk_weights = afdConnectorMetadata.topk_weights
                 # topk_ids = afdConnectorMetadata.m2n_afdconnector_data.topk_ids
                 # row_idx = afdConnectorMetadata.row_idx
-                print('execute_model')
+                print('execute_model', current_layer_idx)
                 with set_ascend_forward_context(
                         attn_metadata=None,
                         vllm_config=self.vllm_config,
@@ -162,7 +167,12 @@ class NPUFFNModelRunner(NPUModelRunner):
                             current_layer_idx=current_layer_idx)
                     else:
                         rank_ffn_output = self._execute_eager_mode(
-                            hidden_states,router_logits,current_layer_idx,topk_weights, topk_ids)
+                            hidden_states = hidden_states,
+                            current_layer_idx = current_layer_idx,
+                            router_logits = router_logits,
+                            topk_weights = topk_weights, 
+                            topk_ids = topk_ids,
+                            row_idx = row_idx,)
 
             
             self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
@@ -240,8 +250,14 @@ class NPUFFNModelRunner(NPUModelRunner):
                 topk_weights=topk_weights, 
                 topk_ids=topk_ids)
         else:
+            print("_execute_eager_mode", topk_weights.shape)
             rank_ffn_output = self.model.compute_ffn_output(
-                current_layer_idx, hidden_states,router_logits,topk_weights, topk_ids, row_idx)
+                 hidden_states = hidden_states,
+                 layer_idx = current_layer_idx,
+                 router_logits = router_logits,
+                 topk_weights = topk_weights, 
+                 topk_ids = topk_ids,
+                 row_idx = row_idx,)
 
         return rank_ffn_output
 
