@@ -103,7 +103,7 @@ class NPUFFNModelRunner(NPUModelRunner):
             #     return
             # self.is_m2n = False
             self.is_m2n = False
-            self.is_cam = True
+            self.is_cam = False
             if self.is_m2n:
                 # TODO metadata
                 m2n_afdconnector_data = M2NAFDConnectorMetadata()
