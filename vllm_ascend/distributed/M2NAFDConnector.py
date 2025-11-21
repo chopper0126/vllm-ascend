@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Any
+from contextlib import nullcontext
 
 from vllm.distributed.afd_transfer.afd_connector import (AFDConnectorBase, AFDConnectorFactory,
                             AFDConnectorMetadata)
@@ -21,8 +22,24 @@ from vllm.distributed.parallel_state import init_afd_process_group, init_model_p
 
 from vllm.logger import init_logger
 from vllm.config import VllmConfig,CUDAGraphMode,CompilationLevel
+
+from vllm.distributed.afd_transfer.afd_connector.metadata import AFDRecvHandle
 logger = init_logger(__name__)
 
+
+def with_npu_stream(use_multistream: bool, stream: torch.npu.Stream):
+    if use_multistream:
+        return torch.npu.stream(stream)
+    else:
+        return nullcontext()
+
+class NPUAFDRecvHandle(AFDRecvHandle):
+    def __init__(self, recv_event: torch.npu.Event):
+        super().__init__()
+        self.recv_event = recv_event
+
+    def wait(self):
+        torch.npu.current_stream().wait_event(self.recv_event)
 
 class DefaultProcessGroupSwitcher:
     def __init__(self, default_group, new_default_group):
@@ -66,6 +83,13 @@ class M2NAFDConnector(AFDConnectorBase):
         self.ffn_size = 0
         self.use_aclgraph = self._use_aclgraph()
         print(f'self.use_aclgraph in M2NAFDConnector is {self.use_aclgraph}')
+
+        # TODO(jcz): Need to be config.
+        self.use_multistream = True
+
+        if self.use_multistream:
+            self.send_stream = torch.npu.Stream(device=torch.npu.current_device())
+            self.recv_stream = torch.npu.Stream(device=torch.npu.current_device())
         
     def _use_aclgraph(self) -> bool:
         return self.config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.config.compilation_config.level == CompilationLevel.PIECEWISE and not self.config.model_config.enforce_eager
@@ -146,25 +170,28 @@ class M2NAFDConnector(AFDConnectorBase):
         quant_mode = metadata.m2n_afdconnector_data.quant_mode
         aiv_num = metadata.m2n_afdconnector_data.aiv_num
         
-        if dynamic_scales is None:
-            dynamic_scales = torch.tensor([], dtype=torch.float32, device='npu')
-        recv_counts = torch_npu.npu_m2n_distribute_send(x=hidden_states,
-                                                        expert_ids=topk_ids,
-                                                        expert_scales=topk_weights,
-                                                        # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
-                                                        group_ep=self.hccl_comm_name,
-                                                        world_size=self.attn_size + self.ffn_size,
-                                                        moe_world_size=self.ffn_size,
-                                                        ep_rank_id=self.rank,
-                                                        moe_expert_num=moe_expert_num,
-                                                        quant_mode=quant_mode,
-                                                        aiv_num=aiv_num,
-                                                        server_rank_size = 2,
-                                                        dynamic_scales=dynamic_scales)
-        
-        
-        
-        return recv_counts
+        compute_event = torch.npu.Event()
+        compute_event.record()
+        with with_npu_stream(self.use_multistream, self.send_stream):
+            self.send_stream.wait_event(compute_event)
+            if dynamic_scales is None:
+                dynamic_scales = torch.tensor([], dtype=torch.float32, device='npu')
+            recv_counts = torch_npu.npu_m2n_distribute_send(x=hidden_states,
+                                                            expert_ids=topk_ids,
+                                                            expert_scales=topk_weights,
+                                                            # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                            group_ep=self.hccl_comm_name,
+                                                            world_size=self.attn_size + self.ffn_size,
+                                                            moe_world_size=self.ffn_size,
+                                                            ep_rank_id=self.rank,
+                                                            moe_expert_num=moe_expert_num,
+                                                            quant_mode=quant_mode,
+                                                            aiv_num=aiv_num,
+                                                            server_rank_size=2,
+                                                            dynamic_scales=dynamic_scales)
+            # TODO(jcz): Need to remove this synchronization.
+            self.send_stream.synchronize()
+            return recv_counts
 
     # MOE发给ATTN（ATTN接收）
     def recv_ffn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata) -> torch.Tensor:
@@ -173,17 +200,20 @@ class M2NAFDConnector(AFDConnectorBase):
         moe_expert_num = metadata.m2n_afdconnector_data.moe_expert_num
         aiv_num = metadata.m2n_afdconnector_data.aiv_num
         
-        xOut = torch_npu.npu_n2m_distribute_recv(x=hidden_states,
-                                                ep_recv_counts=handle,
-                                                # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
-                                                group_ep=self.hccl_comm_name,
-                                                world_size=self.attn_size + self.ffn_size,
-                                                moe_world_size=self.ffn_size,
-                                                ep_rank_id=self.rank,
-                                                moe_expert_num=moe_expert_num,
-                                                server_rank_size = 2,
-                                                aiv_num=aiv_num)
-        return xOut
+        recv_event = torch.npu.Event()
+        with with_npu_stream(self.use_multistream, self.recv_stream):
+            xOut = torch_npu.npu_n2m_distribute_recv(x=hidden_states,
+                                                    ep_recv_counts=handle,
+                                                    # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                    group_ep=self.hccl_comm_name,
+                                                    world_size=self.attn_size + self.ffn_size,
+                                                    moe_world_size=self.ffn_size,
+                                                    ep_rank_id=self.rank,
+                                                    moe_expert_num=moe_expert_num,
+                                                    server_rank_size=2,
+                                                    aiv_num=aiv_num)
+            recv_event.record()
+            return xOut, [recv_event]
     
     # MOE发给ATTN(MOE发送) 
     def send_ffn_output(self, ffn_output: torch.Tensor, metadata: M2NAFDConnectorMetadata):
