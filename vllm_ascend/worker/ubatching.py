@@ -20,14 +20,14 @@ class UBatchContext:
 
     def __init__(self,
                  id: int,
-                 comm_stream: torch.cuda.Stream,
-                 compute_stream: torch.cuda.Stream,
+                 comm_stream: torch.npu.Stream,
+                 compute_stream: torch.npu.Stream,
                  forward_context: ForwardContext,
                  ready_barrier: threading.Barrier,
                  cpu_wait_event: threading.Event,
                  cpu_signal_event: threading.Event,
-                 gpu_comm_done_event: torch.cuda.Event,
-                 gpu_compute_done_event: torch.cuda.Event,
+                 npu_comm_done_event: torch.npu.Event,
+                 npu_compute_done_event: torch.npu.Event,
                  schedule: str = "default"):
         self.id = id
         self.comm_stream = comm_stream
@@ -37,8 +37,8 @@ class UBatchContext:
         self.cpu_wait_event = cpu_wait_event
         self.cpu_signal_event = cpu_signal_event
         self.current_stream = compute_stream
-        self.gpu_comm_done_event = gpu_comm_done_event
-        self.gpu_compute_done_event = gpu_compute_done_event
+        self.npu_comm_done_event = npu_comm_done_event
+        self.npu_compute_done_event = npu_compute_done_event
         self.schedule = schedule
         self.recv_hook = None
 
@@ -70,19 +70,19 @@ class UBatchContext:
     def update_stream(self, stream):
         self.current_stream = stream
         if current_stream() != self.current_stream:
-            torch.cuda.set_stream(self.current_stream)
+            torch.npu.set_stream(self.current_stream)
 
     def _signal_comm_done(self):
-        self.gpu_comm_done_event.record(self.comm_stream)
+        self.npu_comm_done_event.record(self.comm_stream)
 
     def _signal_compute_done(self):
-        self.gpu_compute_done_event.record(self.compute_stream)
+        self.npu_compute_done_event.record(self.compute_stream)
 
     def _wait_compute_done(self):
-        self.comm_stream.wait_event(self.gpu_compute_done_event)
+        self.comm_stream.wait_event(self.npu_compute_done_event)
 
     def _wait_comm_done(self):
-        self.compute_stream.wait_event(self.gpu_comm_done_event)
+        self.compute_stream.wait_event(self.npu_comm_done_event)
 
     def _cpu_yield(self):
         # It is critical for correctness that only one thread is running
@@ -186,8 +186,8 @@ def dbo_register_recv_hook(recv_hook):
 
 def make_ubatch_contexts(
     num_micro_batches: int,
-    compute_stream: torch.cuda.Stream,
-    comm_stream: torch.cuda.Stream,
+    compute_stream: torch.npu.Stream,
+    comm_stream: torch.npu.Stream,
     forward_contexts: list[ForwardContext],
     ready_barrier: threading.Barrier,
     schedule: str = "default",
@@ -197,11 +197,11 @@ def make_ubatch_contexts(
     Create a context manager for micro-batching synchronization.
     """
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
-    gpu_comm_done_events = [
-        torch.cuda.Event() for _ in range(num_micro_batches)
+    npu_comm_done_events = [
+        torch.npu.Event() for _ in range(num_micro_batches)
     ]
-    gpu_compute_done_events = [
-        torch.cuda.Event() for _ in range(num_micro_batches)
+    npu_compute_done_events = [
+        torch.npu.Event() for _ in range(num_micro_batches)
     ]
 
     assert len(forward_contexts) == 2
@@ -216,8 +216,8 @@ def make_ubatch_contexts(
                             cpu_wait_event=cpu_events[i],
                             cpu_signal_event=cpu_events[(i + 1) %
                                                         num_micro_batches],
-                            gpu_comm_done_event=gpu_comm_done_events[i],
-                            gpu_compute_done_event=gpu_compute_done_events[i],
+                            npu_comm_done_event=npu_comm_done_events[i],
+                            npu_compute_done_event=npu_compute_done_events[i],
                             schedule=schedule)
         ctxs.append(ctx)
 

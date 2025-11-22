@@ -19,7 +19,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import has_deep_gemm
-from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+from vllm_ascend.worker.ubatching import UBatchContext, make_ubatch_contexts
 
 logger = init_logger(__name__)
 
@@ -106,7 +106,7 @@ class UBatchWrapper:
         # self.sm_control = self._create_sm_control_context(vllm_config)
         self.device = device
 
-    # TODO 这里要重新写，npu当然没有sm这种东西，得改成aiv和aic，但不知道是啥，先注释掉再说
+    # TODO HXY 这里要重新写，npu当然没有sm这种东西，得改成aiv和aic，但不知道是啥，先注释掉再说
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
         comm_sms = envs.VLLM_DBO_COMM_SMS
@@ -238,6 +238,7 @@ class UBatchWrapper:
                     intermediate_tensors=ubatch_metadata.intermediate_tensors,
                     inputs_embeds=ubatch_metadata.inputs_embeds,
                 )
+            print("_ubatch_thread")
             results.append((ubatch_metadata.context.id, model_output))
 
         results: list[tuple[int, torch.Tensor]] = []
@@ -245,21 +246,23 @@ class UBatchWrapper:
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
         # after both threads have finished
-        with override_forward_context(None):
-            ubatch_threads = []
-            for metadata in ubatch_metadata:
-                thread = threading.Thread(target=_ubatch_thread,
-                                          args=(
-                                              results,
-                                              model,
-                                              metadata,
-                                          ))
-                ubatch_threads.append(thread)
-                thread.start()
-            self.ready_barrier.wait()  # Wait for both threads to be ready
-            ubatch_metadata[0].context.cpu_wait_event.set()
-            for thread in ubatch_threads:
-                thread.join()
+        # TODO HXY 这里强行override了才导致这边的里面要Get的时候拿不到正确的东西了
+        # with override_forward_context(None):
+        ubatch_threads = []
+        for metadata in ubatch_metadata:
+            thread = threading.Thread(target=_ubatch_thread,
+                                        args=(
+                                            results,
+                                            model,
+                                            metadata,
+                                        ))
+            ubatch_threads.append(thread)
+            thread.start()
+        self.ready_barrier.wait()  # Wait for both threads to be ready
+        ubatch_metadata[0].context.cpu_wait_event.set()
+        for thread in ubatch_threads:
+            thread.join()
+        
         sorted_results = [value for position, value in sorted(results)]
         result = torch.cat(sorted_results, dim=0)
         return result
@@ -272,13 +275,21 @@ class UBatchWrapper:
         # Create one forward context per ubatch
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
+            forward_context = get_forward_context()
+            forward_context.attn_metadata = attn_metadata[i] if attn_metadata is not None else None
+            forward_context.no_compile_layers=self.vllm_config.compilation_config.static_forward_context
+            forward_context.dp_metadata=dp_metadata
+            forward_context.cudagraph_runtime_mode=aclgraph_runtime_mode
+            forward_context.batch_descriptor=batch_descriptor
             forward_contexts.append(
-                create_forward_context(
-                    attn_metadata[i] if attn_metadata is not None else None,
-                    self.vllm_config,
-                    dp_metadata=dp_metadata,
-                    batch_descriptor=batch_descriptor,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode))
+                forward_context
+                # create_forward_context( # TODO HXY 这里到底是create_forward_context还是ascend的
+                #     attn_metadata[i] if attn_metadata is not None else None,
+                #     self.vllm_config,
+                #     dp_metadata=dp_metadata,
+                #     batch_descriptor=batch_descriptor,
+                #     cudagraph_runtime_mode=aclgraph_runtime_mode)
+                    )
 
         ubatch_ctxs = make_ubatch_contexts(
             num_micro_batches=len(ubatch_slices),
@@ -327,7 +338,7 @@ class UBatchWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         ubatch_slices = forward_context.ubatch_slices
-        aclgraph_runtime_mode = forward_context.aclgraph_runtime_mode
+        aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
         # If there's no ubatching, just run the runnable object
         if ubatch_slices is None:
@@ -396,5 +407,6 @@ class UBatchWrapper:
                 dp_metadata=dp_metadata,
                 batch_descriptor=batch_descriptor,
                 aclgraph_runtime_mode=CUDAGraphMode.NONE)
-            with self.sm_control:
-                return self._run_ubatches(ubatch_metadata, self.model)
+            # with self.sm_control:
+            #     return self._run_ubatches(ubatch_metadata, self.model)
+            return self._run_ubatches(ubatch_metadata, self.model)
