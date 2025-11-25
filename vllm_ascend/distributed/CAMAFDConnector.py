@@ -225,3 +225,6 @@ class CAMAFDConnector(AFDConnectorBase):
         print(f'recv_attn_output end rank:{self.rank}')
 
         return output1, metadata
+    
+    def wait_recv_stream(self) -> None:
+        pass
