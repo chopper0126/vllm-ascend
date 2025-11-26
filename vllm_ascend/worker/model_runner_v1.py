@@ -1652,7 +1652,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_input_tokens, num_tokens_across_dp,
                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
                 input_ids, inputs_embeds, intermediate_tensors, afd_metadata,
-                max_num_scheduled_tokens)
+                max_num_scheduled_tokens, ubatch_slices)
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
         if (
