@@ -11,20 +11,29 @@ import torch_npu
 import torch
 
 from torch.distributed.distributed_c10d import _get_default_group
-from vllm.distributed.parallel_state import init_afd_process_group, DefaultProcessGroupSwitcher
 import re
 
 import torch
 from torch.distributed.distributed_c10d import  _update_default_pg, _get_default_group
+from vllm.distributed.afd_transfer.afd_connector.metadata import M2NAFDConnectorMetadata
 
 from vllm.distributed.parallel_state import init_afd_process_group, init_model_parallel_group
-from vllm.distributed.afd_transfer.afd_connector.metadata import (
-    M2NAFDConnectorMetadata)
 
 from vllm.logger import init_logger
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig,CUDAGraphMode,CompilationLevel
 logger = init_logger(__name__)
 
+
+class DefaultProcessGroupSwitcher:
+    def __init__(self, default_group, new_default_group):
+        self.default_group = default_group
+        self.new_default_group = new_default_group
+
+    def __enter__(self):
+        _update_default_pg(self.new_default_group)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        _update_default_pg(self.default_group)
 
 # # TODO(yxj):move to ascend ,use kwargs 
 # @dataclass
@@ -55,6 +64,11 @@ class M2NAFDConnector(AFDConnectorBase):
         self.config = config
         self.attn_size = 0
         self.ffn_size = 0
+        self.use_aclgraph = self._use_aclgraph()
+        print(f'self.use_aclgraph in M2NAFDConnector is {self.use_aclgraph}')
+        
+    def _use_aclgraph(self) -> bool:
+        return self.config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.config.compilation_config.level == CompilationLevel.PIECEWISE and not self.config.model_config.enforce_eager
     
     def close(self) -> None:
         """Close the connector and release resources."""
@@ -74,14 +88,17 @@ class M2NAFDConnector(AFDConnectorBase):
         self.rank = world_rank
         logger.info(
             f"world_size = {self.ffn_size + self.attn_size}, world_rank = {world_rank}")
+        print(f"world_size = {self.ffn_size + self.attn_size}, world_rank = {world_rank}")
         # TODO : get backend to replace hardcode
         self.afd_pg = init_afd_process_group(
             backend="hccl",
-            init_method=f"tcp://127.0.0.1:29509",
+            init_method=f"tcp://127.0.0.1:29505",
             world_size=self.ffn_size + self.attn_size,
             rank=world_rank,
             group_name="afd"
         )
+        # print(f'hccl_comm_name is {self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)}')
+        self.hccl_comm_name = self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
         ffn_ranks = [i for i in range(self.ffn_size, self.ffn_size + self.attn_size)]
         attn_ranks = [i for i in range(self.attn_size)]
 
@@ -98,6 +115,9 @@ class M2NAFDConnector(AFDConnectorBase):
                                                  backend="hccl",
                                                  group_name="ae")
 
+        import math
+        # 节点的卡数,最好取一个公约数,比如a侧8卡f侧4卡，那可以取2或者4
+        self.server_rank_size = math.gcd(self.attn_size, self.ffn_size)
         logger.info("m2n connector initialized")
 
         self._initialized = True
@@ -118,10 +138,12 @@ class M2NAFDConnector(AFDConnectorBase):
                          topk_ids:torch.Tensor, 
                          metadata: AFDConnectorMetadata) -> Any:
         # TODO():move to support aclgraph
-        dst = (self.process_group.rank_in_group + 1) % self.process_group.world_size
-        print(f'send_attn_output dst is {dst}')
-        self.process_group.send_object(metadata,dst)
-        print(f'send_attn_output metadata success')
+        # torch.npu.synchronize()
+        if not self.use_aclgraph:
+            dst = (self.process_group.rank_in_group + 1) % self.process_group.world_size
+            print(f'send_attn_output dst is {dst}')
+            self.process_group.send_object(metadata,dst)
+            print(f'send_attn_output metadata success')
         dynamic_scales = metadata.m2n_afdconnector_data.scale
         # moe_expert_num
         moe_expert_num = metadata.m2n_afdconnector_data.moe_expert_num
@@ -133,14 +155,14 @@ class M2NAFDConnector(AFDConnectorBase):
         recv_counts = torch_npu.npu_m2n_distribute_send(x=hidden_states,
                                                         expert_ids=topk_ids,
                                                         expert_scales=topk_weights,
-                                                        group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                        group_ep=self.hccl_comm_name,
                                                         world_size=self.attn_size + self.ffn_size,
                                                         moe_world_size=self.ffn_size,
                                                         ep_rank_id=self.rank,
                                                         moe_expert_num=moe_expert_num,
                                                         quant_mode=quant_mode,
                                                         aiv_num=aiv_num,
-                                                        server_rank_size = 2,
+                                                        server_rank_size = self.server_rank_size,
                                                         dynamic_scales=dynamic_scales)
         
         
@@ -156,12 +178,13 @@ class M2NAFDConnector(AFDConnectorBase):
         
         xOut = torch_npu.npu_n2m_distribute_recv(x=hidden_states,
                                                 ep_recv_counts=handle,
-                                                group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                group_ep=self.hccl_comm_name,
                                                 world_size=self.attn_size + self.ffn_size,
                                                 moe_world_size=self.ffn_size,
                                                 ep_rank_id=self.rank,
                                                 moe_expert_num=moe_expert_num,
-                                                server_rank_size = 2,
+                                                server_rank_size = self.server_rank_size,
                                                 aiv_num=aiv_num)
         return xOut
     
@@ -178,26 +201,29 @@ class M2NAFDConnector(AFDConnectorBase):
         torch_npu.npu_n2m_distribute_send(expandX=ffn_output,
                                         ep_send_counts=handle,
                                         expert_scales=topk_weights,
-                                        group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                        # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                        group_ep=self.hccl_comm_name,
                                         world_size=self.attn_size + self.ffn_size,
                                         moe_world_size=self.ffn_size,
                                         ep_rank_id=self.rank,
                                         moe_expert_num=moe_expert_num,# config
                                         batch_size=batch_size,# config
                                         k=k,# config
-                                        server_rank_size = 2,
+                                        server_rank_size = self.server_rank_size,
                                         aiv_num=aiv_num)# config 未分核48 
-        print(f'send_ffn_output success')
+        # print(f'send_ffn_output success')
         return
     
     # ATTN发给MOE(MOE接收)
     def recv_attn_output(self, metadata: M2NAFDConnectorMetadata) -> Any: 
-        
-        print(f'before recv_attn_output metadata is {metadata}') 
-        src = (self.process_group.rank_in_group - 1) % self.process_group.world_size
-        afdConnectorMetadata = self.process_group.recv_object(src)
-        print(f'recv_attn_output metadata success')
-        print(f'after recv_attn_output metadata is {metadata}') 
+        # torch.npu.synchronize()
+        afdConnectorMetadata = None
+        if not self.use_aclgraph:
+            print(f'before recv_attn_output metadata is {metadata}') 
+            src = (self.process_group.rank_in_group - 1) % self.process_group.world_size
+            afdConnectorMetadata = self.process_group.recv_object(src)
+            print(f'recv_attn_output afdConnectorMetadata success')
+            print(f'after recv_attn_output afdConnectorMetadata is {afdConnectorMetadata}') 
         # TODO(yxj): 对比
         x_type = torch.int8
         if metadata.quant_mode == 0 :
@@ -211,7 +237,8 @@ class M2NAFDConnector(AFDConnectorBase):
         expert_token_nums_type = metadata.expert_token_nums_type
         #npu::npu_m2n_distribute_recv(Tensor x, str group_ep, int world_size, int server_rank_size, int moe_world_size, int ep_rank_id, int moe_expert_num, int quant_mode, int batch_size, int h, int k, int expert_token_nums_type, int aiv_num) -> (Tensor, Tensor, Tensor, Tensor, Tensor)
         expand_x, dynamic_scales, expert_token_nums, recv_counts, expand_scales = torch_npu.npu_m2n_distribute_recv(x = torch.tensor([], dtype=x_type, device='npu'),
-                                                                                group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                                                # group_ep=self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank),
+                                                                                group_ep=self.hccl_comm_name,
                                                                                 world_size=self.attn_size + self.ffn_size,
                                                                                 moe_world_size=self.ffn_size,
                                                                                 ep_rank_id=self.rank,
@@ -221,7 +248,7 @@ class M2NAFDConnector(AFDConnectorBase):
                                                                                 h=h,
                                                                                 k=k,
                                                                                 expert_token_nums_type=expert_token_nums_type,
-                                                                                server_rank_size = 2,
+                                                                                server_rank_size = self.server_rank_size,
                                                                                 aiv_num=aiv_num)
         
         # recv_counts 返程路由

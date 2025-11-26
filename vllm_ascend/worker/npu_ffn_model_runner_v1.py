@@ -5,24 +5,32 @@ import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import torch_npu
 import torch.nn as nn
-
+from tqdm import tqdm
+import re
 from vllm.config import VllmConfig
 from vllm.distributed.afd_transfer.afd_connector.factory import (
     AFDConnectorFactory)
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
-    get_world_group, graph_capture)
-from vllm.forward_context import set_forward_context
+from vllm.distributed.parallel_state import (get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
+                                             get_world_group,is_global_first_rank)
+from vllm.forward_context import set_forward_context,BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner,graph_capture
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm.distributed.afd_transfer.afd_connector.metadata import (
-    AFDConnectorMetadata,FFNNeedForwardData,M2NAFDConnectorMetadata)
+    AFDConnectorMetadata, FFNNeedForwardData, M2NAFDConnectorMetadata)
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
+                         get_layers_from_vllm_config)
+from vllm.v1.worker.gpu_ffn_model_runner import GPUFFNModelRunner
+from vllm.platforms import current_platform
+import vllm.envs as envs_vllm
+
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -31,7 +39,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class NPUFFNModelRunner(NPUModelRunner):
+class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config=vllm_config,
@@ -41,30 +49,29 @@ class NPUFFNModelRunner(NPUModelRunner):
         self.device = device
         self.dtype = self.model_config.dtype
         self.load_config = vllm_config.load_config
+        self.first_k_dense_replace = self.model_config.hf_config.first_k_dense_replace
+        self._forword_cnt = 0
 
         self.afd_config = vllm_config.afd_config
         if not self.afd_config or not self.afd_config.is_ffn_server:
             raise ValueError(
                 "AFD config must be provided with afd_role='ffn' for FFN server"
             )
-
+        self.connector_name = self.afd_config.afd_connector
+        
         self._counter = 0
 
-        # Initialize CUDA graph support
-        self.use_cuda_graph = not self.model_config.enforce_eager
-
-        # self.cudagraph_batch_sizes sorts in ascending order.
-        # The batch sizes in the config are in descending order.
+        # Initialize ACL graph support
         self.cudagraph_batch_sizes = list(
             reversed(
                 self.vllm_config.compilation_config.cudagraph_capture_sizes))
-        
-        self.is_m2n = self.afd_config.afd_connector == "m2nconnector"
+                # self.aclgraph_batch_sizes = list(
+        #     reversed(self.compilation_config.cudagraph_capture_sizes))
 
         # Storage for captured graphs
-        self._cuda_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {
-        }  # {(layer_idx, num_tokens): CUDAGraph}
-        self._graph_memory_pool = None
+        self._acl_graphs: dict[tuple[int, int], torch.npu.NPUGraph] = {
+        }  # {(layer_idx, num_tokens): ACLGraph}
+        self.graph_pool = None
 
         assert self.afd_config.is_ffn_server
         self.connector = AFDConnectorFactory.create_connector(
@@ -72,12 +79,35 @@ class NPUFFNModelRunner(NPUModelRunner):
             get_world_group().local_rank, self.vllm_config)
         
         self.connector.init_afd_connector()
+        self.attn_size = self.connector.attn_size
+        self.ffn_size = self.connector.ffn_size
+        print(f'attn_size = {self.attn_size},ffn_size = {self.ffn_size}')
         if getattr(self.model_config.hf_config, "text_config",
                    None) is not None:
             self.num_layers = (
                 self.model_config.hf_config.text_config.num_hidden_layers)
         else:
             self.num_layers = self.model_config.hf_config.num_hidden_layers
+        self.dummy_run_call_cnt = 0
+        
+        # self.profiler
+        # import os
+        # experimental_config = torch_npu.profiler._ExperimentalConfig(
+        #     export_type=torch_npu.profiler.ExportType.Text,
+        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        # )
+        # self.prof = torch_npu.profiler.profile(
+        #     activities=[
+        #         torch_npu.profiler.ProfilerActivity.CPU,
+        #         torch_npu.profiler.ProfilerActivity.NPU
+        #     ],
+        #     schedule=torch_npu.profiler.schedule(wait=5, warmup=2, active=20, repeat=1, skip_first=20),
+        #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
+        #     experimental_config=experimental_config,
+        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof_ffn")
+        # )
+        # self.prof.start()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -85,76 +115,127 @@ class NPUFFNModelRunner(NPUModelRunner):
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()
 
-    
-
     def _get_current_layer_idx(self) -> int:
         return (self._counter //
                 self.afd_config.num_afd_stages) % self.num_layers
+    
+    def profile_run(self):
+        self._dummy_run(self.max_num_tokens)
 
+        
     @torch.inference_mode()
     def execute_model(self, scheduler_output=None, intermediate_tensors=None):
         """Execute FFN computation for a single request"""
         # scheduler_output and intermediate_tensors are unused in FFN server
         # mode
+        # self.prof.step()
         current_layer_idx = self._get_current_layer_idx()
         try:
-            # AFDConnectorMetadata
-            # if current_layer_idx < 1:
-            #     return
-            # self.is_m2n = False
-            self.is_m2n = False
-            self.is_cam = False
-            if self.is_m2n:
+            # skip dense layer
+            if current_layer_idx < self.first_k_dense_replace:
+                return
+            
+            if self.connector_name == "m2nconnector":
                 # TODO metadata
                 m2n_afdconnector_data = M2NAFDConnectorMetadata()
                 m2n_afdconnector_data.quant_mode = 0
                 m2n_afdconnector_data.expand_x_type = torch.bfloat16
                 m2n_afdconnector_data.moe_expert_num = 64
-                m2n_afdconnector_data.batch_size = 3200
                 m2n_afdconnector_data.h = 2048
                 m2n_afdconnector_data.k = 8
                 m2n_afdconnector_data.expert_token_nums_type = 0
                 m2n_afdconnector_data.aiv_num = 48
-                
+                # self.max_num_tokens * topk * attn_size
+                m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * self.attn_size
+                # [64,2048]
                 hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
                 print(f'recv_attn_output success ,layer id is {current_layer_idx}')
                 m2n_afdconnector_data.handle = handle
                 m2n_afdconnector_data.topk_weights = topk_weights
-            elif self.is_cam:
+                print(f'dynamic_scales shape is {dynamic_scales.shape},dtype is {dynamic_scales.dtype}')
+                print(f'group_list shape is {group_list.shape},dtype is {group_list.dtype}')
+                print(f'topk_weights shape is {topk_weights.shape},dtype is {topk_weights.dtype}')
+            elif self.connector_name == "camconnector":
                 output1,afdConnectorMetadata = self.connector.recv_attn_output()
                 current_layer_idx = afdConnectorMetadata.layer_idx
                 hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
                 group_list = expertTokenNums.to(torch.int64)
                 topk_weights = simulateExpertScales
-            else:
+            elif self.connector_name == "p2pconnector":
                 hidden_states,router_logits,topk_weights, topk_ids, row_idx, afdConnectorMetadata = self.connector.recv_attn_output()
-                m2n_afdconnector_data=None
-            logger.info("*"*50)
-            logger.info(f"layer {current_layer_idx} moe recv hidden states type:{type(hidden_states)}, shape:{hidden_states.shape}")
-            print("execute_model", topk_weights.shape)
-            num_tokens = hidden_states.shape[0]
+                if afdConnectorMetadata is not None and afdConnectorMetadata.recv_handle_list is not None:
+                    for work in afdConnectorMetadata.recv_handle_list:
+                        work.wait()
+                print(f'router_logits shape is {router_logits.shape},dtype is {router_logits.dtype}')
+                print(f'topk_weights shape is {topk_weights.shape},dtype is {topk_weights.dtype}')
+                print(f'topk_ids shape is {topk_ids.shape},dtype is {topk_ids.dtype}')
+                print(f'row_idx shape is {row_idx.shape},dtype is {row_idx.dtype}')
+                print(f'recv_attn_output success ,layer id is {current_layer_idx}')
 
-            # Try to use CUDA graph if available
-            cuda_graph_info = self._find_cuda_graph(current_layer_idx,
+                
+            # Try to use ACL graph if available
+            # TODO(yxj):move layer
+            # 先做成通信不如图的版本
+            max_num_tokens = self.max_num_tokens * 8 *2 # 64
+            self.cudagraph_batch_sizes.append(max_num_tokens)
+            num_tokens = hidden_states.shape[0]
+            acl_graph_info = self._find_cuda_graph(current_layer_idx,
                                                     num_tokens)
-            if cuda_graph_info is not None:
-                # Use captured CUDA graph for computation
-                with set_ascend_forward_context(attn_metadata=None,
-                                         vllm_config=self.vllm_config):
-                    rank_ffn_output = self._execute_with_cuda_graph(
-                        hidden_states, cuda_graph_info)
+
+            
+            print(f'acl_graph_info is {acl_graph_info}')
+            print(f'current_layer_idx is {current_layer_idx},num_tokens is {max_num_tokens}')
+            print(f'self._forword_cnt is {self._forword_cnt},num_tokens is {max_num_tokens}')
+           
+            if acl_graph_info is not None:
+                # Use captured ACL graph for computation
+                with set_ascend_forward_context(
+                        attn_metadata=None,
+                        vllm_config=self.vllm_config,
+                        reserved_mc2_mask=self.reserved_mc2_mask,
+                        # batch_descriptor=batch_descriptor,
+                        # aclgraph_runtime_mode=aclgraph_runtime_mode,
+                        prefetch_stream=self.prefetch_stream,
+                        model_instance=self.model):
+                    if self.connector_name == "m2nconnector":
+                        # 未combine hidden
+                        # TODO(yxj)：图模式
+                        rank_ffn_output = self._execute_with_acl_graph(
+                            acl_graph_info = acl_graph_info,
+                            hidden_states=hidden_states,
+                            group_list=group_list,
+                            dynamic_scales=dynamic_scales,
+                            topk_weights=topk_weights,
+                            current_layer_idx=current_layer_idx)
+                    elif self.connector_name == "camconnector":
+                        # 未combine hidden
+                        rank_ffn_output = self._execute_with_acl_graph(
+                            acl_graph_info = acl_graph_info,
+                            hidden_states=hidden_states,
+                            group_list=group_list,
+                            dynamic_scales=dynamic_scales,
+                            topk_weights=topk_weights,
+                            current_layer_idx=current_layer_idx)
+                    else:
+                        rank_ffn_output = self._execute_with_acl_graph(
+                            acl_graph_info = acl_graph_info,
+                            hidden_states = hidden_states,
+                            router_logits = router_logits,
+                            current_layer_idx = current_layer_idx,
+                            topk_weights = topk_weights, 
+                            topk_ids = topk_ids,
+                            row_idx = row_idx,
+                            )
             else:
                 # Fallback to eager mode
-                ffn_need_forward_data = afdConnectorMetadata.ffn_need_forward_data
-                with_prefill = ffn_need_forward_data.with_prefill
-                moe_comm_type = ffn_need_forward_data.moe_comm_type
-                num_input_tokens = ffn_need_forward_data.num_input_tokens
-                total_num_scheduled_tokens = ffn_need_forward_data.total_num_scheduled_tokens
-                current_layer_idx = afdConnectorMetadata.layer_idx
-                # topk_weights = afdConnectorMetadata.topk_weights
-                # topk_ids = afdConnectorMetadata.m2n_afdconnector_data.topk_ids
-                # row_idx = afdConnectorMetadata.row_idx
-                print('execute_model', current_layer_idx)
+                if afdConnectorMetadata is not None:
+                    ffn_need_forward_data = afdConnectorMetadata.ffn_need_forward_data
+                    with_prefill = ffn_need_forward_data.with_prefill
+                    moe_comm_type = ffn_need_forward_data.moe_comm_type
+                    num_input_tokens = ffn_need_forward_data.num_input_tokens
+                    total_num_scheduled_tokens = ffn_need_forward_data.total_num_scheduled_tokens
+                    current_layer_idx = afdConnectorMetadata.layer_idx
+                # test
                 with set_ascend_forward_context(
                         attn_metadata=None,
                         vllm_config=self.vllm_config,
@@ -165,7 +246,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                         prefetch_stream=self.prefetch_stream,
                         num_actual_tokens=total_num_scheduled_tokens,
                         model_instance=self.model):
-                    if self.is_m2n:
+                    if self.connector_name == "m2nconnector":
                         # 未combine hidden
                         rank_ffn_output = self._execute_eager_mode(
                             hidden_states=hidden_states,
@@ -173,7 +254,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                             dynamic_scales=dynamic_scales,
                             topk_weights=topk_weights,
                             current_layer_idx=current_layer_idx)
-                    elif self.is_cam:
+                    elif self.connector_name == "camconnector":
                         # 未combine hidden
                         rank_ffn_output = self._execute_eager_mode(
                             hidden_states=hidden_states,
@@ -184,18 +265,24 @@ class NPUFFNModelRunner(NPUModelRunner):
                     else:
                         rank_ffn_output = self._execute_eager_mode(
                             hidden_states = hidden_states,
-                            current_layer_idx = current_layer_idx,
                             router_logits = router_logits,
+                            current_layer_idx = current_layer_idx,
                             topk_weights = topk_weights, 
                             topk_ids = topk_ids,
-                            row_idx = row_idx,)
+                            row_idx = row_idx,
+                            )
 
-            if self.is_cam:
+            if self.connector_name == "camconnector":
                 handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
                 afdConnectorMetadata.cam_afdconnector_data.handle = handle
                 self.connector.send_ffn_output(rank_ffn_output, afdConnectorMetadata)
-            else :
+            elif self.connector_name == "m2nconnector":
                 self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
+                print(f'send_ffn_output success ,layer id is {current_layer_idx}')
+            else :
+                afdConnectorMetadata.recv_handle_list = None
+                self.connector.send_ffn_output(rank_ffn_output, afdConnectorMetadata)
+                print(f'send_ffn_output success ,layer id is {current_layer_idx}')
         except Exception as e:
             raise ValueError(
                 f"Error computing FFN for layer {current_layer_idx}: {e}"
@@ -205,11 +292,12 @@ class NPUFFNModelRunner(NPUModelRunner):
             if (self._counter == self.num_layers *
                     self.afd_config.num_afd_stages):
                 self._counter = 0
+                self._forword_cnt += 1
         return None  # FFN server doesn't return ModelRunnerOutput
 
     def _execute_with_cuda_graph(self, hidden_states: torch.Tensor,
                                  cuda_graph_info: dict):
-        """Execute FFN computation using captured CUDA graph."""
+        """Execute FFN computation using captured ACL graph."""
         graph = cuda_graph_info['graph']
         input_tensor = cuda_graph_info['input_hidden_states']
         output_tensor = cuda_graph_info['output']
@@ -234,6 +322,44 @@ class NPUFFNModelRunner(NPUModelRunner):
 
         # Return only the actual output (without padding)
         return output_tensor[:actual_tokens].clone()
+    
+    def _execute_with_acl_graph(self, 
+                                hidden_states: torch.Tensor,
+                                current_layer_idx: int,
+                                acl_graph_info: Optional[dict] = None,
+                                router_logits: Optional[torch.Tensor] = None,
+                                group_list: Optional[torch.Tensor] = None,
+                                dynamic_scales: Optional[torch.Tensor] = None,
+                                topk_weights: Optional[torch.Tensor] = None,
+                                topk_ids: Optional[torch.Tensor] = None,
+                                row_idx: Optional[torch.Tensor] = None,
+                                ):
+        """Execute FFN computation using captured ACL graph."""
+        graph = acl_graph_info['graph']
+        input_tensor = acl_graph_info['input_hidden_states']
+        output_tensor = acl_graph_info['output']
+
+        # Copy input data to graph's input tensor
+        # Handle padding if necessary
+        actual_tokens = hidden_states.shape[0]
+        graph_tokens = input_tensor.shape[0]
+
+        if actual_tokens <= graph_tokens:
+            # Copy actual data and pad with zeros if needed
+            input_tensor[:actual_tokens].copy_(hidden_states)
+            if actual_tokens < graph_tokens:
+                input_tensor[actual_tokens:].zero_()
+        else:
+            raise ValueError(
+                f"Input size {actual_tokens} exceeds graph capacity "
+                f"{graph_tokens}")
+
+        # Replay the captured graph
+        graph.replay()
+        print("FFN Replay graphs")
+        # Return only the actual output (without padding)
+        return output_tensor[:actual_tokens].clone()
+        
 
     def _execute_eager_mode(self, 
                             hidden_states: torch.Tensor,
@@ -247,6 +373,7 @@ class NPUFFNModelRunner(NPUModelRunner):
         """Execute FFN computation in eager mode (fallback)."""
         # Handle TP case: all-gather tensors from all TP ranks
         # print('_execute_eager_mode')
+        print(f'current_layer_idx in _execute_eager_mode is {current_layer_idx}')
         tp_world_size = get_tensor_model_parallel_world_size()
         # if tp_world_size > 1:
         #     # All-gather hidden states from all TP ranks
@@ -261,7 +388,7 @@ class NPUFFNModelRunner(NPUModelRunner):
         #     rank_ffn_output = ffn_output[start_idx:end_idx, :]
         # else:
         # Single TP case
-        if self.is_m2n:
+        if self.connector_name == "m2nconnector":
             rank_ffn_output = self.model.compute_ffn_output(
                 layer_idx=current_layer_idx, 
                 hidden_states=hidden_states,
@@ -269,7 +396,7 @@ class NPUFFNModelRunner(NPUModelRunner):
                 dynamic_scales=dynamic_scales,
                 topk_weights=topk_weights, 
                 topk_ids=topk_ids)
-        if self.is_cam:
+        elif self.connector_name == "camconnector":
             rank_ffn_output = self.model.compute_ffn_output(
                 layer_idx=current_layer_idx, 
                 hidden_states=hidden_states,
@@ -281,111 +408,272 @@ class NPUFFNModelRunner(NPUModelRunner):
         else:
             print("_execute_eager_mode", topk_weights.shape)
             rank_ffn_output = self.model.compute_ffn_output(
-                 hidden_states = hidden_states,
-                 layer_idx = current_layer_idx,
-                 router_logits = router_logits,
-                 topk_weights = topk_weights, 
-                 topk_ids = topk_ids,
-                 row_idx = row_idx,)
+                layer_idx=current_layer_idx, 
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_weights=topk_weights, 
+                topk_ids=topk_ids,
+                row_idx=row_idx)
 
         return rank_ffn_output
 
-    # Methods required for interface compatibility with GPUModelRunner
-    def profile_run(self) -> None:
-        """FFN servers don't need profiling."""
-        pass
+    
 
-    def get_kv_cache_spec(self) -> dict[str, "KVCacheSpec"]:
-        """FFN servers don't use KV cache."""
-        return {}
-
-    def initialize_kv_cache(self, kv_cache_config: "KVCacheConfig") -> None:
-        """FFN servers don't use KV cache."""
-        pass
-
-    def _dummy_run(self, num_tokens: int = 1, **kwargs) -> torch.Tensor:
-        """FFN servers don't need dummy runs."""
-        # Return a dummy tensor for interface compatibility
-        return torch.zeros(num_tokens,
-                           self.model_config.hf_config.hidden_size,
-                           dtype=self.dtype,
-                           device=self.device)
-
+    
     def capture_model(self) -> int:
-        """Capture CUDA graphs for FFN operations."""
-        if not self.use_cuda_graph:
-            logger.warning("Skipping CUDA graph capture.")
-            return 0
-
-        logger.info("Starting CUDA graph capture for FFN operations...")
+        """Capture ACL graphs for FFN operations."""
+        
+        logger.debug("Starting ACL graph capture for FFN operations...")
         start_time = time.perf_counter()
-        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        start_free_npu_memory = torch.npu.mem_get_info()[0]
+        
+        self._capture_model()
+        
+        end_time = time.perf_counter()
+        end_free_npu_memory = torch.npu.mem_get_info()[0]
+        elapsed_time = end_time - start_time
+        npu_graph_size = start_free_npu_memory - end_free_npu_memory
+        # This usually takes 5~20 seconds.
+        logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
+                    elapsed_time, npu_graph_size / (1 << 30))
 
-        # Create memory pool for graphs
-        if self._graph_memory_pool is None:
-            self._graph_memory_pool = torch.cuda.graph_pool_handle()
+        return npu_graph_size
 
-        # Capture graphs for each layer and different batch sizes
+    def _capture_model(self):
+        if self.graph_pool is None:
+            self.graph_pool = current_platform.get_global_graph_pool()
+        if not self.use_aclgraph:
+            logger.warning(
+                "Skipping ACL graph capture. To turn on ACL graph capture, "
+                "ensure `aclraph_mode` was not manually set to `NONE`")
+            return
+        else:
+            self.initialize_aclgraph_capture()
+            
+        set_cudagraph_capturing_enabled(True)
+        # Trigger ACL graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with graph_capture(device=self.device):
-            for layer_idx in range(self.num_layers):
-                for num_tokens in reversed(self.cudagraph_batch_sizes):
-                    with set_forward_context(attn_metadata=None,
-                                             vllm_config=self.vllm_config):
-                        self._capture_graph_for_layer_and_size(
-                            layer_idx, num_tokens)
+            # pass
+            max_num_tokens = self.scheduler_config.max_num_seqs * \
+                        self.uniform_decode_query_len
+            decode_cudagraph_batch_sizes = [
+                x for x in self.aclgraph_batch_sizes if x <= max_num_tokens
+                and x >= self.uniform_decode_query_len
+            ]
+            compilation_cases_decode = list(
+                reversed(decode_cudagraph_batch_sizes))
+            self._capture_aclgraphs(
+                    compilation_cases=compilation_cases_decode,
+                    aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                    uniform_decode=True)
+           
+        set_cudagraph_capturing_enabled(False)
+        
+    def _capture_aclgraphs(self, compilation_cases: list[int],
+                           aclgraph_runtime_mode: CUDAGraphMode,
+                           uniform_decode: bool):
+        assert aclgraph_runtime_mode != CUDAGraphMode.NONE and \
+            aclgraph_runtime_mode in [CUDAGraphMode.FULL,
+                                      CUDAGraphMode.PIECEWISE]
 
-        end_time = time.perf_counter()
-        end_free_gpu_memory = torch.cuda.mem_get_info()[0]
-        elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        # Only rank 0 should print progress bar during capture
+        if is_global_first_rank():
+            logger.info(
+                "Starting to capture ACL graphs for cases: %s, "
+                "mode: %s, uniform_decode: %s", compilation_cases,
+                aclgraph_runtime_mode.name, uniform_decode)
+            compilation_cases = tqdm(
+                compilation_cases,
+                disable=not self.load_config.use_tqdm_on_load,
+                desc="Capturing ACL graphs ({}, {})".format(
+                    "decode" if uniform_decode else "mixed prefill-decode",
+                    aclgraph_runtime_mode.name))
+        for num_tokens in compilation_cases:
+            # Warm up the operations for this specific layer
+            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
+                self._dummy_run(num_tokens,
+                                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                                force_attention=force_attention,
+                                uniform_decode=uniform_decode)
+            self._dummy_run(num_tokens,
+                            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                            force_attention=force_attention,
+                            uniform_decode=uniform_decode)
+    
+    def _dummy_run(self, 
+                   num_tokens: int = 1, 
+                   aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
+                   force_attention: bool = False,
+                   uniform_decode: bool = False,**kwargs):
+        
+        # only support eager mode and piecewise graph now
+        assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
+            CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
+        }
+        # filter out the valid batch descriptor
+        _ag_mode, batch_descriptor = \
+            self.aclgraph_dispatcher.dispatch(
+                BatchDescriptor(num_tokens=num_tokens,
+                                uniform_decode=uniform_decode))
+        if aclgraph_runtime_mode is not None:
+            # we allow forcing NONE when the dispatcher disagrees to support
+            # warm ups for aclgraph capture
+            assert aclgraph_runtime_mode == CUDAGraphMode.NONE or \
+                aclgraph_runtime_mode == _ag_mode, (
+                f"Aclgraph runtime mode mismatch at dummy_run. "
+                f"Expected {_ag_mode}, but got {aclgraph_runtime_mode}.")
+        else:
+            aclgraph_runtime_mode = _ag_mode
+            
+        # mock self.model
+        for layer_idx in range(self.first_k_dense_replace,self.num_layers):
+            with set_ascend_forward_context(
+                    attn_metadata=None,
+                    vllm_config=self.vllm_config,
+                    reserved_mc2_mask=self.reserved_mc2_mask,
+                    batch_descriptor=batch_descriptor,
+                    aclgraph_runtime_mode=aclgraph_runtime_mode,
+                    prefetch_stream=self.prefetch_stream,
+                    model_instance=self.model):
+                if self.connector_name == "m2nconnector":
+                    self._capture_graph_for_layer_and_size(
+                        layer_idx, num_tokens,aclgraph_runtime_mode)
+                elif self.connector_name == "camconnector":
 
-        logger.info(
-            "FFN CUDA graph capturing finished in %.0f secs, took %.2f GiB",
-            elapsed_time, cuda_graph_size / (1 << 30))
-        return cuda_graph_size
-
+                    self._capture_graph_for_layer_and_size(
+                        layer_idx, num_tokens,aclgraph_runtime_mode)
+                else:
+                    self._capture_graph_for_layer_and_size(
+                        layer_idx, num_tokens,aclgraph_runtime_mode)
+        print(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
+        self.dummy_run_call_cnt += 1
+        
+        
+                       
     def _capture_graph_for_layer_and_size(self, layer_idx: int,
-                                          num_tokens: int):
-        """Capture CUDA graph for specific layer and number of tokens."""
+                                          num_tokens: int,
+                                          aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
+                                          **kargs):
+        """Capture ACL graph for specific layer and number of tokens."""
         # Create dummy hidden states
         dummy_hidden_states = torch.randn(
             num_tokens,
             self.model_config.hf_config.hidden_size,
             dtype=self.dtype,
             device=self.device)
-
-        # Warm up the operations for this specific layer
-        for _ in range(
-                self.vllm_config.compilation_config.cudagraph_num_of_warmups):
-            self._run_ffn_computation(dummy_hidden_states,
-                                      layer_idx=layer_idx,
-                                      capture_mode=True)
+        # for m2n
+        dummy_group_list = torch.randn(
+            32,
+            dtype=torch.int64,
+            device=self.device)
+        dummy_topk_weights = torch.randn(
+            num_tokens,
+            dtype=torch.float32,
+            device=self.device)
+        dummy_dynamic_scales = torch.randn(
+            num_tokens,
+            dtype=torch.float32,
+            device=self.device)
+        
+        if aclgraph_runtime_mode == CUDAGraphMode.NONE:
+            # warm up
+            if self.connector_name == "m2nconnector":
+                # TODO metadata
+                m2n_afdconnector_data = M2NAFDConnectorMetadata()
+                m2n_afdconnector_data.quant_mode = 0
+                m2n_afdconnector_data.expand_x_type = torch.bfloat16
+                m2n_afdconnector_data.moe_expert_num = 64
+                m2n_afdconnector_data.h = 2048
+                m2n_afdconnector_data.k = 8
+                m2n_afdconnector_data.expert_token_nums_type = 0
+                m2n_afdconnector_data.aiv_num = 48
+                m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * 2 # self.max_num_tokens*topk*die_nums
+                
+                hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
+                # print(f'recv_attn_output success ,layer id is {current_layer_idx}')
+                m2n_afdconnector_data.handle = handle
+                m2n_afdconnector_data.topk_weights = topk_weights
+            # compute_ffn_output ,未combine hidden
+            output = self._run_ffn_computation(hidden_states = hidden_states,
+                                               layer_idx=layer_idx,
+                                               capture_mode=True,
+                                               group_list=group_list,
+                                                dynamic_scales=dynamic_scales,
+                                                topk_weights=topk_weights
+                                               )
+            # send_ffn_output
+            if self.connector_name == "camconnector":
+                pass
+            elif self.connector_name == "m2nconnector":
+                self.connector.send_ffn_output(output, m2n_afdconnector_data)
+            else :
+                self.connector.send_ffn_output(output, afdConnectorMetadata)
+            return 
 
         # Create and capture the graph
-        graph = torch.cuda.CUDAGraph()
+        aclgraph = torch.npu.NPUGraph()
 
         # Start graph capture
-        with torch.cuda.graph(graph, pool=self._graph_memory_pool):
-            output = self._run_ffn_computation(dummy_hidden_states,
+        # recv_attn_output
+        if self.connector_name == "m2nconnector":
+            # TODO metadata
+            m2n_afdconnector_data = M2NAFDConnectorMetadata()
+            m2n_afdconnector_data.quant_mode = 0
+            m2n_afdconnector_data.expand_x_type = torch.bfloat16
+            m2n_afdconnector_data.moe_expert_num = 64
+            m2n_afdconnector_data.h = 2048
+            m2n_afdconnector_data.k = 8
+            m2n_afdconnector_data.expert_token_nums_type = 0
+            m2n_afdconnector_data.aiv_num = 48
+            m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * 2
+            
+            hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
+            # print(f'recv_attn_output success ,layer id is {current_layer_idx}')
+            m2n_afdconnector_data.handle = handle
+            m2n_afdconnector_data.topk_weights = topk_weights
+        with torch.npu.graph(aclgraph, pool=self.graph_pool):
+            # compute_ffn_output
+            output = self._run_ffn_computation(hidden_states = hidden_states,
                                                layer_idx=layer_idx,
-                                               capture_mode=True)
-
+                                               capture_mode=True,
+                                               group_list=group_list,
+                                                dynamic_scales=dynamic_scales,
+                                                topk_weights=topk_weights
+                                               )
+        # send_ffn_output 暂时不入图
+        if self.connector_name == "camconnector":
+            pass
+        elif self.connector_name == "m2nconnector":
+            self.connector.send_ffn_output(output, m2n_afdconnector_data)
+        else :
+            self.connector.send_ffn_output(output, afdConnectorMetadata)
+        print(f'dummy_hidden_states shape is {dummy_hidden_states.shape}')
+        print(f'output shape is {output.shape}')
         # Store the captured graph with layer and token count as key
-        self._cuda_graphs[(layer_idx, num_tokens)] = {
-            'graph': graph,
-            'input_hidden_states': dummy_hidden_states,
+        # dummy_hidden_states ->[4,2048];output ->[4,2048];
+        self._acl_graphs[(layer_idx, output.shape[0])] = {
+            'graph': aclgraph,
+            'input_hidden_states': output,
             'output': output
         }
+        print(f'self._acl_graphs is {self._acl_graphs}')
 
-        logger.debug("Captured CUDA graph for layer %s with %s tokens",
+        logger.debug("Captured ACL graph for layer %s with %s tokens",
                      layer_idx, num_tokens)
 
     def _run_ffn_computation(self,
                              hidden_states: torch.Tensor,
                              layer_idx: Optional[int] = None,
-                             capture_mode: bool = False):
+                             capture_mode: bool = False,
+                             router_logits: Optional[torch.Tensor] = None,
+                             group_list: Optional[torch.Tensor] = None,
+                             dynamic_scales: Optional[torch.Tensor] = None,
+                             topk_weights: Optional[torch.Tensor] = None,
+                             topk_ids: Optional[torch.Tensor] = None,
+                             row_idx: Optional[torch.Tensor] = None,):
         """Run FFN computation for graph capture or replay."""
         if layer_idx is None:
             current_layer_idx = self._get_current_layer_idx(
@@ -393,37 +681,66 @@ class NPUFFNModelRunner(NPUModelRunner):
         else:
             current_layer_idx = layer_idx
 
-        tp_world_size = get_tensor_model_parallel_world_size()
-        if tp_world_size > 1:
-            # Handle TP case: all-gather tensors from all TP ranks
-            gathered_hidden_states = tensor_model_parallel_all_gather(
-                hidden_states, dim=0)
-            ffn_output = self.model.compute_ffn_output(current_layer_idx,
-                                                       gathered_hidden_states)
+        # tp_world_size = get_tensor_model_parallel_world_size()
+        # if tp_world_size > 1:
+        #     # Handle TP case: all-gather tensors from all TP ranks
+        #     gathered_hidden_states = tensor_model_parallel_all_gather(
+        #         hidden_states, dim=0)
+        #     ffn_output = self.model.compute_ffn_output(current_layer_idx,
+        #                                                gathered_hidden_states)
 
-            # Extract the output corresponding to current rank
-            start_idx = hidden_states.shape[
-                0] * get_tensor_model_parallel_rank()
-            end_idx = start_idx + hidden_states.shape[0]
-            rank_ffn_output = ffn_output[start_idx:end_idx, :]
-        else:
-            # Single TP case
+        #     # Extract the output corresponding to current rank
+        #     start_idx = hidden_states.shape[
+        #         0] * get_tensor_model_parallel_rank()
+        #     end_idx = start_idx + hidden_states.shape[0]
+        #     rank_ffn_output = ffn_output[start_idx:end_idx, :]
+        # else:
+        # Single TP case
+        
+        # TODO(yxj):support m2n\cam\p2p
+        
+        if self.connector_name == "m2nconnector":
             rank_ffn_output = self.model.compute_ffn_output(
-                current_layer_idx, hidden_states)
+                layer_idx=current_layer_idx, 
+                hidden_states=hidden_states,
+                group_list=group_list,
+                dynamic_scales=dynamic_scales,
+                topk_weights=topk_weights, 
+                topk_ids=topk_ids)
+        elif self.connector_name == "camconnector":
+            rank_ffn_output = self.model.compute_ffn_output(
+                layer_idx=current_layer_idx, 
+                hidden_states=hidden_states,
+                group_list=group_list,
+                dynamic_scales=dynamic_scales,
+                topk_weights=topk_weights, 
+                topk_ids=topk_ids,
+                row_idx=row_idx)
+        else:
+            rank_ffn_output = self.model.compute_ffn_output(
+                layer_idx=current_layer_idx, 
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_weights=topk_weights, 
+                topk_ids=topk_ids,
+                row_idx=row_idx)
+        
+        # rank_ffn_output = self.model.compute_ffn_output(
+        #     current_layer_idx, hidden_states)
 
         return rank_ffn_output
 
     def _find_cuda_graph(self, layer_idx: int, num_tokens: int):
         """Find the smallest graph that can handle the given layer and
         number of tokens."""
-        if not self.use_cuda_graph:
+        if not self.use_aclgraph:
             return None
 
         # Find the minimum capture size that can handle num_tokens for this
         # layer
         for capture_size in self.cudagraph_batch_sizes:
             if num_tokens <= capture_size:
-                return self._cuda_graphs.get((layer_idx, capture_size))
+                return self._acl_graphs.get((layer_idx, capture_size))
         return None
 
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:

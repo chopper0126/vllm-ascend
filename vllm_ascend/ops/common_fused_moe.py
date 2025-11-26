@@ -558,9 +558,10 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         shared_out = self._shared_experts(hidden_states)
 
         # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
-        moe_comm_type = forward_context.moe_comm_type
-        if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2}:
-            shared_out = tensor_model_parallel_all_reduce(shared_out)
+        if tp_size > 1:
+            moe_comm_type = forward_context.moe_comm_type
+            if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2}:
+                shared_out = tensor_model_parallel_all_reduce(shared_out)
             
         num_tokens, _ = hidden_states.shape
         target_pad_length = forward_context.padded_num_tokens
@@ -574,6 +575,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                                                 (0, 0, 0, pad_size))
             row_idx = nn.functional.pad(row_idx,
                                                 (0, 0, 0, pad_size))
+                                                
         if tp_size > 1:
             split_topk_weights = torch.tensor_split(topk_weights,
                                                     tp_size,
@@ -631,27 +633,17 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             topk_weights: Optional[torch.Tensor] = None,
             topk_ids: Optional[torch.Tensor] = None,
             row_idx: Optional[torch.Tensor] = None,
+            connector_name: Optional[str] = "",
         ):
-        # TODO(yxj): M2N算子接入需要拆分fused_experts
+        #TODO(yxj):move to p2p
+        # hidden_states是dispatch之后的，shape第一维是group_list[-1],self.max_num_token*8*2
         shared_out = self._shared_experts(hidden_states)
-        
-        # forward_context = get_forward_context()
-        # moe_comm_type = forward_context.moe_comm_type
-        # if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2}:
-        #     shared_out = tensor_model_parallel_all_reduce(shared_out)
-            
-        # dispatch --> m2n
-
-        # gmm
         from vllm_ascend.ops.moe.moe_mlp import unified_apply_mlp
+        if connector_name == "m2nconnector":
+            group_list_type = 0
+        else:
+            group_list_type = 1
         
-        # "group_list_type": group_list_type,
-        # "hidden_states": sorted_hidden_states,
-        # "group_list": group_list,
-        # "topk_scales": topk_scales,
-        # expand_x, dynamic_scales, expert_token_nums, recv_counts, expand_scales
-        # just for cam
-        group_list_type = 1
         permuted_hidden_states, expert_tokens = hidden_states, group_list
         
         mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,

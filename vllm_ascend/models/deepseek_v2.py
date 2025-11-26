@@ -32,7 +32,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
+from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank, set_substitute_tp,
                               get_tensor_model_parallel_world_size,
                               get_tp_group, split_tensor_along_last_dim,
                               get_ep_group,
@@ -447,10 +447,13 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             "enable_afd", False)
         
         afd_config = vllm_config.afd_config
+        self.afd_config = afd_config
         if afd_config:
             self.role = afd_config.afd_role
+            self.connector_name = afd_config.afd_connector
         else:
             self.role = None
+            self.connector_name = None
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
@@ -608,8 +611,10 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         self.afd_config = vllm_config.afd_config
         if self.afd_config:
             self.role = self.afd_config.afd_role
+            self.connector_name = self.afd_config.afd_connector
         else:
             self.role = None
+            self.connector_name = None
 
         # `packed_modules_mapping` needs to be modified before
         # initializing DeepseekV2Model, as it is passed inplace to
@@ -697,6 +702,10 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            set_substitute_tp(0)
+            if "shared_experts" in name:
+                # TODO(lxf) temperory solution for ffn support dp
+                set_substitute_tp(1)
             if self.role and 'mlp.gate.' in name:
                 name = name.replace("mlp.gate.", "gate.")
             if "rotary_emb.inv_freq" in name:
@@ -783,7 +792,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     weight_loader(param, loaded_weight)
                     # load share expert down,attn q\k\v\o\layernorm,mlp.gate
             loaded_params.add(name)
-
+        set_substitute_tp(0)
         return loaded_params
 
     def is_moe_weight(self,name):
