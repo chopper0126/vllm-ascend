@@ -245,38 +245,38 @@ class UBatchWrapper:
             results.append((ubatch_metadata.context.id, model_output))
 
         results: list[tuple[int, torch.Tensor]] = []
-        for metadata in ubatch_metadata:
-            print(f"Starting exec ubatch execution", flush=True)
-            model_output = model(
-                input_ids=metadata.input_ids,
-                positions=metadata.positions,
-                intermediate_tensors=metadata.intermediate_tensors,
-                inputs_embeds=metadata.inputs_embeds,
-            )
-            results.append((metadata.context.id, model_output))
-            print(f"finish exec ubatch execution", flush=True)
+        # for metadata in ubatch_metadata:
+        #     print(f"Starting exec ubatch execution", flush=True)
+        #     model_output = model(
+        #         input_ids=metadata.input_ids,
+        #         positions=metadata.positions,
+        #         intermediate_tensors=metadata.intermediate_tensors,
+        #         inputs_embeds=metadata.inputs_embeds,
+        #     )
+        #     results.append((metadata.context.id, model_output))
+        #     print(f"finish exec ubatch execution", flush=True)
 
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
         # after both threads have finished
         # TODO HXY 这里强行override了才导致这边的里面要Get的时候拿不到正确的东西了
-        # with override_forward_context(None):
-        #
-        #     # ubatch_threads = []
-        #     # for metadata in ubatch_metadata:
-        #     #     thread = threading.Thread(target=_ubatch_thread,
-        #     #                                 args=(
-        #     #                                     results,
-        #     #                                     model,
-        #     #                                     metadata,
-        #     #                                 ))
-        #     #     ubatch_threads.append(thread)
-        #     #     thread.start()
-        #     # self.ready_barrier.wait()  # Wait for both threads to be ready
-        #     # print(f"start set cpu_wait_event", flush=True)
-        #     # ubatch_metadata[0].context.cpu_wait_event.set()
-        #     # for thread in ubatch_threads:
-        #     #     thread.join()
+        with override_forward_context(None):
+
+            ubatch_threads = []
+            for metadata in ubatch_metadata:
+                thread = threading.Thread(target=_ubatch_thread,
+                                            args=(
+                                                results,
+                                                model,
+                                                metadata,
+                                            ))
+                ubatch_threads.append(thread)
+                thread.start()
+            self.ready_barrier.wait()  # Wait for both threads to be ready
+            print(f"start set cpu_wait_event", flush=True)
+            ubatch_metadata[0].context.cpu_wait_event.set()
+            for thread in ubatch_threads:
+                thread.join()
 
         print(f"Merging {len(results)} tensors from ubatch threads", flush=True)
 
