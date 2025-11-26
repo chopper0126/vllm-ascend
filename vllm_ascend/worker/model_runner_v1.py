@@ -1525,15 +1525,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             )
 
             if self.afd_config and self.num_stages > 1:
-                if num_reqs >= self.num_stages:
-                    num_reqs_per_stage = num_reqs // self.num_stages
-                    afd_reqs_start_loc = [
-                        num_reqs_per_stage * i
-                        for i in range(self.num_stages + 1)
-                    ]
-                    afd_reqs_start_loc[-1] = num_reqs
-                else:
-                    afd_reqs_start_loc = [i for i in range(num_reqs + 1)]
+                # if num_reqs >= self.num_stages:
+                #     num_reqs_per_stage = num_reqs // self.num_stages
+                #     afd_reqs_start_loc = [
+                #         num_reqs_per_stage * i
+                #         for i in range(self.num_stages + 1)
+                #     ]
+                #     afd_reqs_start_loc[-1] = num_reqs
+                # else:
+                #     afd_reqs_start_loc = [i for i in range(num_reqs + 1)]
 
                 # For prefill, compute tokens per stage based on actual token
                 # counts
@@ -1559,7 +1559,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 #     afd_tokens_lens.append(stage_tokens)
                 #     afd_tokens_start_loc.append(afd_tokens_start_loc[-1] +
                 #                                 stage_tokens)
-
+                logger.info(f"ttg ubatch_slices: {ubatch_slices},"
+                            f"afd_tokens_start_loc: {afd_tokens_start_loc},"
+                            f"afd_reqs_start_loc: {afd_reqs_start_loc},"
+                            f"afd_tokens_lens: {afd_tokens_lens}"
+                            )
                 afd_metadata = AFDMetadata(
                     afd_tokens_start_loc=afd_tokens_start_loc,
                     afd_reqs_start_loc=afd_reqs_start_loc,
@@ -2156,17 +2160,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
              max_query_len, ubatch_slices) = (self._prepare_inputs(scheduler_output,
                                                                    intermediate_tensors))
 
-        dp_rank = self.parallel_config.data_parallel_rank
-        if ubatch_slices:
-            assert num_tokens_across_dp is not None
-            num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
-            self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
-        elif num_tokens_across_dp is not None:
-            num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
-        else:
-            num_input_tokens = self._get_num_input_tokens(
-                scheduler_output.total_num_scheduled_tokens
-            )
+            dp_rank = self.parallel_config.data_parallel_rank
+            if ubatch_slices:
+                assert num_tokens_across_dp is not None
+                num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+                self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
+            elif num_tokens_across_dp is not None:
+                num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+            else:
+                num_input_tokens = self._get_num_input_tokens(
+                    scheduler_output.total_num_scheduled_tokens
+                )
+            logger.info(f"ttg execute_model ubatch_slices:{ubatch_slices}")
+            logger.info(f"ttg execute_model num_tokens_across_dp:{num_tokens_across_dp}")
+            logger.info(f"ttg execute_model afd_metadata:{afd_metadata}")
 
         # if afd_metadata:
         #     # Padding for AFD
