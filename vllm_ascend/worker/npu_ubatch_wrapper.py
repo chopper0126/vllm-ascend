@@ -335,6 +335,10 @@ class UBatchWrapper:
                 sliced_intermediate_tensors)
 
     def __call__(self, *args, **kwargs):
+        # TODO: 后续待修改成DBO多线程方式
+        print(f"ttg exec runnable", flush=True)
+        return self.runnable(*args, **kwargs)
+
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         ubatch_slices = forward_context.ubatch_slices
