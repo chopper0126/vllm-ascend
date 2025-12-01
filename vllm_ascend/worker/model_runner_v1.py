@@ -1529,8 +1529,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.afd_config:
                 # For prefill, compute tokens per stage based on actual token
                 # counts
-                afd_tokens_start_loc = [0]
-                afd_tokens_lens = []
                 if ubatch_slices and len(ubatch_slices) > 1:
                     afd_tokens_start_loc = [ub.token_slice.start for ub in ubatch_slices]
                     afd_reqs_start_loc = [ub.request_slice.start for ub in ubatch_slices]
@@ -1567,18 +1565,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             num_draft_tokens=self.num_draft_tokens.
                             gpu[:num_reqs],
                         )
-                    attn_metadata_i = builder.build(
-                        common_prefix_len=common_prefix_len,
-                        common_attn_metadata=common_attn_metadata,
-                        # afd_metadata=afd_metadata,
-                        **extra_attn_metadata_args)
-                else:
-                    attn_metadata_i = builder.build(
-                        common_prefix_len=common_prefix_len,
-                        common_attn_metadata=common_attn_metadata,
-                        model=self.get_model(),
-                        # afd_metadata=afd_metadata,
-                        **extra_attn_metadata_args)
 
                 if ubatch_slices is not None:
                     common_attn_metadata_list = split_attn_metadata(
@@ -1618,30 +1604,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logits_indices = nn.functional.pad(
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
-        
-        
-        if afd_metadata:
-            (num_afd_pad, afd_tokens_start_loc,
-             afd_tokens_lens) = self.get_afd_padding(
-                 afd_metadata.afd_tokens_start_loc,
-                 afd_metadata.afd_tokens_lens)
-            afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
-            afd_metadata.afd_tokens_lens = afd_tokens_lens
-            num_tokens += num_afd_pad
-            num_tokens_across_dp = None
-
-
-
-        # if afd_metadata:
-        #     (num_afd_pad, afd_tokens_start_loc,
-        #      afd_tokens_lens) = self.get_afd_padding(
-        #          afd_metadata.afd_tokens_start_loc,
-        #          afd_metadata.afd_tokens_lens)
-        #     afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
-        #     afd_metadata.afd_tokens_lens = afd_tokens_lens
-        #     num_tokens += num_afd_pad
-        #     num_tokens_across_dp = None
-
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
@@ -2162,18 +2124,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_input_tokens = self._get_num_input_tokens(
                     scheduler_output.total_num_scheduled_tokens
                 )
-
-        # if afd_metadata:
-        #     # Padding for AFD
-        #     num_input_tokens = num_input_tokens
-        #     (num_pad_afd, afd_tokens_start_loc,
-        #         afd_tokens_lens) = self.get_afd_padding(
-        #             afd_metadata.afd_tokens_start_loc,
-        #             afd_metadata.afd_tokens_lens)
-        #     afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
-        #     afd_metadata.afd_tokens_lens = afd_tokens_lens
-        #     num_input_tokens += num_pad_afd
-        #     num_tokens_across_dp = None
 
         if self.dynamic_eplb:
             self.eplb_updator.take_update_info_from_eplb_process()
