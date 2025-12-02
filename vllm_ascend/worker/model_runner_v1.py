@@ -1262,7 +1262,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
                                               attn_state,
                                               total_num_scheduled_tokens)
-        logger.info("enable_dbo=", enable_dbo)
+        logger.info(f"enable_dbo= {enable_dbo}")
 
         # Get info across DP ranks.
         # NOTE: maybe_padded_num_tokens is only used when using TorchAir with DP,
@@ -1332,6 +1332,26 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.query_start_loc[:num_reqs + 1].copy_(
             self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
 
+        num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+        num_tokens_padded = self._get_num_input_tokens(num_tokens_unpadded)
+
+        # allow_dp_padding = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE or \
+        #                     self.afd_config is not None
+        allow_dp_padding = True
+
+        uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len
+                          ) and (total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
+
+        ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
+            num_tokens_unpadded=num_tokens_unpadded,
+            parallel_config=self.parallel_config,
+            allow_microbatching=True,
+            allow_dp_padding=allow_dp_padding,
+            num_tokens_padded=num_tokens_padded,
+            uniform_decode=uniform_decode,
+            num_scheduled_tokens_per_request=num_scheduled_tokens,
+        )
+
         self.seq_lens_np[:num_reqs] = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                 num_scheduled_tokens)
@@ -1364,7 +1384,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.with_prefill = with_prefill
         self.num_tokens_across_dp = num_tokens_across_dp
         self._update_graph_pad_size(with_prefill, maybe_padded_num_tokens)
-        attn_metadata: dict[str, Any] = {}
+        # attn_metadata: dict[str, Any] = {}
 
         # Prepare input_ids
         token_indices = (positions_np +
@@ -1450,6 +1470,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.num_draft_tokens.np[num_reqs:].fill(0)
             self.num_draft_tokens.copy_to_gpu()
 
+        # attn_metadata: PerLayerAttnMetadata = {}
+        if ubatch_slices is not None:
+            print('ubatch已经切了')
+            attn_metadata = [dict() for _ in range(len(ubatch_slices))]
+        else:
+            attn_metadata: dict[str, Any] = {}
+        use_cascade_attn = False
+
         # Used in the below loop.
         # query_start_loc_cpu = self.query_start_loc.cpu[:num_reqs + 1]
         num_computed_tokens_cpu = (
@@ -1499,29 +1527,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 sin=self.sin,
             )
 
-            if self.afd_config and self.num_stages > 1:
-                if num_reqs >= self.num_stages:
-                    num_reqs_per_stage = num_reqs // self.num_stages
-                    afd_reqs_start_loc = [
-                        num_reqs_per_stage * i
-                        for i in range(self.num_stages + 1)
-                    ]
-                    afd_reqs_start_loc[-1] = num_reqs
+            if self.afd_config:
+                if ubatch_slices and len(ubatch_slices) > 1:
+                    afd_tokens_start_loc = [ub.token_slice.start for ub in ubatch_slices]
+                    afd_reqs_start_loc = [ub.request_slice.start for ub in ubatch_slices]
+                    logger.info(f"afd_tokens_start_loc: {afd_tokens_start_loc} "
+                                f"afd_reqs_start_loc: {afd_reqs_start_loc}")
+                    afd_tokens_lens = [ub.num_tokens for ub in ubatch_slices]
                 else:
-                    afd_reqs_start_loc = [i for i in range(num_reqs + 1)]
-
-                # For prefill, compute tokens per stage based on actual token
-                # counts
-                afd_tokens_start_loc = [0]
-                afd_tokens_lens = []
-                for stage_idx in range(len(afd_reqs_start_loc) - 1):
-                    stage_start_req = afd_reqs_start_loc[stage_idx]
-                    stage_end_req = afd_reqs_start_loc[stage_idx + 1]
-                    stage_tokens = int(query_start_loc[stage_end_req] -
-                                       query_start_loc[stage_start_req])
-                    afd_tokens_lens.append(stage_tokens)
-                    afd_tokens_start_loc.append(afd_tokens_start_loc[-1] +
-                                                stage_tokens)
+                    afd_tokens_start_loc = [0]
+                    afd_reqs_start_loc = [0]
+                    afd_tokens_lens = [num_tokens_unpadded]
 
                 afd_metadata = AFDMetadata(
                     afd_tokens_start_loc=afd_tokens_start_loc,
@@ -1549,23 +1565,37 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             num_draft_tokens=self.num_draft_tokens.
                                                     gpu[:num_reqs],
                         )
-                    attn_metadata_i = builder.build(
-                        common_prefix_len=common_prefix_len,
-                        common_attn_metadata=common_attn_metadata,
-                        # afd_metadata=afd_metadata,
-                        **extra_attn_metadata_args)
+                if ubatch_slices is not None:
+                    common_attn_metadata_list = split_attn_metadata(
+                        ubatch_slices, common_attn_metadata
+                    )
+                    for ubid, common_attn_metadata in enumerate(
+                            common_attn_metadata_list
+                    ):
+                        attn_metadata_i = attn_group.get_metadata_builder(
+                            ubatch_id=ubid
+                        ).build(
+                            common_prefix_len=common_prefix_len,
+                            common_attn_metadata=common_attn_metadata,
+                            model=self.get_model(),
+                        )
+                        for layer_name in kv_cache_group_spec.layer_names:
+                            assert type(attn_metadata) is list
+                            attn_metadata[ubid][layer_name] = attn_metadata_i
                 else:
                     attn_metadata_i = builder.build(
                         common_prefix_len=common_prefix_len,
                         common_attn_metadata=common_attn_metadata,
                         model=self.get_model(),
-                        # afd_metadata=afd_metadata,
-                        **extra_attn_metadata_args)
+                        **extra_attn_metadata_args,
+                    )
+                    use_cascade_attn |= getattr(attn_metadata_i, "use_cascade", False)
+                    for layer_name in attn_group.layer_names:
+                        attn_metadata[layer_name] = attn_metadata_i
 
-                if self.vllm_config.model_config.use_mla or self.ascend_config.use_sfa:
-                    attn_metadata_i.num_input_tokens = num_input_tokens
-                for layer_name in attn_group.layer_names:
-                    attn_metadata[layer_name] = attn_metadata_i
+                # disable cascade attention when DBO
+                if ubatch_slices is not None:
+                    use_cascade_attn = False
 
         if lmhead_tp_enable():
             max_num_reqs_across_dp = maybe_padded_num_tokens if not with_prefill else self.max_num_reqs
@@ -1573,21 +1603,34 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
-        if afd_metadata:
-            (num_afd_pad, afd_tokens_start_loc,
-             afd_tokens_lens) = self.get_afd_padding(
-                afd_metadata.afd_tokens_start_loc,
-                afd_metadata.afd_tokens_lens)
-            afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
-            afd_metadata.afd_tokens_lens = afd_tokens_lens
-            num_tokens += num_afd_pad
-            num_tokens_across_dp = None
-
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
                 input_ids, inputs_embeds, intermediate_tensors, afd_metadata,
-                max_num_scheduled_tokens)
+                max_num_scheduled_tokens, ubatch_slices)
+
+    def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
+        if (
+                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and not envs.VLLM_DISABLE_PAD_FOR_CUDAGRAPH
+                and hasattr(self, "cudagraph_batch_sizes")
+                and self.cudagraph_batch_sizes
+                and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
+        ):
+            # Use CUDA graphs.
+            # Add padding to the batch size.
+            return self.vllm_config.pad_for_cudagraph(num_scheduled_tokens)
+
+        # Eager mode.
+        # Pad tokens to multiple of tensor_parallel_size when
+        # enabled collective fusion for SP
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if (
+                self.compilation_config.pass_config.enable_sequence_parallelism
+                and tp_size > 1
+        ):
+            return round_up(num_scheduled_tokens, tp_size)
+        return num_scheduled_tokens
 
     def _generate_process_reqs_hidden_states(self, attn_metadata, with_prefill,
                                              maybe_padded_num_tokens,
@@ -1865,6 +1908,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         num_pad = new_start_loc[-1] - original_max_end_loc
         return num_pad, new_start_loc, afd_tokens_lens
 
+    # This is where the second ubatch is adjusted to account for the padding.
+    # Should be called after attention metadata creation. This just pads
+    # the second ubatch slice out to the total number of tokens
+    # (num_tokens + padding)
+    def pad_out_ubatch_slice(self, ubatch_slices: UBatchSlices,
+                             num_total_tokens: int):
+        padded_second_ubatch_slice = slice(ubatch_slices[1].token_slice.start,
+                                           num_total_tokens)
+        ubatch_slices[1] = UBatchSlice(padded_second_ubatch_slice,
+                                       padded_second_ubatch_slice)
+
     def _pool(
             self,
             hidden_states: torch.Tensor,
@@ -1999,20 +2053,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
              num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
              logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
              intermediate_tensors, afd_metadata,
-             max_query_len) = (self._prepare_inputs(scheduler_output,
-                                                    intermediate_tensors))
+             max_query_len, ubatch_slices
+             ) = self._prepare_inputs(scheduler_output)
 
-        if afd_metadata:
-            # Padding for AFD
-            num_input_tokens = num_input_tokens
-            (num_pad_afd, afd_tokens_start_loc,
-             afd_tokens_lens) = self.get_afd_padding(
-                afd_metadata.afd_tokens_start_loc,
-                afd_metadata.afd_tokens_lens)
-            afd_metadata.afd_tokens_start_loc = afd_tokens_start_loc
-            afd_metadata.afd_tokens_lens = afd_tokens_lens
-            num_input_tokens += num_pad_afd
-            num_tokens_across_dp = None
+        dp_rank = self.parallel_config.data_parallel_rank
+        if ubatch_slices:
+            assert num_tokens_across_dp is not None
+            num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+            self.pad_out_ubatch_slice(ubatch_slices, num_input_tokens)
+        elif num_tokens_across_dp is not None:
+            num_input_tokens = int(num_tokens_across_dp[dp_rank].item())
+        else:
+            num_input_tokens = self._get_num_input_tokens(
+                scheduler_output.total_num_scheduled_tokens
+            )
 
         if self.dynamic_eplb:
             self.eplb_updator.take_update_info_from_eplb_process()
@@ -2054,6 +2108,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     prefetch_stream=self.prefetch_stream,
                     model_instance=self.model,
                     afd_metadata=afd_metadata,
+                    ubatch_slices=ubatch_slices,
                     weight_prefetch_method=self.weight_prefetch_method):
                 self.maybe_setup_kv_connector(scheduler_output)
 
@@ -2556,6 +2611,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             uniform_decode=uniform_decode,
             num_scheduled_tokens_per_request=num_scheduled_tokens,
         )
+        logger.info(f"ttg dummy_run, ubatch_slices: {ubatch_slices}")
         num_tokens_after_padding = num_tokens
         if num_tokens_across_dp is not None:
             dp_rank = self.parallel_config.data_parallel_rank
@@ -3628,21 +3684,46 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     aclgraph_runtime_mode.name))
         # We skip EPLB here since we don't want to record dummy metrics
         for num_tokens in compilation_cases:
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
-                # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
-                # But be careful, warm up with `NONE`is orthogonal to
-                # if we want to warm up attention or not. This is
-                # different from the case where `FULL` implies capture
-                # attention while `PIECEWISE` implies no attention.
-                force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
+            # We currently only capture ubatched graphs when its a FULL
+            # cudagraph and for uniform decode batches.
+            capture_ubatched_graph = self.parallel_config.enable_dbo \
+                                     and aclgraph_runtime_mode == CUDAGraphMode.FULL \
+                                     and uniform_decode \
+                                     and check_ubatch_thresholds(
+                config=self.vllm_config.parallel_config,
+                num_tokens=num_tokens,
+                uniform_decode=uniform_decode,
+            )
+
+            # Currently we capture both microbatched and non-microbatched
+            # graphs when capture_ubatched_graph is True, this is because
+            # occasionally we will be forced out of microbatching due to other
+            # DP ranks not microbatching (usually caused by an empty second
+            # microbatch; once we resolve this, we can remove the
+            # non-microbatched graph capture).
+            allow_microbatching_options = [True, False] if \
+                capture_ubatched_graph else [False]
+            for allow_microbatching in allow_microbatching_options:
+                for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                    # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
+                    # But be careful, warm up with `NONE`is orthogonal to
+                    # if we want to warm up attention or not. This is
+                    # different from the case where `FULL` implies capture
+                    # attention while `PIECEWISE` implies no attention.
+                    force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
+                    self._dummy_run(num_tokens,
+                                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                                    force_attention=force_attention,
+                                    uniform_decode=uniform_decode,
+                                    allow_microbatching=allow_microbatching)
+
+                # Graph Capture
                 self._dummy_run(num_tokens,
-                                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                                aclgraph_runtime_mode=aclgraph_runtime_mode,
                                 force_attention=force_attention,
-                                uniform_decode=uniform_decode)
-            self._dummy_run(num_tokens,
-                            aclgraph_runtime_mode=aclgraph_runtime_mode,
-                            force_attention=force_attention,
-                            uniform_decode=uniform_decode)
+                                uniform_decode=uniform_decode,
+                                allow_microbatching=allow_microbatching,
+                                )
 
     def _capture_model(self):
         if not self.use_aclgraph:
