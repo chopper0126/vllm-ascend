@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from multiprocessing import Manager
 from typing import (TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional,
                     Union, cast)
+from typing_extensions import TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -73,7 +74,9 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.utils.jsontree import json_map_leaves
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
-    AttentionCGSupport, reorder_batch_to_split_decodes_and_prefills)
+    CommonAttentionMetadata, AttentionCGSupport,
+    reorder_batch_to_split_decodes_and_prefills)
+from vllm.v1.attention.backends.flash_attn import AttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -90,6 +93,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.utils import CpuGpuBuffer
+# from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (AttentionGroup, bind_kv_cache,
@@ -102,7 +106,7 @@ from vllm_ascend.ascend_forward_context import (MoECommType,
                                                 set_ascend_forward_context)
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_attn_metadata
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                set_graph_params,
                                                update_attn_params,
@@ -131,6 +135,17 @@ from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
 
 from vllm.distributed.parallel_state import get_world_group
 from vllm.distributed.afd_transfer import AFDConnectorFactory
+
+#-------------------
+# from vllm_ascend.worker.npu_ubatch_wrapper import UBatchWrapper
+# from vllm_ascend.worker.ubatch_splitting import check_ubatch_thresholds, ubatch_split
+# from vllm_ascend.worker.ubatch_utils import UBatchSlice, UBatchSlices
+AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
+# list when ubatching is enabled
+PerLayerAttnMetadata: TypeAlias = Union[list[AttnMetadataDict],
+                                        AttnMetadataDict]
+#------------------
+
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -1246,6 +1261,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
                                               attn_state,
                                               total_num_scheduled_tokens)
+        logger.info("enable_dbo=", enable_dbo)
 
         # Get info across DP ranks.
         # NOTE: maybe_padded_num_tokens is only used when using TorchAir with DP,
@@ -2437,6 +2453,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Padding for DP
         (num_tokens, num_tokens_across_dp, with_prefill,
          _) = self._sync_metadata_across_dp(num_tokens, with_prefill, False)
+        logger.info(f"ttg num_tokens: {num_tokens}, {num_tokens_across_dp}")
 
         moe_comm_type = self._select_moe_comm_method(num_tokens, with_prefill)
         # AFD padding (stage-level alignment) before DP padding
@@ -2522,6 +2539,48 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         num_scheduled_tokens = np.array(num_scheduled_tokens_list,
                                         dtype=np.int32)
 
+        # total_num_scheduled_tokens = int(num_scheduled_tokens.sum())
+        # # ------下两行代码在AFA阶段暂时封印，后续需要解封
+        # # allow_dp_padding = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE or \
+        # #                     self.afd_config is not None
+        # allow_dp_padding = True
+        #
+        # # We currently only microbatch if the number of tokens is
+        # # over a certain threshold.
+        # ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
+        #     num_tokens_unpadded=total_num_scheduled_tokens,
+        #     parallel_config=self.vllm_config.parallel_config,
+        #     allow_microbatching=True,
+        #     allow_dp_padding=allow_dp_padding,
+        #     num_tokens_padded=total_num_scheduled_tokens,
+        #     uniform_decode=uniform_decode,
+        #     num_scheduled_tokens_per_request=num_scheduled_tokens,
+        # )
+        # num_tokens_after_padding = num_tokens
+        # if num_tokens_across_dp is not None:
+        #     dp_rank = self.parallel_config.data_parallel_rank
+        #     num_tokens_after_padding = int(num_tokens_across_dp[dp_rank])
+
+        # contruct ubatch
+        ubatch_slices = None
+        # ubatch_slices: UBatchSlices = []
+        # n_ubatches = len(afd_metadata.afd_tokens_lens)
+        # for i in range(n_ubatches):
+        #     token_slice = slice(
+        #         afd_metadata.afd_tokens_start_loc[i],
+        #         afd_metadata.afd_tokens_start_loc[i + 1]
+        #     )
+        #     request_slice = slice(
+        #         afd_metadata.afd_reqs_start_loc[i],
+        #         afd_metadata.afd_reqs_start_loc[i + 1]
+        #     )
+        #
+        #     ubatch_slices.append(UBatchSlice(
+        #         request_slice=request_slice,
+        #         token_slice=token_slice
+        #     ))
+        # logger.info(f"ttg ubatch_slices: {ubatch_slices}")
+
         # Force dummy run on prefill stage when this node is deemed as kv producer.
         if self.is_kv_producer and not self.is_kv_consumer:
             with_prefill = True
@@ -2534,6 +2593,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             max_query_len=max_query_len,
             force_attention=force_attention,
         )
+        logger.info(f"ttg dummy run attn_metadata: {attn_metadata}")
 
         if not self.in_profile_run and self.dynamic_eplb:
             self.eplb_updator.forward_before()
@@ -2607,6 +2667,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     prefetch_stream=self.prefetch_stream,
                     model_instance=self.model,
                     afd_metadata = afd_metadata,
+                    ubatch_slices=ubatch_slices,
                     weight_prefetch_method=self.weight_prefetch_method):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     with_prefill, is_torchair_compile, input_ids, positions,
@@ -2646,6 +2707,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         with self.set_in_profile_run():
             hidden_states = self._dummy_run(self.max_num_tokens,
                                             with_prefill=True)
+            logger.info(f"finish dummy run")
             # MC2 will consume additional NPU memory.
             # Therefore, we need to run the MC2 path once here to complete its initialization,
             # allowing vLLM to correctly estimate the maximum memory required.
@@ -2673,11 +2735,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                 dtype=np.int32)
                 logit_indices = np.cumsum(num_scheduled_tokens) - 1
                 # TODO: need to rum a dummy sampler for generate task
+                logger.info(f'hidden_states before synchronize shape is {hidden_states.shape}')
                 # print(f'hidden_states before synchronize shape is {hidden_states.shape}')
                 NPUPlatform.synchronize()
                 hidden_states = hidden_states[logit_indices]
                 output = self.model.compute_logits(hidden_states)
 
+        logger.info(f"start npu synchronize")
         NPUPlatform.synchronize()
         del hidden_states, output
         self.encoder_cache.clear()
