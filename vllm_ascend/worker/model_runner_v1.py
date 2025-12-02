@@ -299,6 +299,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.attn_mask = None
         self.attn_state = None
         self.requests: Dict[str, CachedRequestState] = {}
+        self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.intermediate_tensors: Optional[IntermediateTensors] = None
         self.runner_only_attn_layers: set[str] = set()
 
@@ -874,7 +875,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
-        if isinstance(self.model, ACLGraphWrapper):
+        if isinstance(self.model, (ACLGraphWrapper, UBatchWrapper)):
             return self.model.unwrap()
         return self.model
 
@@ -1593,9 +1594,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
-                # disable cascade attention when DBO
-                if ubatch_slices is not None:
-                    use_cascade_attn = False
+        # disable cascade attention when DBO
+        if ubatch_slices is not None:
+            use_cascade_attn = False
 
         if lmhead_tp_enable():
             max_num_reqs_across_dp = maybe_padded_num_tokens if not with_prefill else self.max_num_reqs
@@ -2616,26 +2617,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if num_tokens_across_dp is not None:
             dp_rank = self.parallel_config.data_parallel_rank
             num_tokens_after_padding = int(num_tokens_across_dp[dp_rank])
-
-        # contruct ubatch
-        # ubatch_slices = None
-        # ubatch_slices: UBatchSlices = []
-        # n_ubatches = len(afd_metadata.afd_tokens_lens)
-        # for i in range(n_ubatches):
-        #     token_slice = slice(
-        #         afd_metadata.afd_tokens_start_loc[i],
-        #         afd_metadata.afd_tokens_start_loc[i + 1]
-        #     )
-        #     request_slice = slice(
-        #         afd_metadata.afd_reqs_start_loc[i],
-        #         afd_metadata.afd_reqs_start_loc[i + 1]
-        #     )
-        #
-        #     ubatch_slices.append(UBatchSlice(
-        #         request_slice=request_slice,
-        #         token_slice=token_slice
-        #     ))
-        # logger.info(f"ttg ubatch_slices: {ubatch_slices}")
 
         # Force dummy run on prefill stage when this node is deemed as kv producer.
         if self.is_kv_producer and not self.is_kv_consumer:
@@ -3712,10 +3693,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # attention while `PIECEWISE` implies no attention.
                     force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
                     self._dummy_run(num_tokens,
-                                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
                                     force_attention=force_attention,
                                     uniform_decode=uniform_decode,
-                                    allow_microbatching=allow_microbatching)
+                                    allow_microbatching=allow_microbatching,
+                                    skip_eplb=True,
+                                    remove_lora=False)
 
                 # Graph Capture
                 self._dummy_run(num_tokens,
@@ -3723,7 +3706,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 force_attention=force_attention,
                                 uniform_decode=uniform_decode,
                                 allow_microbatching=allow_microbatching,
-                                )
+                                skip_eplb=True,
+                                remove_lora=False)
+        self.maybe_remove_all_loras(self.lora_config)
 
     def _capture_model(self):
         if not self.use_aclgraph:
