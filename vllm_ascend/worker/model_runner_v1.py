@@ -2500,6 +2500,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
             force_attention: bool = False,
             uniform_decode: bool = False,
+            allow_microbatching: bool = True
     ) -> torch.Tensor:
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
@@ -2606,7 +2607,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
             num_tokens_unpadded=total_num_scheduled_tokens,
             parallel_config=self.vllm_config.parallel_config,
-            allow_microbatching=True,
+            allow_microbatching=allow_microbatching,
             allow_dp_padding=allow_dp_padding,
             num_tokens_padded=total_num_scheduled_tokens,
             uniform_decode=uniform_decode,
@@ -3685,30 +3686,25 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             allow_microbatching_options = [True, False] if \
                 capture_ubatched_graph else [False]
             for allow_microbatching in allow_microbatching_options:
+                force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
                 for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                     # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                     # But be careful, warm up with `NONE`is orthogonal to
                     # if we want to warm up attention or not. This is
                     # different from the case where `FULL` implies capture
                     # attention while `PIECEWISE` implies no attention.
-                    force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
                     self._dummy_run(num_tokens,
-                                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
                                     force_attention=force_attention,
                                     uniform_decode=uniform_decode,
-                                    allow_microbatching=allow_microbatching,
-                                    skip_eplb=True,
-                                    remove_lora=False)
+                                    allow_microbatching=allow_microbatching)
 
                 # Graph Capture
                 self._dummy_run(num_tokens,
                                 aclgraph_runtime_mode=aclgraph_runtime_mode,
                                 force_attention=force_attention,
                                 uniform_decode=uniform_decode,
-                                allow_microbatching=allow_microbatching,
-                                skip_eplb=True,
-                                remove_lora=False)
-        self.maybe_remove_all_loras(self.lora_config)
+                                allow_microbatching=allow_microbatching)
 
     def _capture_model(self):
         if not self.use_aclgraph:
