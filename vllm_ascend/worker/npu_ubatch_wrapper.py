@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import torch
+import copy
 
 import vllm.envs as envs
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
@@ -111,7 +112,7 @@ class UBatchWrapper:
         comm_sms = envs.VLLM_DBO_COMM_SMS
 
         set_comm_sms = lambda sms: None
-        if vllm_config.parallel_config.enable_expert_parallel:
+        if vllm_config.parallel_config.enable_expert_parallel and not vllm_config.afd_config:
             # Currently only DeepEP highthroughput supports SM control so this
             # only affects that case.
             all2all_manager = get_ep_group(
@@ -166,10 +167,10 @@ class UBatchWrapper:
         def _capture_ubatch_thread(results, ubatch_metadata):
             torch.npu.set_device(self.device)
             ubatch_context = ubatch_metadata.context
-            with torch.npu.stream(ubatch_context.compute_stream):
-                _ = torch.npu.current_blas_handle()
-            with torch.npu.stream(ubatch_context.comm_stream):
-                _ = torch.npu.current_blas_handle()
+            # with torch.npu.stream(ubatch_context.compute_stream):
+            #     _ = torch.npu.current_blas_handle()
+            # with torch.npu.stream(ubatch_context.comm_stream):
+            #     _ = torch.npu.current_blas_handle()
             with ubatch_context:
                 model_output = model(
                     input_ids=ubatch_metadata.input_ids,
@@ -241,22 +242,21 @@ class UBatchWrapper:
         # override it to None here so we can have it restored correctly
         # after both threads have finished
         # TODO HXY 这里强行override了才导致这边的里面要Get的时候拿不到正确的东西了
-        # with override_forward_context(None):
-        ubatch_threads = []
-        for metadata in ubatch_metadata:
-            thread = threading.Thread(target=_ubatch_thread,
-                                        args=(
-                                            results,
-                                            model,
-                                            metadata,
-                                        ))
-            ubatch_threads.append(thread)
-            thread.start()
-        self.ready_barrier.wait()  # Wait for both threads to be ready
-        ubatch_metadata[0].context.cpu_wait_event.set()
-        for thread in ubatch_threads:
-            thread.join()
-
+        with override_forward_context(None):
+            ubatch_threads = []
+            for metadata in ubatch_metadata:
+                thread = threading.Thread(target=_ubatch_thread,
+                                            args=(
+                                                results,
+                                                model,
+                                                metadata,
+                                            ))
+                ubatch_threads.append(thread)
+                thread.start()
+            self.ready_barrier.wait()  # Wait for both threads to be ready
+            ubatch_metadata[0].context.cpu_wait_event.set()
+            for thread in ubatch_threads:
+                thread.join()
         sorted_results = [value for position, value in sorted(results)]
         result = torch.cat(sorted_results, dim=0)
         return result
@@ -264,12 +264,12 @@ class UBatchWrapper:
     def _make_ubatch_metadata(self, ubatch_slices, attn_metadata, input_ids,
                               positions, inputs_embeds, intermediate_tensors,
                               compute_stream, dp_metadata, batch_descriptor,
-                              aclgraph_runtime_mode) -> list[UbatchMetadata]:
+                              aclgraph_runtime_mode,afd_metadata) -> list[UbatchMetadata]:
 
         # Create one forward context per ubatch
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
-            forward_context = get_forward_context()
+            forward_context = copy.copy(get_forward_context())
             forward_context.attn_metadata = attn_metadata[i] if attn_metadata is not None else None
             forward_context.no_compile_layers=self.vllm_config.compilation_config.static_forward_context
             forward_context.dp_metadata=dp_metadata
@@ -277,14 +277,8 @@ class UBatchWrapper:
             forward_context.batch_descriptor=batch_descriptor
             forward_contexts.append(
                 forward_context
-                # create_forward_context( # TODO HXY 这里到底是create_forward_context还是ascend的
-                #     attn_metadata[i] if attn_metadata is not None else None,
-                #     self.vllm_config,
-                #     dp_metadata=dp_metadata,
-                #     batch_descriptor=batch_descriptor,
-                #     cudagraph_runtime_mode=aclgraph_runtime_mode)
                     )
-
+        
         ubatch_ctxs = make_ubatch_contexts(
             num_micro_batches=len(ubatch_slices),
             comm_stream=self.comm_stream,
@@ -336,6 +330,7 @@ class UBatchWrapper:
         batch_descriptor = forward_context.batch_descriptor
         ubatch_slices = forward_context.ubatch_slices
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        afd_metadata = forward_context.afd_metadata
 
         # If there's no ubatching, just run the runnable object
         if ubatch_slices is None:
@@ -360,7 +355,7 @@ class UBatchWrapper:
 
         attn_metadata = forward_context.attn_metadata
         num_tokens = (ubatch_slices[0].token_slice.stop -
-                      ubatch_slices[0].token_slice.start) * 2
+                      ubatch_slices[0].token_slice.start) * 2 # num_tokens = 12 
         input_ids = kwargs['input_ids']
         positions = kwargs['positions']
         intermediate_tensors = kwargs['intermediate_tensors']
@@ -384,7 +379,8 @@ class UBatchWrapper:
                 compute_stream=compute_stream,
                 dp_metadata=dp_metadata,
                 batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE)
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                afd_metadata=afd_metadata)
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.model)
         elif num_tokens in self.aclgraphs \
@@ -403,7 +399,8 @@ class UBatchWrapper:
                 compute_stream=compute_stream,
                 dp_metadata=dp_metadata,
                 batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE)
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                afd_metadata=afd_metadata)
             # with self.sm_control:
             #     return self._run_ubatches(ubatch_metadata, self.model)
             return self._run_ubatches(ubatch_metadata, self.model)
