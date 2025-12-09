@@ -558,7 +558,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         else:
             self._ffn_forward(batch_descriptor=batch_descriptor,
                                   aclgraph_runtime_mode=aclgraph_runtime_mode) 
-            print("finsh capture warm_up")
+
         print(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
         self.dummy_run_call_cnt += 1
     

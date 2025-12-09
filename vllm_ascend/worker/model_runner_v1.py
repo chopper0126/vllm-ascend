@@ -2907,6 +2907,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                          runtime_mode=CUDAGraphMode.FULL)
         elif self.parallel_config.enable_dbo:
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+                self.update_stream = torch.npu.Stream()
+                set_graph_params(self.compilation_config.cudagraph_capture_sizes)
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.FULL, self.device)
             else:
@@ -3666,44 +3668,45 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # We skip EPLB here since we don't want to record dummy metrics
         for num_tokens in compilation_cases:
             # We currently only capture ubatched graphs when its a FULL
-            # cudagraph and for uniform decode batches.
-            capture_ubatched_graph = self.parallel_config.enable_dbo \
-                                     and aclgraph_runtime_mode == CUDAGraphMode.FULL \
-                                     and uniform_decode \
-                                     and check_ubatch_thresholds(
-                config=self.vllm_config.parallel_config,
-                num_tokens=num_tokens,
-                uniform_decode=uniform_decode,
+            # cudagraph, a uniform decode batch, and the number of tokens
+            # is above the threshold. Otherwise we just capture a non-ubatched
+            # version of the graph
+            allow_microbatching = (
+                self.parallel_config.enable_dbo
+                and aclgraph_runtime_mode == CUDAGraphMode.FULL
+                and uniform_decode
+                and check_ubatch_thresholds(
+                    config=self.vllm_config.parallel_config,
+                    num_tokens=num_tokens,
+                    uniform_decode=uniform_decode,
+                )
             )
-
-            # Currently we capture both microbatched and non-microbatched
-            # graphs when capture_ubatched_graph is True, this is because
-            # occasionally we will be forced out of microbatching due to other
-            # DP ranks not microbatching (usually caused by an empty second
-            # microbatch; once we resolve this, we can remove the
-            # non-microbatched graph capture).
-            allow_microbatching_options = [True, False] if \
-                capture_ubatched_graph else [False]
-            for allow_microbatching in allow_microbatching_options:
+             
+            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
+                # But be careful, warm up with `NONE`is orthogonal to
+                # if we want to warm up attention or not. This is
+                # different from the case where `FULL` implies capture
+                # attention while `PIECEWISE` implies no attention.
                 force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
-                for _ in range(self.compilation_config.cudagraph_num_of_warmups):
-                    # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
-                    # But be careful, warm up with `NONE`is orthogonal to
-                    # if we want to warm up attention or not. This is
-                    # different from the case where `FULL` implies capture
-                    # attention while `PIECEWISE` implies no attention.
-                    self._dummy_run(num_tokens,
-                                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
-                                    force_attention=force_attention,
-                                    uniform_decode=uniform_decode,
-                                    allow_microbatching=allow_microbatching)
+                self._dummy_run(
+                    num_tokens,
+                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                    force_attention=force_attention,
+                    uniform_decode=uniform_decode,
+                    allow_microbatching=allow_microbatching
+                )
+                print(f'capture warmup self.dp_rank is {self.dp_rank}')
 
-                # Graph Capture
-                self._dummy_run(num_tokens,
-                                aclgraph_runtime_mode=aclgraph_runtime_mode,
-                                force_attention=force_attention,
-                                uniform_decode=uniform_decode,
-                                allow_microbatching=allow_microbatching)
+            # Graph Capture
+            self._dummy_run(
+                num_tokens,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                force_attention=force_attention,
+                uniform_decode=uniform_decode,
+                allow_microbatching=allow_microbatching
+            )
+            print(f'capture Graph self.dp_rank is {self.dp_rank}')
 
     def _capture_model(self):
         if not self.use_aclgraph:
