@@ -32,6 +32,7 @@ from typing import (TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional,
                     Union, cast)
 from typing_extensions import TypeAlias
 
+import vllm.envs as envs
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -2500,6 +2501,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
             force_attention: bool = False,
             uniform_decode: bool = False,
+            allow_microbatching:bool = False,
     ) -> torch.Tensor:
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
@@ -2761,7 +2763,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         self.mc2_tokens_capacity,
                         with_prefill=True) == MoECommType.MC2:
                 self._dummy_run(self.mc2_tokens_capacity, with_prefill=True)
-        # print(f'hidden_states shape is {hidden_states.shape}')
+        print(f'hidden_states shape is {hidden_states.shape}')
         output = None
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -2781,16 +2783,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 logit_indices = np.cumsum(num_scheduled_tokens) - 1
                 # TODO: need to rum a dummy sampler for generate task
                 logger.info(f'hidden_states before synchronize shape is {hidden_states.shape}')
-                # print(f'hidden_states before synchronize shape is {hidden_states.shape}')
+                print(f'hidden_states before synchronize shape is {hidden_states.shape}')
                 NPUPlatform.synchronize()
                 hidden_states = hidden_states[logit_indices]
                 output = self.model.compute_logits(hidden_states)
+                print(f'hidden_states after synchronize shape is {hidden_states.shape}')
 
         logger.info(f"start npu synchronize")
         NPUPlatform.synchronize()
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        print(f'hidden_states after profile_run shape is {hidden_states.shape}')
 
     def _dummy_pooler_run_task(
             self,
@@ -3675,6 +3679,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens=num_tokens,
                 uniform_decode=uniform_decode,
             )
+            print(f"capture_ubatched_graph is {capture_ubatched_graph}")
 
             # Currently we capture both microbatched and non-microbatched
             # graphs when capture_ubatched_graph is True, this is because
@@ -3693,21 +3698,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # attention while `PIECEWISE` implies no attention.
                     force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
                     self._dummy_run(num_tokens,
-                                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
                                     force_attention=force_attention,
                                     uniform_decode=uniform_decode,
-                                    allow_microbatching=allow_microbatching,
-                                    skip_eplb=True,
-                                    remove_lora=False)
+                                    allow_microbatching=allow_microbatching
+                                    )
 
                 # Graph Capture
                 self._dummy_run(num_tokens,
                                 aclgraph_runtime_mode=aclgraph_runtime_mode,
                                 force_attention=force_attention,
                                 uniform_decode=uniform_decode,
-                                allow_microbatching=allow_microbatching,
-                                skip_eplb=True,
-                                remove_lora=False)
+                                allow_microbatching=allow_microbatching
+                                )
         self.maybe_remove_all_loras(self.lora_config)
 
     def _capture_model(self):

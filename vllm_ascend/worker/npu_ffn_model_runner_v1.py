@@ -93,6 +93,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.topk = self.model_config.hf_config.num_experts_per_tok
         self.n_routed_experts = self.model_config.hf_config.n_routed_experts
         self.hidden_size = self.model_config.hf_config.hidden_size
+        self.num_stages = self.afd_config.num_afd_stages
         print(f'self.topk is {self.topk}')
         
         # self.profiler
@@ -139,7 +140,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             # skip dense layer
             if current_layer_idx < self.first_k_dense_replace:
                 return
-            torch.npu.synchronize()
+            # torch.npu.synchronize()
             if self.use_aclgraph:
                 # replay
                 acl_graph_info = self._acl_graphs_full.get(self.max_num_tokens * self.topk * self.attn_size)
@@ -545,8 +546,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             aclgraph = torch.npu.NPUGraph()
             with torch.npu.graph(aclgraph, pool=self.graph_pool):
                 # compute_ffn_output
+                
                 output = self._ffn_forward(batch_descriptor=batch_descriptor,
-                                  aclgraph_runtime_mode=aclgraph_runtime_mode)
+                                    aclgraph_runtime_mode=aclgraph_runtime_mode)
             print(f'output shape is {output.shape}')
             # Store the captured graph with token count as key
             self._acl_graphs_full[output.shape[0]] = {
@@ -567,43 +569,44 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                      aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,):
         # mock self.model
         for layer_idx in range(self.first_k_dense_replace,self.num_layers):
-            # recv
-            if self.connector_name == "m2nconnector":
-                # TODO metadata
-                m2n_afdconnector_data = M2NAFDConnectorMetadata()
-                m2n_afdconnector_data.quant_mode = 0
-                m2n_afdconnector_data.expand_x_type = torch.bfloat16
-                m2n_afdconnector_data.moe_expert_num = 64
-                m2n_afdconnector_data.h = 2048
-                m2n_afdconnector_data.k = 8
-                m2n_afdconnector_data.expert_token_nums_type = 0
-                m2n_afdconnector_data.aiv_num = 48
-                # self.max_num_tokens * topk * attn_size
-                m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * self.attn_size
-                # [64,2048]
-                hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
-                # print(f'recv_attn_output success ,layer id is {layer_idx}')
-                m2n_afdconnector_data.handle = handle
-                m2n_afdconnector_data.topk_weights = topk_weights
-                # compute
-            with set_ascend_forward_context(
-                    attn_metadata=None,
-                    vllm_config=self.vllm_config,
-                    reserved_mc2_mask=self.reserved_mc2_mask,
-                    batch_descriptor=batch_descriptor,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    prefetch_stream=self.prefetch_stream,
-                    model_instance=self.model):
-                rank_ffn_output = self._run_ffn_computation(hidden_states = hidden_states,
-                                               layer_idx=layer_idx,
-                                               capture_mode=True,
-                                               group_list=group_list,
-                                                dynamic_scales=dynamic_scales,
-                                                topk_weights=topk_weights
-                                               )
-                # send
-                self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
-                # print(f'send_ffn_output success ,layer id is {layer_idx}')
+            for i in range(self.num_stages):
+                # recv
+                if self.connector_name == "m2nconnector":
+                    # TODO metadata
+                    m2n_afdconnector_data = M2NAFDConnectorMetadata()
+                    m2n_afdconnector_data.quant_mode = 0
+                    m2n_afdconnector_data.expand_x_type = torch.bfloat16
+                    m2n_afdconnector_data.moe_expert_num = 64
+                    m2n_afdconnector_data.h = 2048
+                    m2n_afdconnector_data.k = 8
+                    m2n_afdconnector_data.expert_token_nums_type = 0
+                    m2n_afdconnector_data.aiv_num = 48
+                    # self.max_num_tokens * topk * attn_size
+                    m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * self.attn_size
+                    # [64,2048]
+                    hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
+                    # print(f'recv_attn_output success ,layer id is {layer_idx}')
+                    m2n_afdconnector_data.handle = handle
+                    m2n_afdconnector_data.topk_weights = topk_weights
+                    # compute
+                with set_ascend_forward_context(
+                        attn_metadata=None,
+                        vllm_config=self.vllm_config,
+                        reserved_mc2_mask=self.reserved_mc2_mask,
+                        batch_descriptor=batch_descriptor,
+                        aclgraph_runtime_mode=aclgraph_runtime_mode,
+                        prefetch_stream=self.prefetch_stream,
+                        model_instance=self.model):
+                    rank_ffn_output = self._run_ffn_computation(hidden_states = hidden_states,
+                                                layer_idx=layer_idx,
+                                                capture_mode=True,
+                                                group_list=group_list,
+                                                    dynamic_scales=dynamic_scales,
+                                                    topk_weights=topk_weights
+                                                )
+                    # send
+                    self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
+                    # print(f'send_ffn_output success ,layer id is {layer_idx}')
         return rank_ffn_output
   
         

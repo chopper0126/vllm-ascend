@@ -166,10 +166,10 @@ class UBatchWrapper:
         def _capture_ubatch_thread(results, ubatch_metadata):
             torch.npu.set_device(self.device)
             ubatch_context = ubatch_metadata.context
-            with torch.npu.stream(ubatch_context.compute_stream):
-                _ = torch.npu.current_blas_handle()
-            with torch.npu.stream(ubatch_context.comm_stream):
-                _ = torch.npu.current_blas_handle()
+            # with torch.npu.stream(ubatch_context.compute_stream):
+            #     _ = torch.npu.current_blas_handle()
+            # with torch.npu.stream(ubatch_context.comm_stream):
+            #     _ = torch.npu.current_blas_handle()
             with ubatch_context:
                 model_output = model(
                     input_ids=ubatch_metadata.input_ids,
@@ -260,6 +260,27 @@ class UBatchWrapper:
         sorted_results = [value for position, value in sorted(results)]
         result = torch.cat(sorted_results, dim=0)
         return result
+    
+    def _run_ubatches_without_threads(self, ubatch_metadatas, model) -> torch.Tensor:
+
+        # ubatch_metadata list
+        # 传入完整ubatch_metadata，并且已经切好ubatch_slice
+        # ubatch_metadata.context is per ubatch context
+        
+        
+        # ubatch_hidden_states: list[torch.Tensor]
+        # ubatch_residual: list[Optional[torch.Tensor]]
+        # ubatch_positions: list[torch.Tensor]
+        
+        # for ubatch_metadata in ubatch_metadatas:
+        with ubatch_metadatas[0].context:
+            model_output = model.forward_m2n_ubatch(
+                input_ids=ubatch_metadata.input_ids,
+                positions=ubatch_metadata.positions,
+                intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                inputs_embeds=ubatch_metadata.inputs_embeds,
+            )
+        return model_output
 
     def _make_ubatch_metadata(self, ubatch_slices, attn_metadata, input_ids,
                               positions, inputs_embeds, intermediate_tensors,
@@ -267,32 +288,33 @@ class UBatchWrapper:
                               aclgraph_runtime_mode) -> list[UbatchMetadata]:
 
         # Create one forward context per ubatch
-        forward_contexts = []
-        for i, ubatch_slice in enumerate(ubatch_slices):
-            forward_context = get_forward_context()
-            forward_context.attn_metadata = attn_metadata[i] if attn_metadata is not None else None
-            forward_context.no_compile_layers=self.vllm_config.compilation_config.static_forward_context
-            forward_context.dp_metadata=dp_metadata
-            forward_context.cudagraph_runtime_mode=aclgraph_runtime_mode
-            forward_context.batch_descriptor=batch_descriptor
-            forward_contexts.append(
-                forward_context
-                # create_forward_context( # TODO HXY 这里到底是create_forward_context还是ascend的
-                #     attn_metadata[i] if attn_metadata is not None else None,
-                #     self.vllm_config,
-                #     dp_metadata=dp_metadata,
-                #     batch_descriptor=batch_descriptor,
-                #     cudagraph_runtime_mode=aclgraph_runtime_mode)
-                    )
-
-        ubatch_ctxs = make_ubatch_contexts(
-            num_micro_batches=len(ubatch_slices),
-            comm_stream=self.comm_stream,
-            compute_stream=compute_stream,
-            forward_contexts=forward_contexts,
-            ready_barrier=self.ready_barrier)
+        # forward_contexts = []
+        # for i, ubatch_slice in enumerate(ubatch_slices):
+        #     # 这里forward_context 是完整的
+        #     forward_context = get_forward_context()
+        #     forward_context.attn_metadata = attn_metadata[i] if attn_metadata is not None else None
+        #     forward_context.no_compile_layers=self.vllm_config.compilation_config.static_forward_context
+        #     forward_context.dp_metadata=dp_metadata
+        #     forward_context.cudagraph_runtime_mode=aclgraph_runtime_mode
+        #     forward_context.batch_descriptor=batch_descriptor
+        #     forward_contexts.append(
+        #         forward_context
+        #             )
+        # (variable) ubatch_ctxs: list[UBatchContext]
+        # ubatch_ctxs = make_ubatch_contexts(
+        #     num_micro_batches=len(ubatch_slices),
+        #     comm_stream=self.comm_stream,
+        #     compute_stream=compute_stream,
+        #     forward_contexts=forward_contexts,
+        #     ready_barrier=self.ready_barrier)
+        ubatch_ctx =  get_forward_context()
 
         ubatch_metadata: list[UbatchMetadata] = []
+        ubatch_hidden_states: list[torch.Tensor]
+        ubatch_residual: list[Optional[torch.Tensor]]
+        ubatch_positions: list[torch.Tensor]
+        ubatch_input_ids: list[torch.Tensor]
+        
         for i, ubatch_slice in enumerate(ubatch_slices):
             sliced_input_ids, sliced_positions, sliced_inputs_embeds, \
             sliced_intermediate_tensors = \
@@ -301,7 +323,7 @@ class UBatchWrapper:
                     inputs_embeds, intermediate_tensors)
             ubatch_metadata.append(
                 UbatchMetadata(
-                    context=ubatch_ctxs[i],
+                    context=ubatch_ctx,
                     input_ids=sliced_input_ids,
                     positions=sliced_positions,
                     inputs_embeds=sliced_inputs_embeds,
@@ -373,38 +395,43 @@ class UBatchWrapper:
         # We shouldn't be here unless we are running with multiple DP ranks
         assert dp_metadata is not None
 
+        # capture 
         if num_tokens not in self.aclgraphs \
             and aclgraph_runtime_mode is CUDAGraphMode.FULL:
-            ubatch_metadata = self._make_ubatch_metadata(
-                ubatch_slices=ubatch_slices,
-                attn_metadata=attn_metadata,
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                compute_stream=compute_stream,
-                dp_metadata=dp_metadata,
-                batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE)
-            with self.sm_control:
-                return self._capture_ubatches(ubatch_metadata, self.model)
+            # ubatch_metadata = self._make_ubatch_metadata(
+            #     ubatch_slices=ubatch_slices,
+            #     attn_metadata=attn_metadata,
+            #     input_ids=input_ids,
+            #     positions=positions,
+            #     intermediate_tensors=intermediate_tensors,
+            #     inputs_embeds=inputs_embeds,
+            #     compute_stream=compute_stream,
+            #     dp_metadata=dp_metadata,
+            #     batch_descriptor=batch_descriptor,
+            #     aclgraph_runtime_mode=CUDAGraphMode.NONE)
+            # with self.sm_control:
+            return self.aclgraph_wrapper(*args, **kwargs)
+            # return self._capture_ubatches(ubatch_metadata, self.model)
+        # repaly
         elif num_tokens in self.aclgraphs \
             and aclgraph_runtime_mode is CUDAGraphMode.FULL:
-            aclgraph_metadata = self.aclgraphs[num_tokens]
-            aclgraph_metadata.aclgraph.replay()
-            return aclgraph_metadata.outputs
+            # aclgraph_metadata = self.aclgraphs[num_tokens]
+            # aclgraph_metadata.aclgraph.replay()
+            # return aclgraph_metadata.outputs
+            return self.aclgraph_wrapper(*args, **kwargs)
         else:
-            ubatch_metadata = self._make_ubatch_metadata(
-                ubatch_slices=ubatch_slices,
-                attn_metadata=attn_metadata,
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                compute_stream=compute_stream,
-                dp_metadata=dp_metadata,
-                batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE)
-            # with self.sm_control:
-            #     return self._run_ubatches(ubatch_metadata, self.model)
-            return self._run_ubatches(ubatch_metadata, self.model)
+            return self.runnable(*args, **kwargs)
+            # # ubatch_slices list[UbatchMetadata]
+            # ubatch_metadata = self._make_ubatch_metadata(
+            #     ubatch_slices=ubatch_slices,
+            #     attn_metadata=attn_metadata,
+            #     input_ids=input_ids,
+            #     positions=positions,
+            #     intermediate_tensors=intermediate_tensors,
+            #     inputs_embeds=inputs_embeds,
+            #     compute_stream=compute_stream,
+            #     dp_metadata=dp_metadata,
+            #     batch_descriptor=batch_descriptor,
+            #     aclgraph_runtime_mode=CUDAGraphMode.NONE)
+
+            # return self._run_ubatches_without_threads(ubatch_metadata, self.model)
