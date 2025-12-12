@@ -667,7 +667,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
                     cam_afdconnector_data.handle = handle
                     self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data)
-                # print(f'send_ffn_output success ,layer id is {layer_idx}')
+                print(f'send_ffn_output success ,layer id is {layer_idx}')
         return rank_ffn_output
   
         

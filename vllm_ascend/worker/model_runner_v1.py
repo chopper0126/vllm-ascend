@@ -2861,20 +2861,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     m.consumed_memory / float(2 ** 30))
 
         # wrap the model with full graph wrapper if needed.
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs() \
-                and not self.parallel_config.use_ubatching:
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
             set_graph_params(self.compilation_config.cudagraph_capture_sizes)
             self.model = ACLGraphWrapper(self.model,
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL)
-        elif self.parallel_config.use_ubatching:
-            if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-                self.model = UBatchWrapper(self.model, self.vllm_config,
-                                           CUDAGraphMode.FULL, self.device)
-            else:
-                self.model = UBatchWrapper(self.model, self.vllm_config,
-                                           CUDAGraphMode.NONE, self.device)
+        # elif self.parallel_config.use_ubatching:
+        #     if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        #         self.update_stream = torch.npu.Stream()
+        #         set_graph_params(self.compilation_config.cudagraph_capture_sizes)
+        #         self.model = UBatchWrapper(self.model, self.vllm_config,
+        #                                    CUDAGraphMode.FULL, self.device)
+        #     else:
+        #         self.model = UBatchWrapper(self.model, self.vllm_config,
+        #                                    CUDAGraphMode.NONE, self.device)
 
     def _convert_torch_format(self, tensor):
         tensor = torch_npu.npu_format_cast(tensor, ACL_FORMAT)
