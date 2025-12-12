@@ -599,7 +599,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * self.attn_size
                 # [64,2048]
                 hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
-                # print(f'recv_attn_output success ,layer id is {layer_idx}')
+                print(f'recv_attn_output success ,layer id is {layer_idx}')
                 m2n_afdconnector_data.handle = handle
                 m2n_afdconnector_data.topk_weights = topk_weights
             elif self.connector_name == "camconnector":
@@ -641,7 +641,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
                     cam_afdconnector_data.handle = handle
                     self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data)
-                # print(f'send_ffn_output success ,layer id is {layer_idx}')
+                print(f'send_ffn_output success ,layer id is {layer_idx}')
         return rank_ffn_output
   
         
