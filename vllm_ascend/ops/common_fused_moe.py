@@ -208,7 +208,6 @@ class AscendAFD(FusedMoE):
         # currently it is only activated when doing profile runs.
         if enable_force_load_balance and not self.use_aclgraph:
             topk_ids = torch.randint_like(topk_ids, 0, self.global_num_experts)
-        
         return topk_weights, topk_ids, row_idx
 
 
@@ -326,6 +325,10 @@ class AscendFusedMoE(FusedMoE):
         ):
         forward_context = get_forward_context()
         moe_comm_method = forward_context.moe_comm_method
+        # 自动检测量化类型并获取所有相关参数
+        use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias = \
+            self._detect_quantization_and_get_params(layer)
+
         final_hidden_states = moe_comm_method.fused_experts(
             hidden_states=hidden_states,
             w1=layer.w13_weight,
@@ -337,7 +340,13 @@ class AscendFusedMoE(FusedMoE):
             expert_map=self.expert_map,
             shared_experts=None,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
-            dynamic_eplb=self.dynamic_eplb)
+            dynamic_eplb=self.dynamic_eplb,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int4_w4a8=use_int4_w4a8,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_scale_bias=w1_scale_bias,
+            w2_scale_bias=w2_scale_bias)
         if isinstance(final_hidden_states, tuple):
             final_hidden_states, group_list_type, expert_tokens = final_hidden_states
 
@@ -554,10 +563,10 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         w2_scale = getattr(layer, 'w2_weight_scale', None) if has_w2_scale else None
 
         # get scale_bias param（INT4)
-        w1_scale_bias = getattr(layer, 'w13_weight_scale_bias', None) if \
-                        hasattr(layer, 'w13_weight_scale_bias') else None
-        w2_scale_bias = getattr(layer, 'w2_weight_scale_bias', None) if \
-                        hasattr(layer, 'w2_weight_scale_bias') else None
+        w1_scale_bias = getattr(layer, 'w13_weight_offset', None) if \
+                        hasattr(layer, 'w13_weight_offset') else None
+        w2_scale_bias = getattr(layer, 'w2_weight_offset', None) if \
+                        hasattr(layer, 'w2_weight_offset') else None
         return use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias
 
     # TODO 这里的weight的传入有问题，目测是没加载对
@@ -625,7 +634,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             router_logits=router_logits,
             replace_allreduce=forward_context.sp_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp)
-        
+
         use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias = \
                         self._detect_quantization_and_get_params(layer)
 
