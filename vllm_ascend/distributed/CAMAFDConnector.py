@@ -78,7 +78,7 @@ class CAMAFDConnector(AFDConnectorBase):
 
         logger.info(
             f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
-        # TODO : get backend to replace hardcode
+        # TODO(jcz) : 这里要根据实际的num_of_stages创建，需要改成list
         self.afd_pg = init_afd_process_group(
             backend="hccl",
             init_method=f"tcp://127.0.0.1:29509",
@@ -86,7 +86,15 @@ class CAMAFDConnector(AFDConnectorBase):
             rank=self.rank,
             group_name="afd"
         )
+        self.afd_pg2 = init_afd_process_group(
+            backend="hccl",
+            init_method=f"tcp://127.0.0.1:29509",
+            world_size=self.ffn_size + self.attn_size,
+            rank=self.rank,
+            group_name="afd2"
+        )
         self.hccl_comm_name = self.afd_pg._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
+        self.hccl_comm_name2 = self.afd_pg2._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
         ffn_ranks = [i for i in range(0, self.ffn_size)]
         attn_ranks = [i for i in range(self.ffn_size, self.ffn_size + self.attn_size)]
 
@@ -117,11 +125,13 @@ class CAMAFDConnector(AFDConnectorBase):
                                   
     # ATTN发给MOE（ATTN发送）
     # TODO:metadata的获取，最好从框架侧去拿
+    # TODO(jcz): 这里ubatch_idx的入参需要优化
     def send_attn_output(self, 
                          hidden_states: torch.Tensor,  
                          topk_weights: torch.Tensor, 
                          topk_idx:torch.Tensor, 
-                         metadata: AFDConnectorMetadata) -> Any:
+                         metadata: AFDConnectorMetadata,
+                         ubatch_idx: int = 0) -> Any:
         if not self.use_aclgraph:
             print(f'send_attn_output start rank:{self.rank}')
             dst = (self.process_group.rank_in_group + 1) % self.process_group.world_size
@@ -144,13 +154,13 @@ class CAMAFDConnector(AFDConnectorBase):
                             expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
                             sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num, rank = self.rank,
                             loadBalancingRankNum=1, loadBalancingThreshold=0, dynamicQuant = quant_mode,
-                            groupEp = self.hccl_comm_name,
+                            groupEp = self.hccl_comm_name2 if ubatch_idx == 1 else self.hccl_comm_name,
                             aivNum = aiv_num)
 
         return handle_out
 
     # MOE发给ATTN（ATTN接收）
-    def recv_ffn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata) -> torch.Tensor:
+    def recv_ffn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata, ubatch_idx: int = 0) -> torch.Tensor:
         batch_size = metadata.cam_afdconnector_data.batch_size
         h = metadata.cam_afdconnector_data.h
         k = metadata.cam_afdconnector_data.k
@@ -170,13 +180,13 @@ class CAMAFDConnector(AFDConnectorBase):
                             sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num,
                             rank = self.rank,
                             loadBalancingRankNum=1, loadBalancingThreshold=0,
-                            groupEp = self.hccl_comm_name,
+                            groupEp = self.hccl_comm_name2 if ubatch_idx == 1 else self.hccl_comm_name,
                             aivNum = aiv_num)
 
         return output2
     
     # MOE发给ATTN(MOE发送) 
-    def send_ffn_output(self, ffn_output: torch.Tensor, metadata: CAMAFDConnectorMetadata):
+    def send_ffn_output(self, ffn_output: torch.Tensor, metadata: CAMAFDConnectorMetadata, ubatch_idx: int = 0):
         batch_size = metadata.batch_size
         h = metadata.h
         k = metadata.k
@@ -197,13 +207,13 @@ class CAMAFDConnector(AFDConnectorBase):
                             sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num,
                             rank = self.rank,
                             loadBalancingRankNum=1, loadBalancingThreshold=0,
-                            groupEp = self.hccl_comm_name,
+                            groupEp = self.hccl_comm_name2 if ubatch_idx == 1 else self.hccl_comm_name,
                             aivNum = aiv_num)
 
         return
     
     # ATTN发给MOE(MOE接收)
-    def recv_attn_output(self, metadata: CAMAFDConnectorMetadata) -> Any: 
+    def recv_attn_output(self, metadata: CAMAFDConnectorMetadata, ubatch_idx: int = 0) -> Any: 
         afdmetadata = None
         if not self.use_aclgraph:
             src = (self.process_group.rank_in_group - 1) % self.process_group.world_size
@@ -227,7 +237,7 @@ class CAMAFDConnector(AFDConnectorBase):
                             expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
                             sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num, rank = self.rank,
                             loadBalancingRankNum=1, loadBalancingThreshold=0, dynamicQuant = quant_mode,
-                            groupEp = self.hccl_comm_name,
+                            groupEp = self.hccl_comm_name2 if ubatch_idx == 1 else self.hccl_comm_name,
                             aivNum = aiv_num)
         
         return output1, afdmetadata
