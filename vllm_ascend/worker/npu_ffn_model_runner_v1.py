@@ -94,6 +94,10 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.n_routed_experts = self.model_config.hf_config.n_routed_experts
         self.hidden_size = self.model_config.hf_config.hidden_size
         print(f'self.topk is {self.topk}')
+
+        # TODO(jcz): 对于ffn eager模式下_current_num_ubatches逻辑和layer_idx的计算逻辑需要优化
+        #            这里的2是hardcode，需要根据实际情况调整，初始化的时候目前暂时需要初始化成dummy run跑的batch_size
+        self._current_num_ubatches = self.afd_config.num_afd_stages
         
         # self.profiler
         # import os
@@ -121,8 +125,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.connector.init_afd_connector()
 
     def _get_current_layer_idx(self) -> int:
-        return (self._counter //
-                self.afd_config.num_afd_stages) % self.num_layers
+        # return (self._counter //
+        #         self.afd_config.num_afd_stages) % self.num_layers
+        return (self._counter // self._current_num_ubatches) % self.num_layers
     
     def profile_run(self):
         self._dummy_run(self.max_num_tokens)
@@ -139,7 +144,6 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             # skip dense layer
             if current_layer_idx < self.first_k_dense_replace:
                 return
-            torch.npu.synchronize()
             if self.use_aclgraph:
                 # replay
                 if self.connector_name == "camconnector":
@@ -169,6 +173,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 print(f'recv_attn_output success ,layer id is {current_layer_idx}')
                 m2n_afdconnector_data.handle = handle
                 m2n_afdconnector_data.topk_weights = topk_weights
+                self._current_num_ubatches = afdConnectorMetadata.num_ubatches
                 print(f'dynamic_scales shape is {dynamic_scales.shape},dtype is {dynamic_scales.dtype}')
                 print(f'group_list shape is {group_list.shape},dtype is {group_list.dtype}')
                 print(f'topk_weights shape is {topk_weights.shape},dtype is {topk_weights.dtype}')
@@ -184,7 +189,8 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     h = 2048,
                     k = 8
                 )
-                output1,afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data)
+                output1,afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data, self._counter % self._current_num_ubatches)
+                self._current_num_ubatches = afdConnectorMetadata.num_ubatches
                 hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
                 group_list = expertTokenNums.to(torch.int64)
                 topk_weights = simulateExpertScales
@@ -198,7 +204,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 print(f'topk_ids shape is {topk_ids.shape},dtype is {topk_ids.dtype}')
                 print(f'row_idx shape is {row_idx.shape},dtype is {row_idx.dtype}')
                 print(f'recv_attn_output success ,layer id is {current_layer_idx}')
-
+            print(f"jcz ffn self._current_num_ubatches:{self._current_num_ubatches}")
                 
             # Try to use ACL graph if available
             # TODO(yxj):move layer
@@ -305,7 +311,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             if self.connector_name == "camconnector":
                 handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
                 cam_afdconnector_data.handle = handle
-                self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data)
+                self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data, self._counter % self._current_num_ubatches)
             elif self.connector_name == "m2nconnector":
                 self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
                 print(f'send_ffn_output success ,layer id is {current_layer_idx}')
@@ -319,8 +325,10 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             ) from e
         finally:
             self._counter += 1
+            # if (self._counter == self.num_layers *
+            #         self.afd_config.num_afd_stages):
             if (self._counter == self.num_layers *
-                    self.afd_config.num_afd_stages):
+                    self._current_num_ubatches):
                 self._counter = 0
                 self._forword_cnt += 1
         return None  # FFN server doesn't return ModelRunnerOutput
@@ -598,7 +606,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 # self.max_num_tokens * topk * attn_size
                 m2n_afdconnector_data.batch_size = self.max_num_tokens * m2n_afdconnector_data.k * self.attn_size
                 # [64,2048]
-                hidden_states, dynamic_scales, group_list, handle, topk_weights,afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
+                hidden_states, dynamic_scales, group_list, handle, topk_weights, afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
                 print(f'recv_attn_output success ,layer id is {layer_idx}')
                 m2n_afdconnector_data.handle = handle
                 m2n_afdconnector_data.topk_weights = topk_weights
@@ -614,7 +622,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     h = 2048,
                     k = 8
                 )
-                output1,afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data)
+                output1, afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data)
                 hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
                 group_list = expertTokenNums.to(torch.int64)
                 topk_weights = simulateExpertScales
