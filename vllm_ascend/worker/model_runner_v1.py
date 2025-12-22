@@ -879,7 +879,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
-        if isinstance(self.model, (ACLGraphWrapper, UBatchWrapper)):
+        # if isinstance(self.model, (ACLGraphWrapper, UBatchWrapper)):
+        if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
 

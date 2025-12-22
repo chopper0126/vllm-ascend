@@ -209,6 +209,9 @@ class NPUWorker(WorkerBase):
         if not (self.vllm_config.afd_config
                 and self.vllm_config.afd_config.is_ffn_server):
             return
+        # while True:
+        #     print("eager dummy_run profile_run  ")
+        #     self.model_runner.profile_run()
         if not self.model_config.enforce_eager:
             print("start to ffn profile_run  ")
             self.model_runner.profile_run()

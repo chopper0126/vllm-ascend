@@ -142,6 +142,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         # self.prof.step()
         current_layer_idx = self._get_current_layer_idx()
         try:
+            
+            # self.profile_run()
+            
             # skip dense layer
             if current_layer_idx < self.first_k_dense_replace:
                 return
@@ -312,7 +315,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data, self._counter % self._current_num_ubatches)
             elif self.connector_name == "m2nconnector":
                 self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
-                print(f'send_ffn_output success ,layer id is {current_layer_idx}')
+                print(f'send_ffn_output success ,layer id is {current_layer_idx}',flush=True)
             else :
                 afdConnectorMetadata.recv_handle_list = None
                 self.connector.send_ffn_output(rank_ffn_output, afdConnectorMetadata)
@@ -577,11 +580,11 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 'input_hidden_states': output,
                 'output': output
             }
-            print(f'self._acl_graphs_full is {self._acl_graphs_full}')
+            print(f'self._acl_graphs_full is {self._acl_graphs_full}',flush=True)
         else:
             self._ffn_forward(batch_descriptor=batch_descriptor,
                                   aclgraph_runtime_mode=aclgraph_runtime_mode) 
-            print("finsh capture warm_up")
+            print("finsh capture warm_up or prefile run",flush=True)
         print(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
         self.dummy_run_call_cnt += 1
 
@@ -618,63 +621,69 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                      aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,):
         # mock self.model
         for layer_idx in range(self.first_k_dense_replace,self.num_layers):
-            # recv
-            if self.connector_name == "m2nconnector":
-                # TODO metadata
-                m2n_afdconnector_data = M2NAFDConnectorMetadata()
-                hidden_states, dynamic_scales, group_list, topk_weights, afdConnectorMetadata = \
-                self._build_and_recv_m2n_afdconnector(
-                    m2n_afdconnector_data=m2n_afdconnector_data,
-                    quant_mode= 0,
-                    expand_x_type = torch.bfloat16,
-                    n_routed_experts=self.n_routed_experts,
-                    hidden_size=self.hidden_size,
-                    topk=self.topk,
-                    expert_token_nums_type=0,
-                    attn_size=self.attn_size,
-                    max_num_tokens=self.max_num_tokens,
+            for ubatch_idx in range(2):
+                # torch.npu.synchronize()
+                # recv
+                if self.connector_name == "m2nconnector":
+                     hidden_states, dynamic_scales, group_list, topk_weights, afdConnectorMetadata = \
+                
+                    self._build_and_recv_m2n_afdconnector(
+                        m2n_afdconnector_data=m2n_afdconnector_data,
+                        quant_mode= 0,
+                        expand_x_type = torch.bfloat16,
+                        n_routed_experts=self.n_routed_experts,
+                        hidden_size=self.hidden_size,
+                        topk=self.topk,
+                        expert_token_nums_type=0,
+                        attn_size=self.attn_size,
+                        max_num_tokens=self.max_num_tokens,
+                        )
+                    # [64,2048]
+                    hidden_states, dynamic_scales, group_list, handle, topk_weights, afdConnectorMetadata = self.connector.recv_attn_output(m2n_afdconnector_data)
+                    print(f'recv_attn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}',flush=True)
+                    m2n_afdconnector_data.handle = handle
+                    m2n_afdconnector_data.topk_weights = topk_weights
+                elif self.connector_name == "camconnector":
+                    cam_afdconnector_data = CAMAFDConnectorMetadata(
+                        moe_expert_num = 64,
+                        shared_expert_num = 0,
+                        scale = None,
+                        handle = None,
+                        quant_mode = 0,
+                        aiv_num = 48,
+                        batch_size = self.max_num_tokens,
+                        h = 2048,
+                        k = 8
                     )
-
-            elif self.connector_name == "camconnector":
-                cam_afdconnector_data = CAMAFDConnectorMetadata(
-                    moe_expert_num = 64,
-                    shared_expert_num = 0,
-                    scale = None,
-                    handle = None,
-                    quant_mode = 0,
-                    aiv_num = 48,
-                    batch_size = self.max_num_tokens,
-                    h = 2048,
-                    k = 8
-                )
-                output1, afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data)
-                hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
-                group_list = expertTokenNums.to(torch.int64)
-                topk_weights = simulateExpertScales
-                # compute
-            with set_ascend_forward_context(
-                    attn_metadata=None,
-                    vllm_config=self.vllm_config,
-                    reserved_mc2_mask=self.reserved_mc2_mask,
-                    batch_descriptor=batch_descriptor,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    prefetch_stream=self.prefetch_stream,
-                    model_instance=self.model):
-                rank_ffn_output = self._run_ffn_computation(hidden_states = hidden_states,
-                                               layer_idx=layer_idx,
-                                               capture_mode=True,
-                                               group_list=group_list,
-                                                dynamic_scales=dynamic_scales,
-                                                topk_weights=topk_weights
-                                               )
+                    output1, afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data)
+                    hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
+                    group_list = expertTokenNums.to(torch.int64)
+                    topk_weights = simulateExpertScales
+                    # compute
+                with set_ascend_forward_context(
+                        attn_metadata=None,
+                        vllm_config=self.vllm_config,
+                        reserved_mc2_mask=self.reserved_mc2_mask,
+                        batch_descriptor=batch_descriptor,
+                        aclgraph_runtime_mode=aclgraph_runtime_mode,
+                        prefetch_stream=self.prefetch_stream,
+                        model_instance=self.model):
+                    rank_ffn_output = self._run_ffn_computation(hidden_states = hidden_states,
+                                                    layer_idx=layer_idx,
+                                                    capture_mode=True,
+                                                    group_list=group_list,
+                                                    dynamic_scales=dynamic_scales,
+                                                    topk_weights=topk_weights
+                                                )
                 # send
                 if self.connector_name == "m2nconnector":
                     self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
+                    print(f'send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}',flush=True)
                 elif self.connector_name == "camconnector":
                     handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
                     cam_afdconnector_data.handle = handle
                     self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data)
-                print(f'send_ffn_output success ,layer id is {layer_idx}')
+                # print(f'send_ffn_output success ,layer id is {layer_idx}')
         return rank_ffn_output
   
         
