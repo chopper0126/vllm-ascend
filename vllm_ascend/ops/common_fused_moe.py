@@ -682,6 +682,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             row_idx: Optional[torch.Tensor] = None,
             connector_name: Optional[str] = "",
         ):
+        use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias = \
+            self._detect_quantization_and_get_params(layer)
         #TODO(yxj):move to p2p
         # hidden_states是dispatch之后的，shape第一维是group_list[-1],self.max_num_token*8*2
         shared_out = self._shared_experts(hidden_states)
@@ -695,15 +697,15 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         
         mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
                                     w1=layer.w13_weight,
-                                    w1_scale=None,
+                                    w1_scale=w1_scale,
                                     w2=layer.w2_weight,
-                                    w2_scale=None,
+                                    w2_scale=w2_scale,
                                     group_list=expert_tokens,
                                     dynamic_scale=dynamic_scale,
                                     group_list_type=group_list_type,
-                                    w1_scale_bias=None,
-                                    w2_scale_bias=None,
-                                    with_quant=False,
+                                    w1_scale_bias=w1_scale_bias,
+                                    w2_scale_bias=w2_scale_bias,
+                                    with_quant=use_int4_w4a8 or use_int8_w8a8,
                                     fusion=False,
                                     need_trans=False)
         
