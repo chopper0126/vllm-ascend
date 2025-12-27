@@ -289,8 +289,8 @@ _graph_params: Optional[GraphParams] = None
 
 def set_graph_params(aclgraph_capture_sizes: set[int]):
     global _graph_params
-    if _graph_params is not None:
-        raise ValueError("Graph parameters have already been set!")
+    # if _graph_params is not None:
+    #     raise ValueError("Graph parameters have already been set!")
     _graph_params = GraphParams(
         {size: []
          for size in aclgraph_capture_sizes},
@@ -301,7 +301,36 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
         {size: []
          for size in aclgraph_capture_sizes},
     )
-
+    
+def update_graph_params(aclgraph_capture_sizes: set[int]):
+    global _graph_params
+    
+    # 如果 _graph_params 还没有被设置，直接设置
+    if _graph_params is None:
+        set_graph_params(aclgraph_capture_sizes)
+        return
+    
+    # 找出当前不存在的 sizes
+    existing_sizes = set(_graph_params.events.keys())
+    new_sizes = aclgraph_capture_sizes - existing_sizes
+    
+    # 如果没有新 sizes，直接返回
+    if not new_sizes:
+        return
+    
+    # 添加新的 size 到每个字典中
+    for size in new_sizes:
+        # events: dict[int, list[torch.npu.ExternalEvent]] - 初始化为空列表
+        _graph_params.events[size] = []
+        
+        # workspaces: dict[int, torch.Tensor] - 初始化为 None
+        _graph_params.workspaces[size] = None
+        
+        # handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]] - 初始化为空列表
+        _graph_params.handles[size] = []
+        
+        # attn_params: dict[int, list[tuple]] - 初始化为空列表
+        _graph_params.attn_params[size] = []
 
 def get_graph_params():
     return _graph_params

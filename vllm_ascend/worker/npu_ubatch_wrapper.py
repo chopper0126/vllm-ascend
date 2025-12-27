@@ -107,7 +107,7 @@ class UBatchWrapper:
 
         self.device = device
 
-    # TODO HXY 这里要重新写，npu当然没有sm这种东西，得改成aiv和aic，但不知道是啥，先注释掉再说
+
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
         comm_sms = envs.VLLM_DBO_COMM_SMS
@@ -323,15 +323,15 @@ class UBatchWrapper:
                 sliced_intermediate_tensors)
 
     def __call__(self, *args, **kwargs):
-        # TODO: 后续待修改成DBO多线程方式
         print(f'======__call__=====')
-        return self.runnable(*args, **kwargs)
+        # return self.runnable(*args, **kwargs)
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         ubatch_slices = forward_context.ubatch_slices
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
         afd_metadata = forward_context.afd_metadata
-
+        print(f'ubatch_slices in UBatchWrapper is {ubatch_slices}',flush=True)
+        print(f'aclgraph_runtime_mode in UBatchWrapper is {aclgraph_runtime_mode}',flush=True)
         # If there's no ubatching, just run the runnable object
         if ubatch_slices is None:
 
@@ -369,36 +369,39 @@ class UBatchWrapper:
 
         if num_tokens not in self.aclgraphs \
             and aclgraph_runtime_mode is CUDAGraphMode.FULL:
-            ubatch_metadata = self._make_ubatch_metadata(
-                ubatch_slices=ubatch_slices,
-                attn_metadata=attn_metadata,
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                compute_stream=compute_stream,
-                dp_metadata=dp_metadata,
-                batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE,
-                afd_metadata=afd_metadata)
-            with self.sm_control:
-                return self._capture_ubatches(ubatch_metadata, self.model)
+            # ubatch_metadata = self._make_ubatch_metadata(
+            #     ubatch_slices=ubatch_slices,
+            #     attn_metadata=attn_metadata,
+            #     input_ids=input_ids,
+            #     positions=positions,
+            #     intermediate_tensors=intermediate_tensors,
+            #     inputs_embeds=inputs_embeds,
+            #     compute_stream=compute_stream,
+            #     dp_metadata=dp_metadata,
+            #     batch_descriptor=batch_descriptor,
+            #     aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            #     afd_metadata=afd_metadata)
+            assert self.aclgraph_wrapper is not None
+            return self.aclgraph_wrapper(*args, **kwargs)
+            # with self.sm_control:
+            # return self._capture_ubatches(ubatch_metadata, self.model)
         elif num_tokens in self.aclgraphs \
             and aclgraph_runtime_mode is CUDAGraphMode.FULL:
             aclgraph_metadata = self.aclgraphs[num_tokens]
             aclgraph_metadata.aclgraph.replay()
             return aclgraph_metadata.outputs
         else:
-            ubatch_metadata = self._make_ubatch_metadata(
-                ubatch_slices=ubatch_slices,
-                attn_metadata=attn_metadata,
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                compute_stream=compute_stream,
-                dp_metadata=dp_metadata,
-                batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE,
-                afd_metadata=afd_metadata)
-            return self._run_ubatches(ubatch_metadata, self.model)
+            # ubatch_metadata = self._make_ubatch_metadata(
+            #     ubatch_slices=ubatch_slices,
+            #     attn_metadata=attn_metadata,
+            #     input_ids=input_ids,
+            #     positions=positions,
+            #     intermediate_tensors=intermediate_tensors,
+            #     inputs_embeds=inputs_embeds,
+            #     compute_stream=compute_stream,
+            #     dp_metadata=dp_metadata,
+            #     batch_descriptor=batch_descriptor,
+            #     aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            #     afd_metadata=afd_metadata)
+            return self.runnable(*args, **kwargs)
+            # return self._run_ubatches(ubatch_metadata, self.model)

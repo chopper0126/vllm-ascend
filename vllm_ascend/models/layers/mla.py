@@ -151,8 +151,17 @@ def mla_forward(
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    if forward_context.attn_metadata:
-        attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
+    afd_metadata = forward_context.afd_metadata
+    attn_metadata = forward_context.attn_metadata
+    if afd_metadata is not None and isinstance(attn_metadata, list):
+        afd_stage_idx = afd_metadata.afd_stage_idx
+        if afd_stage_idx < len(attn_metadata):
+            attn_metadata = attn_metadata[afd_stage_idx]
+        else:
+            attn_metadata = None  # padding
+
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata[self.mla_attn.layer_name]
     else:
         attn_metadata = forward_context.attn_metadata
     kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine]

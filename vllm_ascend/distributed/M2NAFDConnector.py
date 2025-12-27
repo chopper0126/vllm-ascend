@@ -105,7 +105,7 @@ class M2NAFDConnector(AFDConnectorBase):
         )
         self.afd_pg_2 = init_afd_process_group(
             backend="hccl",
-            init_method=f"tcp://127.0.0.1:29909",
+            init_method=f"tcp://127.0.0.1:29808",
             world_size=self.ffn_size + self.attn_size,
             rank=world_rank,
             group_name="afd_2"
@@ -189,8 +189,7 @@ class M2NAFDConnector(AFDConnectorBase):
         recv_counts = torch_npu.npu_m2n_distribute_send(x=hidden_states,
                                                         expert_ids=topk_ids,
                                                         expert_scales=topk_weights,
-                                                        # group_ep=self.hccl_comm_name if ubatch_idx == 0 else self.hccl_comm_name_2,
-                                                        group_ep=self.hccl_comm_name_2,
+                                                        group_ep=self.hccl_comm_name_2 if ubatch_idx == 1 else self.hccl_comm_name,
                                                         world_size=self.attn_size + self.ffn_size,
                                                         moe_world_size=self.ffn_size,
                                                         ep_rank_id=self.rank,
@@ -213,7 +212,7 @@ class M2NAFDConnector(AFDConnectorBase):
         
         xOut = torch_npu.npu_n2m_distribute_recv(x=hidden_states,
                                                 ep_recv_counts=handle,
-                                                group_ep=self.hccl_comm_name,
+                                                group_ep=self.hccl_comm_name_2 if ubatch_idx == 1 else self.hccl_comm_name,
                                                 world_size=self.attn_size + self.ffn_size,
                                                 moe_world_size=self.ffn_size,
                                                 ep_rank_id=self.rank,
@@ -235,7 +234,7 @@ class M2NAFDConnector(AFDConnectorBase):
         torch_npu.npu_n2m_distribute_send(expandX=ffn_output,
                                         ep_send_counts=handle,
                                         expert_scales=topk_weights,
-                                        group_ep=self.hccl_comm_name,
+                                        group_ep=self.hccl_comm_name_2 if ubatch_idx == 1 else self.hccl_comm_name,
                                         world_size=self.attn_size + self.ffn_size,
                                         moe_world_size=self.ffn_size,
                                         ep_rank_id=self.rank,
@@ -287,7 +286,7 @@ class M2NAFDConnector(AFDConnectorBase):
         expert_token_nums_type = metadata.expert_token_nums_type
         #npu::npu_m2n_distribute_recv(Tensor x, str group_ep, int world_size, int server_rank_size, int moe_world_size, int ep_rank_id, int moe_expert_num, int quant_mode, int batch_size, int h, int k, int expert_token_nums_type, int aiv_num) -> (Tensor, Tensor, Tensor, Tensor, Tensor)
         expand_x, dynamic_scales, expert_token_nums, recv_counts, expand_scales = torch_npu.npu_m2n_distribute_recv(x = torch.tensor([], dtype=x_type, device='npu'),
-                                                                                group_ep=self.hccl_comm_name,
+                                                                                group_ep=self.hccl_comm_name_2 if ubatch_idx == 1 else self.hccl_comm_name,
                                                                                 world_size=self.attn_size + self.ffn_size,
                                                                                 moe_world_size=self.ffn_size,
                                                                                 ep_rank_id=self.rank,

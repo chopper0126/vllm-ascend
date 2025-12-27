@@ -209,9 +209,7 @@ class NPUWorker(WorkerBase):
         if not (self.vllm_config.afd_config
                 and self.vllm_config.afd_config.is_ffn_server):
             return
-        # while True:
-        #     print("eager dummy_run profile_run  ")
-        #     self.model_runner.profile_run()
+
         if not self.model_config.enforce_eager:
             print("start to ffn profile_run  ")
             self.model_runner.profile_run()
@@ -231,7 +229,6 @@ class NPUWorker(WorkerBase):
             print("finsh  ffn compile_or_warm_up_model  ")
             print("start to capture ffn capture_model")
             self.model_runner.capture_model()
-            # self.model_runner.initialize_afd_connector()
             print("finsh  capture ffn capture_model")
         if self.profiler:
             self.profiler.start()
@@ -242,26 +239,53 @@ class NPUWorker(WorkerBase):
             print(self.profiler.key_averages().table(
                 sort_by="self_cuda_time_total"))
 
-        import threading
-        self._ffn_shutdown_event = threading.Event()
-
-        def ffn_worker_loop():
-            # Set NPU device for this thread (thread-local context)
-            device = torch.device(f"npu:{self.local_rank}")
-            NPUPlatform.set_device(device)
-            logger.info("FFN worker loop started")
-
-            try:
-                while not self._ffn_shutdown_event.is_set():
-                    # Execute FFN computation
-                    self.model_runner.execute_model(scheduler_output=None)
-            except Exception as e:
-                logger.error("FFN worker loop error: %s", e)
-                raise
-
-        self._ffn_thread = threading.Thread(target=ffn_worker_loop,
-                                            daemon=True)
-        self._ffn_thread.start()
+        # import threading
+        # self.ffn_queue = SimpleFFNQueue(
+        #     model_runner=self.model_runner,
+        #     model_config=self.model_config,
+        #     local_rank=self.local_rank
+        # ) 
+        # """主线程主循环"""
+        # print("[主系统] 开始运行")
+        
+        # try:
+        #     # 主循环
+        #     while self.ffn_queue.running:
+        #         # 1. 接收FFN数据（这会阻塞直到有数据）
+        #         self.ffn_queue.receive_in_main_thread()
+                
+        #         # 2. 这里可以添加其他需要执行的任务
+        #         # 注意：因为receive_in_main_thread是阻塞的，
+        #         # 所以其他任务会在每次接收完成后执行
+                
+        #         # 例如：
+        #         # self.do_other_task()
+                
+        # except KeyboardInterrupt:
+        #     print("[主系统] 收到中断")
+        # finally:
+        #     # 清理
+        #     self.ffn_queue.stop()
+        device = torch.device(f"npu:{self.local_rank}")
+        NPUPlatform.set_device(device)
+        cnt = 0
+        while True:
+            # 计算源rank
+            rank = self.model_runner.connector.process_group.rank_in_group
+            world_size = self.model_runner.connector.process_group.world_size
+            src = (rank - 1) % world_size
+            print(f"[主线程] 等待接收...",flush=True)
+            # 阻塞接收
+            is_ubatch = self.model_runner.connector.process_group.recv_object(src)
+            print(f"is_ubatch in start_ffn_server_loop is {is_ubatch},self.local_rank is {self.local_rank}",flush=True)
+            # mock forward 1,prefill -- eager ,decode -- replay
+            # if cnt == 0:
+            #     cnt+=1
+            #     # prefill
+            # ffn 全走eager
+            self.model_runner._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE,is_ubatch=is_ubatch)
+            # self.model_runner.execute_model(scheduler_output=None, is_ubatch=is_ubatch)
+            
         logger.info("FFN server loop started in worker")
 
     def stop_ffn_server_loop(self) -> None:
@@ -507,3 +531,103 @@ class NPUWorker(WorkerBase):
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
+
+import threading
+import time
+from queue import Queue
+
+class SimpleFFNQueue:
+    """简单的FFN队列系统"""
+    
+    def __init__(self, model_runner, model_config, local_rank):
+        self.model_runner = model_runner
+        self.model_config = model_config
+        self.local_rank = local_rank
+        
+        # 创建一个队列
+        self.queue = Queue(maxsize=100)
+        
+        # 控制标志
+        self.running = True
+        
+        # 启动处理线程
+        self._start_processor()
+    
+    def _start_processor(self):
+        """启动处理线程"""
+        def processor():
+            # 在线程中设置NPU设备
+            device = torch.device(f"npu:{self.local_rank}")
+            NPUPlatform.set_device(device)
+            
+            print("[FFN处理器] 启动")
+            
+            while self.running:
+                try:
+                    # 从队列获取数据，最多等待1秒
+                    item = self.queue.get(timeout=1.0)
+                    
+                    if item is None:  # 停止信号
+                        break
+                    
+                    is_ubatch = item
+                    print(f"[FFN处理器] 处理 is_ubatch={is_ubatch}")
+                    
+                    # 执行FFN计算
+                    self.model_runner.execute_model(scheduler_output=None, is_ubatch=is_ubatch)
+                    
+                    # 标记任务完成
+                    self.queue.task_done()
+                    
+                except Exception as e:
+                    # 队列为空，继续等待
+                    if "empty" not in str(e).lower():
+                        print(f"[FFN处理器] 错误: {e}")
+                    continue
+        
+        self.processor_thread = threading.Thread(target=processor, daemon=True)
+        self.processor_thread.start()
+    
+    def receive_in_main_thread(self):
+        """主线程调用：接收数据并放入队列"""
+        if not self.running:
+            return False
+        
+        try:
+            # 计算源rank
+            rank = self.model_runner.connector.process_group.rank_in_group
+            world_size = self.model_runner.connector.process_group.world_size
+            src = (rank - 1) % world_size
+            
+            print(f"[主线程] 等待接收...")
+            
+            # 阻塞接收
+            is_ubatch = self.model_runner.connector.process_group.recv_object(src)
+            print(f"[主线程] 收到 is_ubatch={is_ubatch}")
+            
+            # 放入队列
+            self.queue.put(is_ubatch)
+            
+            # 打印队列状态
+            print(f"[队列状态] 大小: {self.queue.qsize()}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[主线程] 接收错误: {e}")
+            return False
+    
+    def stop(self):
+        """停止系统"""
+        print("[FFN队列] 停止...")
+        self.running = False
+        
+        # 发送停止信号
+        self.queue.put(None)
+        
+        # 等待处理完成
+        self.queue.join()
+        
+        # 等待线程结束
+        self.processor_thread.join(timeout=2.0)
+        print("[FFN队列] 已停止")

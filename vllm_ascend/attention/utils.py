@@ -1,10 +1,12 @@
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, List, Optional
+
 
 import torch
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           is_v1_kv_transfer_group)
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.worker.ubatch_utils import UBatchSlice, UBatchSlices
 
@@ -156,7 +158,8 @@ def slice_query_start_locs(
 
 def _make_metadata_with_slice(
         ubatch_slice: UBatchSlice,
-        attn_metadata: AscendCommonAttentionMetadata) -> AscendCommonAttentionMetadata:
+        attn_metadata: AscendCommonAttentionMetadata,
+        aclgraph_runtime_mode: Optional[CUDAGraphMode] = None) -> AscendCommonAttentionMetadata:
     """
     This function creates a new AscendCommonAttentionMetadata that corresponds to
     the requests included in ubatch_slice
@@ -167,13 +170,13 @@ def _make_metadata_with_slice(
 
     request_slice = ubatch_slice.request_slice
     token_slice = ubatch_slice.token_slice
-
+    # TODO(yxj):attn_metadata.query_start_loc_cpu 需要重新初始化
     start_locs = attn_metadata.query_start_loc_cpu
     first_req = request_slice.start
     first_tok = token_slice.start
     last_req = request_slice.stop - 1
     last_tok = token_slice.stop - 1
-
+    
     assert start_locs[first_req] <= first_tok < start_locs[first_req + 1], \
         "Token slice start outside of first request"
     assert start_locs[last_req] <= last_tok < start_locs[last_req+1], \
@@ -286,6 +289,7 @@ def _make_metadata_with_slice(
 def split_attn_metadata(
     ubatch_slices: list[UBatchSlice],
     common_attn_metadata: AscendCommonAttentionMetadata,
+    aclgraph_runtime_mode: Optional[CUDAGraphMode] = None
 ) -> list[AscendCommonAttentionMetadata]:
     """
     Creates a new AscendCommonAttentionMetadata instance that corresponds to the
@@ -295,6 +299,6 @@ def split_attn_metadata(
     results = []
     for ubatch_slice in ubatch_slices:
         results.append(
-            _make_metadata_with_slice(ubatch_slice, common_attn_metadata))
+            _make_metadata_with_slice(ubatch_slice, common_attn_metadata,aclgraph_runtime_mode))
 
     return results

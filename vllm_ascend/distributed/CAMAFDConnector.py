@@ -81,14 +81,14 @@ class CAMAFDConnector(AFDConnectorBase):
         # TODO(jcz) : 这里要根据实际的num_of_stages创建，需要改成list
         self.afd_pg = init_afd_process_group(
             backend="hccl",
-            init_method=f"tcp://127.0.0.1:29509",
+            init_method=f"tcp://127.0.0.1:29777",
             world_size=self.ffn_size + self.attn_size,
             rank=self.rank,
             group_name="afd"
         )
         self.afd_pg2 = init_afd_process_group(
             backend="hccl",
-            init_method=f"tcp://127.0.0.1:29509",
+            init_method=f"tcp://127.0.0.1:29777",
             world_size=self.ffn_size + self.attn_size,
             rank=self.rank,
             group_name="afd2"
