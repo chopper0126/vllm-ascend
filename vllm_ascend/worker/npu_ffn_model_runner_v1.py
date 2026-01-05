@@ -30,6 +30,7 @@ from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
 from vllm.v1.worker.gpu_ffn_model_runner import GPUFFNModelRunner
 from vllm.platforms import current_platform
 import vllm.envs as envs_vllm
+from vllm.v1.worker.ubatch_splitting import check_ubatch_thresholds
 
 
 if TYPE_CHECKING:
@@ -146,21 +147,21 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             
             if self.use_aclgraph and not is_ubatch:
                 # mock
-                self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE,is_ubatch=is_ubatch)
+                # self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE,is_ubatch=is_ubatch)
                 # self._dummy_run(num_tokens,
                 #                 aclgraph_runtime_mode=CUDAGraphMode.NONE,
                 #                 force_attention=force_attention,
                 #                 uniform_decode=uniform_decode,
                 #                 is_ubatch=is_ubatch)
-                # # TODO(yxj):ffn图模式会直接replay，应该设计成ffn收到attn消息才开始replay
+                # TODO(yxj):ffn图模式会直接replay，应该设计成ffn收到attn消息才开始replay
                 # replay
-                # if self.connector_name == "camconnector":
-                #     max_num_tokens = self.max_num_tokens * self.attn_size * (self.n_routed_experts // self.ffn_size) * (self.attn_size // self.ffn_size)
-                # else:
-                #     max_num_tokens = self.max_num_tokens * self.topk * self.attn_size
-                # acl_graph_info = self._acl_graphs_full.get(max_num_tokens)
-                # graph = acl_graph_info['graph']
-                # graph.replay()
+                if self.connector_name == "camconnector":
+                    max_num_tokens = self.max_num_tokens * self.attn_size * (self.n_routed_experts // self.ffn_size) * (self.attn_size // self.ffn_size)
+                else:
+                    max_num_tokens = self.max_num_tokens * self.topk * self.attn_size
+                acl_graph_info = self._acl_graphs_full.get(max_num_tokens)
+                graph = acl_graph_info['graph']
+                graph.replay()
                 self.replay_cnt += 1
                 print(f"ffn replay,replay_cnt is {self.replay_cnt}",flush=True)
                 return
@@ -175,7 +176,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 graph = acl_graph_info['graph']
                 graph.replay()
                 self.replay_cnt += 1
-                print(f"ffn replay,replay_cnt is {self.replay_cnt}",flush=True)
+                print(f"ffn ubatch replay,replay_cnt is {self.replay_cnt}",flush=True)
                 return
                 
             if self.connector_name == "m2nconnector":
@@ -502,18 +503,38 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     aclgraph_runtime_mode.name))
         for num_tokens in compilation_cases:
             # Warm up the operations for this specific layer
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
-                force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
+            # We currently only capture ubatched graphs when its a FULL
+            # cudagraph and for uniform decode batches.
+            allow_microbatching = self.vllm_config.parallel_config.enable_dbo \
+                and aclgraph_runtime_mode == CUDAGraphMode.FULL \
+                and uniform_decode \
+                and check_ubatch_thresholds(
+                config=self.vllm_config.parallel_config,
+                num_tokens=num_tokens,
+                uniform_decode=uniform_decode,
+            )
+
+            # Currently we capture both microbatched and non-microbatched
+            # graphs when capture_ubatched_graph is True, this is because
+            # occasionally we will be forced out of microbatching due to other
+            # DP ranks not microbatching (usually caused by an empty second
+            # microbatch; once we resolve this, we can remove the
+            # non-microbatched graph capture).
+            allow_microbatching_list = [True,False] if allow_microbatching else [False]
+            for am in allow_microbatching_list:
+                print(f'is_ubatch in _capture_aclgraphs is {is_ubatch}')
+                for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+                    force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
+                    self._dummy_run(num_tokens,
+                                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                                    force_attention=force_attention,
+                                    uniform_decode=uniform_decode,
+                                    is_ubatch=am)
                 self._dummy_run(num_tokens,
-                                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                                aclgraph_runtime_mode=CUDAGraphMode.FULL,
                                 force_attention=force_attention,
                                 uniform_decode=uniform_decode,
-                                is_ubatch=is_ubatch)
-            self._dummy_run(num_tokens,
-                            aclgraph_runtime_mode=CUDAGraphMode.FULL,
-                            force_attention=force_attention,
-                            uniform_decode=uniform_decode,
-                            is_ubatch=is_ubatch)
+                                is_ubatch=am)
     
     def _dummy_run(self, 
                    num_tokens: int = 1, 

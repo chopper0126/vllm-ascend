@@ -363,12 +363,15 @@ class UBatchWrapper:
                 assert batch_descriptor is not None
                 if batch_descriptor.num_tokens in self.aclgraphs:
                     aclgraph_runtime_mode = CUDAGraphMode.NONE
+                print(f"yxj __call__ case1 ubatch_slices is {ubatch_slices} aclgraph_runtime_mode:{aclgraph_runtime_mode}")
 
             if aclgraph_runtime_mode in (CUDAGraphMode.NONE,
                                           CUDAGraphMode.PIECEWISE):
+                print(f"yxj __call__ case2 ubatch_slices is {ubatch_slices} aclgraph_runtime_mode:{aclgraph_runtime_mode}")
                 return self.runnable(*args, **kwargs)
             else:
                 assert self.aclgraph_wrapper is not None
+                print(f"yxj __call__ case3 ubatch_slices is {ubatch_slices} aclgraph_runtime_mode:{aclgraph_runtime_mode}")
                 return self.aclgraph_wrapper(*args, **kwargs)
 
         attn_metadata = forward_context.attn_metadata

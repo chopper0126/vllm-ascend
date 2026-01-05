@@ -101,7 +101,7 @@ class ACLGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
-
+        print(f"yxj ACLGraphWrapper __call__ case1  aclgraph_runtime_mode:{aclgraph_runtime_mode}")
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or \
                             aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
@@ -110,6 +110,7 @@ class ACLGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
+            print(f"yxj ACLGraphWrapper __call__ case2  aclgraph_runtime_mode:{aclgraph_runtime_mode}")
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
@@ -172,6 +173,7 @@ class ACLGraphWrapper:
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
             # manage the memory during acl graph capture
+            print(f"yxj ACLGraphWrapper __call__ case3  aclgraph_runtime_mode:{aclgraph_runtime_mode}")
             return output
 
         if self.is_debugging_mode:
@@ -183,7 +185,7 @@ class ACLGraphWrapper:
                 f"Input addresses for aclgraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
-
+        print(f"yxj ACLGraphWrapper __call__ case3  aclgraph_runtime_mode:{aclgraph_runtime_mode}")
         logger.info_once("Replaying aclgraph")
         print("Replay graphs")
         entry.aclgraph.replay()

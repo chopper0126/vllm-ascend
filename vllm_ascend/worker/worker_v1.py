@@ -227,7 +227,7 @@ class NPUWorker(WorkerBase):
                 self.model_runner._dummy_run(size, is_ubatch=True)
             print("finsh  ffn compile_or_warm_up_model  ")
             print("start to capture ffn capture_model")
-            self.model_runner.capture_model(is_ubatch=True)
+            self.model_runner.capture_model()
             # self.model_runner.initialize_afd_connector()
             print("finsh  capture ffn capture_model")
         if self.profiler:
