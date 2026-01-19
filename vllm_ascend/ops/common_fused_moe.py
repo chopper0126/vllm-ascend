@@ -151,64 +151,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             dynamic_eplb=self.dynamic_eplb)
 
 
-class AscendAFD(FusedMoE):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        num_experts = kwargs["num_experts"]
-        self.global_num_experts = num_experts
-        ascend_config = get_ascend_config()
-        self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
-        vllm_config = get_current_vllm_config()
-        if ascend_config.torchair_graph_config.enabled:
-            self.use_aclgraph = False
-        else:
-            self.use_aclgraph = (vllm_config.compilation_config.level
-                                 == CompilationLevel.PIECEWISE and
-                                 not vllm_config.model_config.enforce_eager)
-
-
-    def gating(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor):
-        assert self.quant_method is not None
-
-        # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
-        quantized_x_for_share, dynamic_scale_for_share = None, None
-
-        forward_context = get_forward_context()
-
-        # Load balancing for token distribution among experts in dummy_run
-        # TODO: The community only considers load balancing when DP > 1.
-        # This approach may overlook some extreme scenarios.
-        enable_force_load_balance = forward_context.in_profile_run
-
-        # hidden_states, router_logits = forward_context.moe_comm_method.prepare(
-        #     hidden_states=hidden_states,
-        #     router_logits=router_logits,
-        #     replace_allreduce=forward_context.sp_enabled,
-        #     enable_shared_expert_dp=self.enable_shared_expert_dp)
-        
-        # topk
-        topk_weights, topk_ids, row_idx = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias,
-            global_num_experts=self.global_num_experts)
-
-        topk_weights = topk_weights.to(hidden_states.dtype)
-        # this is a naive implementation for experts load balance so as
-        # to avoid accumulating too much tokens on a single rank.
-        # currently it is only activated when doing profile runs.
-        if enable_force_load_balance and not self.use_aclgraph:
-            topk_ids = torch.randint_like(topk_ids, 0, self.global_num_experts)
-        return topk_weights, topk_ids, row_idx
 
 
 class AscendFusedMoE(FusedMoE):
@@ -360,6 +302,56 @@ class AscendFusedMoE(FusedMoE):
 
         return final_hidden_states
 
+    
+    def afd_m2n_ffn_compute(
+            self, 
+            layer: torch.nn.Module,
+            hidden_states: torch.Tensor, 
+            router_logits:  Optional[torch.Tensor] = None,
+            group_list:  Optional[torch.Tensor] = None,
+            dynamic_scale:  Optional[torch.Tensor] = None,
+            topk_weights: Optional[torch.Tensor] = None,
+            topk_ids: Optional[torch.Tensor] = None,
+            row_idx: Optional[torch.Tensor] = None,
+            x_active_mask:Optional[torch.Tensor] = None,
+            connector_name: Optional[str] = "",
+            cam_p2p_ep_name: Optional[str] = "",
+        ):
+        """
+        To support m2n\cam connector to compute ffn
+        """
+        # print(f'yxj hidden_states in afd_m2n_ffn_compute shape is {hidden_states.shape}')
+        # print(f'yxj group_list in afd_m2n_ffn_compute shape is {group_list.shape}')
+        use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias = \
+            self._detect_quantization_and_get_params(layer)
+
+        
+        #TODO(gr):support without share expert for camp2p
+        
+        from vllm_ascend.ops.moe.moe_mlp import unified_apply_mlp
+        if connector_name == "m2nconnector":
+            group_list_type = 0
+        else:
+            group_list_type = 1
+        
+        permuted_hidden_states, expert_tokens = hidden_states, group_list
+        
+        mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
+                                    w1=layer.w13_weight,
+                                    w1_scale=w1_scale,
+                                    w2=layer.w2_weight,
+                                    w2_scale=w2_scale,
+                                    group_list=expert_tokens,
+                                    dynamic_scale=dynamic_scale,
+                                    group_list_type=group_list_type,
+                                    w1_scale_bias=w1_scale_bias,
+                                    w2_scale_bias=w2_scale_bias,
+                                    with_quant=use_int4_w4a8 or use_int8_w8a8,
+                                    fusion=False,
+                                    need_trans=False)
+        
+        return mlp_output
+    
     def maybe_all_reduce_tensor_model_parallel(
             self, final_hidden_states: torch.Tensor):
         """NOTE(Yizhou): This is to override the parent class method. In `mc2commimpl`,
@@ -688,8 +680,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             self._detect_quantization_and_get_params(layer)
         #TODO(yxj):move to p2p
         # hidden_states是dispatch之后的，shape第一维是group_list[-1],self.max_num_token*8*2
-        shared_out = self._shared_experts(hidden_states)
-
+        # shared_out = self._shared_experts(hidden_states)
+        shared_out = torch.zeros_like(hidden_states)
         if connector_name == "camp2pconnector" :
             w1 = layer.w13_weight.to(torch.int8)
             w2 = layer.w2_weight.to(torch.int8)
@@ -732,7 +724,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                                     w1_scale_bias=w1_scale_bias,
                                     w2_scale_bias=w2_scale_bias,
                                     with_quant=use_int4_w4a8 or use_int8_w8a8,
-                                    fusion=False,
+                                    fusion=True,
                                     need_trans=False)
         
         return shared_out,mlp_output

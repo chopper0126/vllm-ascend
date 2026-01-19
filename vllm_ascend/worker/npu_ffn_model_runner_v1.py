@@ -79,7 +79,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.connector.init_afd_connector()
         self.attn_size = self.connector.attn_size
         self.ffn_size = self.connector.ffn_size
-        print(f'attn_size = {self.attn_size},ffn_size = {self.ffn_size}')
+        logger.info(f'attn_size = {self.attn_size},ffn_size = {self.ffn_size}')
         if getattr(self.model_config.hf_config, "text_config",
                    None) is not None:
             self.num_layers = (
@@ -91,28 +91,29 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.topk = self.model_config.hf_config.num_experts_per_tok
         self.n_routed_experts = self.model_config.hf_config.n_routed_experts
         self.hidden_size = self.model_config.hf_config.hidden_size
-        print(f'self.topk is {self.topk}')
+        logger.info(f'self.topk is {self.topk}')
         self.decode_max_num_token = self.scheduler_config.max_num_seqs * \
                         self.uniform_decode_query_len
 
         # self.profiler
-        # import os
-        # experimental_config = torch_npu.profiler._ExperimentalConfig(
-        #     export_type=torch_npu.profiler.ExportType.Text,
-        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        # )
-        # self.prof = torch_npu.profiler.profile(
-        #     activities=[
-        #         torch_npu.profiler.ProfilerActivity.CPU,
-        #         torch_npu.profiler.ProfilerActivity.NPU
-        #     ],
-        #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=20, repeat=1, skip_first=120),
-        #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
-        #     experimental_config=experimental_config,
-        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof_ffn")
-        # )
-        # self.prof.start()
+        import os
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        )
+        self.prof = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+            ],
+            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=60, repeat=1, skip_first=160),
+            record_shapes=True,#算子的InputShapes和InputTypes
+            # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof_ffn")
+        )
+        self.prof.start()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -150,7 +151,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 self.replay_cnt += 1
                 print(f"ffn replay,replay_cnt is {self.replay_cnt}", flush=True)
             else:
-                print(f"ffn_forward,is_ubatch is {is_ubatch}", flush=True)
+                logger.info(f"ffn_forward,is_ubatch is {is_ubatch}", flush=True)
                 self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch) 
             
         except Exception as e:
@@ -193,7 +194,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
 
         # Replay the captured graph
         graph.replay()
-        print("FFN Replay graphs")
+        logger.info("FFN Replay graphs")
         # Return only the actual output (without padding)
         return output_tensor[:actual_tokens].clone()
         
@@ -292,7 +293,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                    **kwargs):
         
         is_ubatch = self.connector.recv_is_ubatch()
-        print(f'yxj is_ubatch in _dummy_run is {is_ubatch}')
+        logger.info(f'yxj is_ubatch in _dummy_run is {is_ubatch}')
         
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
@@ -321,7 +322,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 output = self._ffn_forward(batch_descriptor=batch_descriptor,
                                   aclgraph_runtime_mode=aclgraph_runtime_mode,
                                   is_ubatch=is_ubatch)
-            print(f'output shape is {output.shape}')
+            logger.info(f'output shape is {output.shape}')
             # Store the captured graph with token count as key
             if is_ubatch:
                 self._acl_graphs_ubatch_full[output.shape[0]] = {
@@ -329,20 +330,20 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     'input_hidden_states': output,
                     'output': output
                 }
-                print(f'self._acl_graphs_ubatch_full is {self._acl_graphs_ubatch_full}',flush=True)
+                logger.info(f'self._acl_graphs_ubatch_full is {self._acl_graphs_ubatch_full}',flush=True)
             else:
                 self._acl_graphs_full[output.shape[0]] = {
                     'graph': aclgraph,
                     'input_hidden_states': output,
                     'output': output
                 }
-                print(f'self._acl_graphs_full is {self._acl_graphs_full}',flush=True)
+                logger.info(f'self._acl_graphs_full is {self._acl_graphs_full}',flush=True)
         else:
             self._ffn_forward(batch_descriptor=batch_descriptor,
                                   aclgraph_runtime_mode=aclgraph_runtime_mode,
                                   is_ubatch=is_ubatch) 
-            print("finsh capture warm_up or prefile run",flush=True)
-        print(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
+            logger.info("finsh capture warm_up or prefile run",flush=True)
+        logger.info(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
         self.dummy_run_call_cnt += 1
 
     def _build_and_recv_m2n_afdconnector(
@@ -456,7 +457,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 # send
                 if self.connector_name == "m2nconnector":
                     self.connector.send_ffn_output(rank_ffn_output, m2n_afdconnector_data)
-                    print(f'send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}',flush=True)
+                    logger.info(f'send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}',flush=True)
                 elif self.connector_name == "camm2nconnector":
                     handle = [simulateExpertIds, simulateExpertScales, expandIdx, epRecvCounts, attenBatchSize]
                     cam_afdconnector_data.handle = handle
@@ -465,7 +466,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     handle = [attenBatchSize]
                     cam_afdconnector_data.handle = handle
                     self.connector.send_ffn_output(rank_ffn_output, cam_afdconnector_data)
-                    print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}',flush=True)
+                    logger.info(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}',flush=True)
         return rank_ffn_output
   
     def _run_ffn_computation(self,

@@ -65,7 +65,7 @@ from vllm_ascend.models.layers.mla import AscendMLAModules
 from vllm_ascend.models.layers.sfa import (AscendSFAModules,
                                            AscendSparseFlashAttention, Indexer)
 from typing import Any, Optional, Union
-from vllm_ascend.ops.common_fused_moe import AscendFusedMoE, AscendAFD
+from vllm_ascend.ops.common_fused_moe import AscendFusedMoE
 from vllm.distributed.afd_transfer.afd_connector.metadata import M2NAFDConnectorMetadata
 
 class CustomDeepseekV2RowParallelLinear(RowParallelLinear):
@@ -464,6 +464,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.tp_rank = get_tp_group().rank_in_group
         ascend_config = get_ascend_config()
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.topk = config.num_experts_per_tok
         if self.role is None or self.role == "attention" or self.is_mtp_layer:
             # TODO: enable mla in vllm-ascend
             if model_config.use_mla:
@@ -571,25 +572,6 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                                         self.n_local_physical_experts)
 
             self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
-            # self.afd_gating = AscendAFD(
-            #     num_experts=config.n_routed_experts,
-            #     top_k=config.num_experts_per_tok,
-            #     hidden_size=config.hidden_size,
-            #     intermediate_size=config.moe_intermediate_size,
-            #     reduce_results=False,
-            #     renormalize=config.norm_topk_prob,
-            #     quant_config=quant_config,
-            #     use_grouped_topk=True,
-            #     num_expert_group=config.n_group,
-            #     topk_group=config.topk_group,
-            #     # prefix=f"{prefix}.experts",
-            #     scoring_func=config.scoring_func,
-            #     # we do scaling outside, set factor to 1.0 to avoid double mul
-            #     routed_scaling_factor=1.0,
-            #     e_score_correction_bias=self.gate.e_score_correction_bias,
-            #     enable_eplb=self.enable_eplb,
-            #     num_redundant_experts=self.n_redundant_experts,
-            #     is_sequence_parallel=self.is_sequence_parallel,)
         
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
