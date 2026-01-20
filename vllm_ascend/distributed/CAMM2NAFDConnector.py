@@ -51,6 +51,7 @@ class CAMM2NAFDConnector(AFDConnectorBase):
         self.ffn_size = 0
         self.use_aclgraph = self._use_aclgraph()
         self.dst_list = []
+        self.quant_mode = 0
         print(f'self.use_aclgraph in CAMM2NAFDConnector is {self.use_aclgraph}')
 
     def _use_aclgraph(self) -> bool:
@@ -104,7 +105,8 @@ class CAMM2NAFDConnector(AFDConnectorBase):
         self.hccl_comm_name2 = self.afd_pg2._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
         ffn_ranks = [i for i in range(0, self.ffn_size)]
         attn_ranks = [i for i in range(self.ffn_size, self.ffn_size + self.attn_size)]
-
+        self.quant_mode = self.config.afd_config.quant_mode
+        print(f"self.quant_mode is {self.quant_mode}")
         # 所有FFN和前min_size的Attention参与p2p通信
         # 所有FFN: world_rank in [0, ffn_size), 前min_size个Attention: world_rank in [ffn_size, ffn_size+min_size)
         import datetime
@@ -166,7 +168,8 @@ class CAMM2NAFDConnector(AFDConnectorBase):
                                                 self.hf_config.n_routed_experts,
                                                 self.max_num_reqs,
                                                 self.hf_config.hidden_size,
-                                                self.hf_config.num_experts_per_tok)
+                                                self.hf_config.num_experts_per_tok,
+                                                self.quant_mode)
 
     # MOE发给ATTN（ATTN接收）
     def recv_ffn_output(self, hidden_states: torch.Tensor, metadata: AFDConnectorMetadata, ubatch_idx: int = 0) -> torch.Tensor:
@@ -212,7 +215,7 @@ class CAMM2NAFDConnector(AFDConnectorBase):
         k = metadata.k
         moe_expert_num = metadata.moe_expert_num
         shared_expert_num = metadata.shared_expert_num
-        quant_mode = metadata.quant_mode
+        quant_mode = self.quant_mode
         aiv_num = metadata.aiv_num
         expandXOutDType = torch.tensor([], dtype=torch.bfloat16 if not quant_mode else torch.int8, device='npu')
 
@@ -278,7 +281,8 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                               moe_expert_num:int,
                               batch_size:int,
                               h:int,
-                              k:int) -> torch.Tensor:
+                              k:int,
+                              quant_mode:int) -> torch.Tensor:
     ubatch_idx = get_forward_context().ubatch_idx
     if get_forward_context().cam_afdconnector_data is None:
         cam_afdconnector_data = CAMM2NAFDConnectorMetadata(
@@ -286,7 +290,7 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                     shared_expert_num = 0,
                     scale = None,
                     handle = None,
-                    quant_mode = 1,
+                    quant_mode = quant_mode,
                     aiv_num = 48,
                     batch_size = batch_size,
                     h = h,

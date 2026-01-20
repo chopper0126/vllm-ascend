@@ -410,8 +410,6 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     )
                     output1, afdConnectorMetadata = self.connector.recv_attn_output(cam_afdconnector_data, ubatch_idx)
                     hidden_states, dynamic_scales, expandIdx, expertTokenNums, epRecvCounts, simulateExpertIds, simulateExpertScales, attenBatchSize = output1[0:8]
-                    logger.debug(f'yxj dynamic_scales in _ffn_forward is {dynamic_scales}')
-                    logger.debug(f'yxj dynamic_scales shape in _ffn_forward is {dynamic_scales.shape}')
                     group_list = expertTokenNums.to(torch.int64)
                     topk_weights = simulateExpertScales
                 elif self.connector_name == "camp2pconnector":
@@ -453,7 +451,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                                                             layer_idx=layer_idx,
                                                             capture_mode=True,
                                                             group_list=group_list,
-                                                            dynamic_scales=dynamic_scales,
+                                                            dynamic_scales=dynamic_scales if self.connector.quant_mode == 1 else None,
                                                             topk_weights=topk_weights
                                                     )
                 # send
