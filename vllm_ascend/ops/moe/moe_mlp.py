@@ -75,8 +75,6 @@ def quant_apply_mlp(hidden_states: torch.Tensor,
         dispose_tensor(unquantized_hidden_states)
     else:
         pertoken_scale = dynamic_scale
-        print(f'yxj dynamic_scales in quant_apply_mlp is {dynamic_scales}')
-        print(f'yxj dynamic_scales shape in quant_apply_mlp is {dynamic_scales.shape}')
 
     bias1, bias2 = None, None
     _output_dtype = w2_scale.dtype
