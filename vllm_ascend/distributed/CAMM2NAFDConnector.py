@@ -113,7 +113,7 @@ class CAMM2NAFDConnector(AFDConnectorBase):
         timeout = datetime.timedelta(seconds=30000)
         if self.is_vaild_rank_for_inequal_AF(self.rank):
             self.p2p_pg = init_afd_process_group(
-                backend="hccl",
+                backend="gloo",
                 init_method=(
                     f"tcp://{self.config.afd_config.afd_host}"
                     f":{self.config.afd_config.afd_port}"
@@ -239,36 +239,28 @@ class CAMM2NAFDConnector(AFDConnectorBase):
         # Only support ffn rank < attn rank
         return (rank >= self.ffn_size and rank < self.ffn_size + self.min_size)
     
-    def send_is_ubatch(self, data):  
+    def send_is_ubatch(self, data: bool):
+        """Send a boolean value to all target nodes"""
+        # Directly convert the boolean value to a single-byte tensor
+        # Using int8 instead of bool for compatibility, as some communication libraries
+        # may have inconsistent support for bool type
+        bool_tensor = torch.tensor([data], dtype=torch.int8, device="cpu")
+        
         for dst in self.dst_list:
-            object_bytes = pickle.dumps(data)
-            object_tensor_cpu = torch.frombuffer(bytearray(object_bytes), dtype=torch.uint8)
-            
-            object_tensor_npu = torch.empty(object_tensor_cpu.shape, 
-                                            dtype=torch.uint8, 
-                                            device="npu")
-            object_tensor_npu.copy_(object_tensor_cpu)
-            
-            size_tensor = torch.tensor([object_tensor_cpu.numel()],
-                                        dtype=torch.long,
-                                        device="npu")
-            
-            torch.distributed.send(size_tensor, dst=dst, group=self.p2p_pg)
-            torch.distributed.send(object_tensor_npu, dst=dst, group=self.p2p_pg)
-            
-    def recv_is_ubatch(self):        
+            torch.distributed.send(bool_tensor, dst=dst, group=self.p2p_pg)
+
+    def recv_is_ubatch(self) -> bool:
+        """Receive a boolean value from the source node"""
         src = self.p2p_rank % self.min_size + self.ffn_size
         
-        size_tensor = torch.empty(1, dtype=torch.long, device="npu")
-        rank_size = torch.distributed.recv(size_tensor, src=src, group=self.p2p_pg)  
-        object_tensor_npu = torch.empty(size_tensor.item(), dtype=torch.uint8, device="npu")
-        rank_object = torch.distributed.recv(object_tensor_npu, src=src, group=self.p2p_pg)
+        # Prepare to receive a single byte of data
+        bool_tensor = torch.empty(1, dtype=torch.int8, device="cpu")
         
-        assert rank_object == rank_size, "Received object sender rank does not match the size sender rank."
+        # Receive data (only one communication operation)
+        torch.distributed.recv(bool_tensor, src=src, group=self.p2p_pg)
         
-        object_tensor_cpu = object_tensor_npu.cpu()
-        data = pickle.loads(object_tensor_cpu.numpy().tobytes())
-        return data    
+        # Convert to Python boolean value and return
+        return bool(bool_tensor.item())
 
 def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                               topk_weights: torch.Tensor,
@@ -337,7 +329,8 @@ def cam_send_attn_output_fake_impl(hidden_states: torch.Tensor,
                                     moe_expert_num:int,
                                     batch_size:int,
                                     h:int,
-                                    k:int) -> torch.Tensor:
+                                    k:int,
+                                    quant_mode:int) -> torch.Tensor:
     return hidden_states
 
 def cam_recv_ffn_output_impl(hidden_states: torch.Tensor,
