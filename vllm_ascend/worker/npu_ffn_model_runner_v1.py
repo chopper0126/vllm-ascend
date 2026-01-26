@@ -107,7 +107,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU
             ],
-            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=60, repeat=1, skip_first=160),
+            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=100, repeat=1, skip_first=160),
             record_shapes=True,#算子的InputShapes和InputTypes
             # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
             experimental_config=experimental_config,
@@ -136,7 +136,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             if self.use_aclgraph and not is_ubatch:
                 # TODO(yxj):use _acl_graphs_full replay
                 self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch)
-                print(f"is_ubatch is false eager",flush=True)
+                logger.info_once(f"is_ubatch is false eager")
             elif self.use_aclgraph and is_ubatch:
                 # TODO(yxj):ffn图模式会直接replay，应该设计成ffn收到attn消息才开始replay
                 # replay
@@ -149,9 +149,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 graph = acl_graph_info['graph']
                 graph.replay()
                 self.replay_cnt += 1
-                print(f"ffn replay,replay_cnt is {self.replay_cnt}", flush=True)
+                logger.info_once(f"ffn replay,replay_cnt is {self.replay_cnt}")
             else:
-                logger.info(f"ffn_forward,is_ubatch is {is_ubatch}", flush=True)
+                logger.info_once(f"ffn_forward,is_ubatch is {is_ubatch}")
                 self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch) 
             
         except Exception as e:

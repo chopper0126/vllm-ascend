@@ -396,7 +396,7 @@ class UBatchWrapper:
             and aclgraph_runtime_mode is CUDAGraphMode.FULL:
             aclgraph_metadata = self.aclgraphs[num_tokens]
             aclgraph_metadata.aclgraph.replay()
-            print("UBatchWrapper replay")
+            logger.info_once("UBatchWrapper replay")
             return aclgraph_metadata.outputs
         else:
             ubatch_metadata = self._make_ubatch_metadata(

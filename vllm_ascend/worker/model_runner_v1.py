@@ -1970,7 +1970,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             scheduler_output: "SchedulerOutput",
             intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
-        # self.prof.step()
+        self.prof.step()
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
