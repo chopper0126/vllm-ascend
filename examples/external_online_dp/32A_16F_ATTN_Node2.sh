@@ -76,6 +76,9 @@
        --gpu-memory-utilization 0.90  \
        --quantization ascend \
        --no-enable-prefix-caching \
+       --enable-dbo \
+       --dbo-prefill-token-threshold 12 \
+       --dbo-decode-token-threshold 2 \
        --additional-config '{"multistream_overlap_shared_expert": false}' \
        --kv-transfer-config \
        '{"kv_connector": "SharedStorageConnector",
