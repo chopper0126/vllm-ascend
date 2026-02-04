@@ -689,7 +689,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             self._detect_quantization_and_get_params(layer)
         #TODO(yxj):move to p2p
         # hidden_states是dispatch之后的，shape第一维是group_list[-1],self.max_num_token*8*2
-        shared_out = self._shared_experts(hidden_states)
+        # shared_out = self._shared_experts(hidden_states)
+        shared_out = None
 
         if connector_name == "camp2pconnector" :
             w1 = layer.w13_weight.to(torch.int8)

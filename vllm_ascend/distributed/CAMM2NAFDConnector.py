@@ -372,7 +372,7 @@ class CAMM2NAFDConnector(AFDConnectorBase):
             shared_expert_num = 0,
             scale = None,
             handle = None,
-            quant_mode = 0,
+            quant_mode = 0,# TODO(yxj):use self.quant_mode
             aiv_num = self.aiv_num,
             batch_size = max_num_tokens,
             h = hf_config.hidden_size,

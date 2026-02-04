@@ -93,25 +93,26 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         print(f'self.topk is {self.topk}')
         self.decode_max_num_token = self.scheduler_config.max_num_seqs * \
                         self.uniform_decode_query_len
-
+        #TODO(yxj):to support afd add mc2
+        self.mc2_tokens_capacity = 512
         # self.profiler
-        # import os
-        # experimental_config = torch_npu.profiler._ExperimentalConfig(
-        #     export_type=torch_npu.profiler.ExportType.Text,
-        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        # )
-        # self.prof = torch_npu.profiler.profile(
-        #     activities=[
-        #         torch_npu.profiler.ProfilerActivity.CPU,
-        #         torch_npu.profiler.ProfilerActivity.NPU
-        #     ],
-        #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=20, repeat=1, skip_first=120),
-        #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
-        #     experimental_config=experimental_config,
-        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof_ffn")
-        # )
-        # self.prof.start()
+        import os
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        )
+        self.prof = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+            ],
+            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=60, repeat=1, skip_first=160),
+            # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof_ffn")
+        )
+        self.prof.start()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -134,7 +135,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             if self.use_aclgraph and not is_ubatch:
                 # TODO(yxj):use _acl_graphs_full replay
                 self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch)
-                print(f"is_ubatch is false eager",flush=True)
+                logger.info(f"is_ubatch is false eager")
             elif self.use_aclgraph and is_ubatch:
                 # TODO(yxj):ffn图模式会直接replay，应该设计成ffn收到attn消息才开始replay
                 # replay
@@ -147,9 +148,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 graph = acl_graph_info['graph']
                 graph.replay()
                 self.replay_cnt += 1
-                print(f"ffn replay,replay_cnt is {self.replay_cnt}", flush=True)
+                logger.info(f"ffn replay,replay_cnt is {self.replay_cnt}")
             else:
-                print(f"ffn_forward,is_ubatch is {is_ubatch}", flush=True)
+                logger.info(f"ffn_forward,is_ubatch is {is_ubatch}")
                 self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch) 
             
         except Exception as e:
@@ -380,13 +381,13 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         for layer_idx in range(self.first_k_dense_replace,self.num_layers):
             for ubatch_idx in range(num_ubatches):
                 # recv
-                afd_connector_data = self.connector.create_recv_metadata(max_num_tokens=self.max_num_tokens)
+                afd_connector_data = self.connector.create_recv_metadata(max_num_tokens=self.decode_max_num_token)
                 recv_output = self.connector.recv_attn_output(metadata=afd_connector_data, ubatch_idx=ubatch_idx)
 
                 if hasattr(self.connector, "update_metadata") and afd_connector_data is not None:
                     self.connector.update_metadata(afd_connector_data, recv_output)
-                print(f'{self.connector_name} recv_attn_output success ,layer id is {layer_idx}, '
-                      f'ubatch_idx is {ubatch_idx}', flush=True)
+                logger.info(f'{self.connector_name} recv_attn_output success ,layer id is {layer_idx}, '
+                      f'ubatch_idx is {ubatch_idx}')
 
                 hidden_states = recv_output.hidden_states
                 dynamic_scales = recv_output.dynamic_scales
@@ -431,7 +432,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                         )
                 # send
                 self.connector.send_ffn_output(rank_ffn_output, afd_connector_data, ubatch_idx=ubatch_idx)
-                print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}', flush=True)
+                logger.info(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}')
         return rank_ffn_output
 
     def _run_ffn_computation(self,
