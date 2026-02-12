@@ -107,7 +107,6 @@ class UBatchWrapper:
 
         self.device = device
 
-    # TODO HXY 这里要重新写，npu当然没有sm这种东西，得改成aiv和aic，但不知道是啥，先注释掉再说
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
         comm_sms = envs.VLLM_DBO_COMM_SMS
@@ -168,6 +167,7 @@ class UBatchWrapper:
         def _capture_ubatch_thread(results, ubatch_metadata):
             torch.npu.set_device(self.device)
             ubatch_context = ubatch_metadata.context
+            ubatch_context.forward_context.capturing = True
             with ubatch_context:
                 model_output = model(
                     input_ids=ubatch_metadata.input_ids,
@@ -188,6 +188,7 @@ class UBatchWrapper:
 
         # Ubatches will manually manage the forward context, so we override
         # it to None here so we can have it restored correctly later
+        forward_context = get_forward_context()
         with override_forward_context(None):
             ubatch_threads = []
             for metadata in ubatch_metadata:
@@ -210,6 +211,7 @@ class UBatchWrapper:
                 set_graph_pool_id(self.graph_pool)
             else:
                 set_graph_pool_id(current_platform.graph_pool_handle())
+            forward_context.capturing = True
             with torch.npu.graph(aclgraph_metadata.aclgraph,
                                   stream=compute_stream,
                                   pool=self.graph_pool):
@@ -241,7 +243,6 @@ class UBatchWrapper:
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
         # after both threads have finished
-        # TODO HXY 这里强行override了才导致这边的里面要Get的时候拿不到正确的东西了
         with override_forward_context(None):
             ubatch_threads = []
             for metadata in ubatch_metadata:
@@ -336,7 +337,6 @@ class UBatchWrapper:
                 sliced_intermediate_tensors)
 
     def __call__(self, *args, **kwargs):
-        # TODO: 后续待修改成DBO多线程方式
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         ubatch_slices = forward_context.ubatch_slices
