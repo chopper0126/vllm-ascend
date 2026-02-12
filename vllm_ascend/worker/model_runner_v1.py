@@ -112,7 +112,8 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_att
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                set_graph_params,
                                                update_attn_params,
-                                               update_mla_attn_params)
+                                               update_mla_attn_params,
+                                               set_graph_params_dict)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import \
     D2DExpertWeightLoader
@@ -482,6 +483,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 get_world_group().rank,
                 get_world_group().local_rank, vllm_config)
             self.afd_connector.init_afd_connector()
+            self.num_stages = self.afd_config.num_afd_stages
+            self.is_ubatch = False
         else:
             self.afd_connector = None
         # kv role
@@ -565,7 +568,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         #         torch_npu.profiler.ProfilerActivity.CPU,
         #         torch_npu.profiler.ProfilerActivity.NPU
         #     ],
-        #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=20, repeat=1, skip_first=120),
+        #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=60, repeat=1, skip_first=120),
         #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
         #     experimental_config=experimental_config,
         #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof")
@@ -1361,7 +1364,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logger.debug(f'yxj self.afd_connector.rank in prepare input is {self.afd_connector.rank}')
             self.afd_connector.send_is_ubatch(is_ubatch)
         logger.debug(f'yxj send is_ubatch in prepare input is {is_ubatch}')
-
+        self.is_ubatch = is_ubatch
         self.seq_lens_np[:num_reqs] = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                 num_scheduled_tokens)
@@ -1634,8 +1637,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             if self.vllm_config.model_config.use_mla:
                 # FIXME: Try using `auto_dispatch_capture=True`
+                runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                 update_mla_attn_params(self.update_stream, forward_context,
-                                       positions.shape[0])
+                                       runtime_shape,self.is_ubatch)
             else:
                 update_attn_params(self.update_stream, forward_context,
                                    positions.shape[0])
@@ -2432,12 +2436,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         print(f'hidden_states.shape in _generate_dummy_run_hidden_states is {hidden_states.shape}',flush=True)
         forward_context = get_forward_context()
         assert forward_context is not None
+        print(f'forward_context.cudagraph_runtime_mode in _generate_dummy_run_hidden_states is {forward_context.cudagraph_runtime_mode}',flush=True)
+        print(f'forward_context.capturing in _generate_dummy_run_hidden_states is {forward_context.capturing}',flush=True)
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
                 not forward_context.capturing:
             if self.vllm_config.model_config.use_mla:
                 # FIXME: Try using `auto_dispatch_capture=True`
+                runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                 update_mla_attn_params(self.update_stream, forward_context,
-                                       positions.shape[0])
+                                       runtime_shape,self.is_ubatch)
             else:
                 update_attn_params(self.update_stream, forward_context,
                                    positions.shape[0])
@@ -2499,7 +2506,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Padding for DP
         (num_tokens, num_tokens_across_dp, with_prefill,
          _) = self._sync_metadata_across_dp(num_tokens, with_prefill, False)
-
+        print(f'###yxj debug  _sync_metadata_across_dp in _dummy_run')
         moe_comm_type = self._select_moe_comm_method(num_tokens, with_prefill)
         
         # If cudagraph_mode.decode_mode() == FULL and
@@ -2566,15 +2573,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 uniform_decode=uniform_decode,
                 num_scheduled_tokens_per_request=num_scheduled_tokens,
             )
+        
         logger.info(f"dummy_run, ubatch_slices: {ubatch_slices}")
         # send is_ubatch to ffn side
         is_ubatch = True if ubatch_slices else False
+        print(f'###yxj debug  is_ubatch in dummy run {is_ubatch}')
         # to support inequal AF,[ffn_size,ffn_size + min_size) send
-        if self.afd_connector and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
+        if self.afd_connector and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank) :
             logger.debug(f'yxj self.afd_connector.rank in dummy_run is {self.afd_connector.rank}')
             self.afd_connector.send_is_ubatch(is_ubatch)
         logger.debug(f'send is_ubatch in dummy_run  is {is_ubatch}')
-        
+        self.is_ubatch = is_ubatch
         num_tokens_after_padding = num_tokens
         if num_tokens_across_dp is not None:
             dp_rank = self.parallel_config.data_parallel_rank
@@ -2881,7 +2890,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         elif self.parallel_config.use_ubatching:
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
                 self.update_stream = torch.npu.Stream()
-                set_graph_params(self.compilation_config.cudagraph_capture_sizes)
+                set_graph_params_dict([size // self.parallel_config.num_ubatches for size in self.compilation_config.cudagraph_capture_sizes],self.parallel_config.num_ubatches)
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.FULL, self.device)
             else:
