@@ -232,12 +232,11 @@ class NPUWorker(WorkerBase):
             print("finsh  capture ffn capture_model")
         if self.profiler:
             self.profiler.start()
-            for _ in range(1000):  # FIXME: hardcoded profiler iterations
-                self.model_runner.execute_model(scheduler_output=None)
+            for _ in range(54):  # FIXME: hardcoded profiler iterations
+                is_ubatch = self.model_runner.connector.recv_is_ubatch()
+                self.model_runner.execute_model(scheduler_output=None, is_ubatch=is_ubatch)
             torch.npu.synchronize()  # Ensure NPU operations complete
             self.profiler.stop()
-            print(self.profiler.key_averages().table(
-                sort_by="self_cuda_time_total"))
 
         import threading
         self._ffn_shutdown_event = threading.Event()
@@ -251,7 +250,7 @@ class NPUWorker(WorkerBase):
             try:
                 while not self._ffn_shutdown_event.is_set():
                     # Execute FFN computation
-                    self.model_runner.prof.step()
+                    # self.model_runner.prof.step()
                     is_ubatch = self.model_runner.connector.recv_is_ubatch()
                     self.model_runner.execute_model(scheduler_output=None, is_ubatch=is_ubatch)
             except Exception as e:
@@ -423,6 +422,7 @@ class NPUWorker(WorkerBase):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def profile(self, is_start: bool = True):
+        print(f'worker_v1 profile')
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
         if is_start:
