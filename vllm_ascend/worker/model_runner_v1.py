@@ -366,6 +366,8 @@ class NPUModelRunner(GPUModelRunner):
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
+
+        self.afd_comm_stream = torch.npu.Stream()
         #
         # import os
         # experimental_config = torch_npu.profiler._ExperimentalConfig(
@@ -1646,7 +1648,8 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     is_multimodal_model=self.is_multimodal_model,
                     afd_metadata=afd_metadata,
-                    ubatch_slices=ubatch_slices):
+                    ubatch_slices=ubatch_slices,
+                    afd_comm_stream=self.afd_comm_stream):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 hidden_states = self._generate_process_reqs_hidden_states(
@@ -2510,7 +2513,8 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model,
                     is_multimodal_model=self.is_multimodal_model,
                     afd_metadata=afd_metadata,
-                    ubatch_slices=ubatch_slices):
+                    ubatch_slices=ubatch_slices,
+                    afd_comm_stream=self.afd_comm_stream):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
                     intermediate_tensors, inputs_embeds)

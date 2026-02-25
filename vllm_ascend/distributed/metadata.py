@@ -5,14 +5,14 @@ from vllm.distributed.afd_transfer.afd_connector.metadata import AFDConnectorDat
 
 @dataclass
 class M2NAFDConnectorMetadata(AFDConnectorData):
-    def __init__(self):
+    def __init__(self, moe_expert_num=0, scale = None, quant_mode=0,aiv_num=0):
         self.topk_idx = None
         self.topk_weights = None
-        self.moe_expert_num = 0
-        self.scale = None
+        self.moe_expert_num = moe_expert_num
+        self.scale = scale
         self.handle = None
-        self.quant_mode = 0
-        self.aiv_num = 0
+        self.quant_mode = quant_mode
+        self.aiv_num = aiv_num
         self.batch_size = 0
         self.h = 0
         self.k = 0
