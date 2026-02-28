@@ -5,9 +5,17 @@ unset https_proxy
 clear
 ulimit -u unlimited
 
-# (需配置项)权重路径
-MODEL_PATH="/home/c00945949/weight/DeepSeek-V3.1_w8a8mix_mtp/"
-# MODEL_PATH="/home/lxf/DSV2LiteWeight"
+# (需配置项)默认参数，可通过入参覆盖：
+# $8: MODEL_PATH
+# $9: --max-num-seqs
+# $10: cudagraph_capture_sizes（逗号分隔，如 "20" 或 "20,40"）
+DEFAULT_MODEL_PATH="/home/c00945949/weight/DeepSeek-V3.1_w8a8mix_mtp/"
+DEFAULT_MAX_NUM_SEQS=20
+DEFAULT_CUDAGRAPH_CAPTURE_SIZES="20"
+
+MODEL_PATH="${8:-$DEFAULT_MODEL_PATH}"
+MAX_NUM_SEQS="${9:-$DEFAULT_MAX_NUM_SEQS}"
+CUDAGRAPH_CAPTURE_SIZES="${10:-$DEFAULT_CUDAGRAPH_CAPTURE_SIZES}"
 
 IF_NAME="enp8s0f4u1"
 LOCAL_IP="141.61.73.132"
@@ -33,31 +41,19 @@ export VLLM_VERSION="v0.11.0"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=600
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/CAM/bin/set_env.bash
 
-# 日志设置
-# (需配置项)基础日志路径设置
 timestamp=$(date +"%Y-%m-%d-%H-%M-%S")
 ALL_LOGS=/home/y00889327/workspace-afd/vllm-logs/${timestamp}
-# mkdir -p "${ALL_LOGS}"
 
-# # CANN日志设置
+# CANN日志设置
 mkdir -p "${ALL_LOGS}"/CANN/"${HCCL_IF_IP}"
 export ASCEND_PROCESS_LOG_PATH=${ALL_LOGS}/CANN/${HCCL_IF_IP}
-# 是否开启日志打屏。开启后，日志将不会保存在log文件中，而是将产生的日志直接打屏显示。
 export ASCEND_SLOG_PRINT_TO_STDOUT=0
-# 设置日志级别。1为INFO，2为WARNING
 export ASCEND_GLOBAL_LOG_LEVEL=3
-# 设置应用类日志是否开启Event日志。
 export ASCEND_GLOBAL_EVENT_ENABLE=1
-# 指定Device侧应用类日志回传到Host侧的延时时间。
-# export ASCEND_LOG_DEVICE_FLUSH_TIMEOUT=2000
-# 指定日志拥塞处理方式。0：默认处理方式，在日志拥塞或IO访问性能差的情况下，为保证业务性能不劣化，系统可能会丢失日志。1：在日志拥塞或IO访问性能差的情况下，不丢失日志。该方式下，为便于问题定位，建议配置为1。
 export ASCEND_LOG_SYNC_SAVE=0
 
-# 应用日志设置
 export VLLM_LOGGING_LEVEL=WARNING
 APP_LOG_PATH=${ALL_LOGS}/"$LOCAL_IP".log
-#    --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
-#    --additional-config '{"recompute_scheduler_enable":true,"multistream_overlap_shared_expert": true,"finegrained_tp_config": {"lmhead_tensor_parallel_size":16}}' \
 # MooncakeLayerwiseConnector
 vllm serve $MODEL_PATH \
     --host 0.0.0.0 \
@@ -70,8 +66,8 @@ vllm serve $MODEL_PATH \
     --enable-expert-parallel \
     --seed 1024 \
     --max-model-len 4096 \
-    --max-num-batched-tokens 20 \
-    --max-num-seqs 20 \
+    --max-num-batched-tokens "$MAX_NUM_SEQS" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --trust-remote-code \
     --gpu-memory-utilization 0.90  \
     --quantization ascend \
@@ -96,7 +92,7 @@ vllm serve $MODEL_PATH \
                     }
             }
     }'\
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[20]}' \
+    --compilation-config "{\"cudagraph_mode\": \"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[${CUDAGRAPH_CAPTURE_SIZES}]}" \
     --afd-config \
           '{
              "afd_connector": "camm2nconnector",
