@@ -400,3 +400,81 @@ def fused_experts(
         quant_mode=0,
         global_bs=0)
     return output
+
+def dispatch_experts(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    x_active_mask: torch.Tensor,
+    group_ep: str,
+    ep_rank_size: int,
+    ep_rank_id: int,
+    moe_expert_num: int,
+):
+    dispatch_kwargs = {
+        "x": hidden_states,
+        "expert_ids": topk_ids,
+        "expert_shard_type": 0,
+        "shared_expert_rank_num": 0,
+        "moe_expert_num": moe_expert_num,
+        "global_bs": 0,
+        "expert_token_nums_type": 0,
+        "scales": None,
+        "quant_mode": 0,
+        "group_ep": group_ep,
+        "ep_world_size": ep_rank_size,
+        "ep_rank_id": ep_rank_id,
+        "x_active_mask": x_active_mask,
+        "group_tp": group_ep,
+        "tp_world_size": 1,
+        "tp_rank_id": 0,
+    }
+    
+    dispatch_output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_kwargs)
+    return dispatch_output
+
+def combine_experts(
+    gmm2_output: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    x_active_mask: torch.Tensor,
+    assist_info_for_combine: torch.Tensor,
+    ep_recv_counts: torch.Tensor,
+    tp_recv_counts: torch.Tensor,
+    expand_scales: torch.Tensor,
+    group_ep: str,
+    ep_rank_size: int,
+    ep_rank_id: int,
+    moe_expert_num: int,
+):
+    combine_kwargs = {
+        "expand_x": gmm2_output,
+        "expert_ids": topk_ids,
+        "expert_scales": topk_weights.to(torch.float32) if topk_weights is not None else None,
+        "expert_shard_type": 0,
+        "shared_expert_rank_num": 0,
+        "moe_expert_num":moe_expert_num,
+        "global_bs": 0,
+        "ep_send_counts": ep_recv_counts,
+        "group_ep": group_ep,
+        "ep_world_size": ep_rank_size,
+        "ep_rank_id": ep_rank_id,
+        "expand_scales": expand_scales,
+        "x_active_mask": x_active_mask,
+        "tp_send_counts": tp_recv_counts,
+        "group_tp": group_ep,
+        "tp_world_size": 1,
+        "tp_rank_id": 0,
+    }
+
+    if hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+        combine_kwargs["assist_info_for_combine"] = assist_info_for_combine
+    else:
+        combine_kwargs["expand_idx"] = assist_info_for_combine
+
+    if hasattr(torch_npu, "npu_moe_distribute_combine_v2"):
+        combine_output = torch_npu.npu_moe_distribute_combine_v2(**combine_kwargs)
+    else:
+        combine_output = torch_npu.npu_moe_distribute_combine(**combine_kwargs)
+
+    return combine_output
