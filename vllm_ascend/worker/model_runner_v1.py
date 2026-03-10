@@ -557,23 +557,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.afd_comm_stream = torch.npu.Stream()
 
-        # import os
-        # experimental_config = torch_npu.profiler._ExperimentalConfig(
-        #     export_type=torch_npu.profiler.ExportType.Text,
-        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        # )
-        # self.prof = torch_npu.profiler.profile(
-        #     activities=[
-        #         torch_npu.profiler.ProfilerActivity.CPU,
-        #         torch_npu.profiler.ProfilerActivity.NPU
-        #     ],
-        #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=60, repeat=1, skip_first=120),
-        #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
-        #     experimental_config=experimental_config,
-        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof")
-        # )
-        # self.prof.start()
+        import os
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        )
+        self.prof = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+            ],
+            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=10, repeat=1, skip_first=1500),
+            # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof")
+        )
+        self.prof.start()
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -1484,10 +1484,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
-            print(f'ubatch_slices: {ubatch_slices}')
+            ##print(f'ubatch_slices: {ubatch_slices}')
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
-        else:
-            print(f"ubatch_slices is None")
+        # else:
+        #     print(f"ubatch_slices is None")
 
         # Used in the below loop.
         # query_start_loc_cpu = self.query_start_loc.cpu[:num_reqs + 1]
@@ -1632,7 +1632,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
-        print(f'hidden_states.shape in _generate_process_reqs_hidden_states is {hidden_states.shape}',flush=True)
+        #print(f'hidden_states.shape in _generate_process_reqs_hidden_states is {hidden_states.shape}',flush=True)
         forward_context = get_forward_context()
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             if self.vllm_config.model_config.use_mla:
@@ -1976,7 +1976,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             scheduler_output: "SchedulerOutput",
             intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
-        # self.prof.step()
+        self.prof.step()
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
@@ -2433,11 +2433,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
                                    inputs_embeds=inputs_embeds)
-        print(f'hidden_states.shape in _generate_dummy_run_hidden_states is {hidden_states.shape}',flush=True)
+        #print(f'hidden_states.shape in _generate_dummy_run_hidden_states is {hidden_states.shape}',flush=True)
         forward_context = get_forward_context()
         assert forward_context is not None
-        print(f'forward_context.cudagraph_runtime_mode in _generate_dummy_run_hidden_states is {forward_context.cudagraph_runtime_mode}',flush=True)
-        print(f'forward_context.capturing in _generate_dummy_run_hidden_states is {forward_context.capturing}',flush=True)
+        #print(f'forward_context.cudagraph_runtime_mode in _generate_dummy_run_hidden_states is {forward_context.cudagraph_runtime_mode}',flush=True)
+        #print(f'forward_context.capturing in _generate_dummy_run_hidden_states is {forward_context.capturing}',flush=True)
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
                 not forward_context.capturing:
             if self.vllm_config.model_config.use_mla:
@@ -2506,7 +2506,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Padding for DP
         (num_tokens, num_tokens_across_dp, with_prefill,
          _) = self._sync_metadata_across_dp(num_tokens, with_prefill, False)
-        print(f'###yxj debug  _sync_metadata_across_dp in _dummy_run')
+        #print(f'###yxj debug  _sync_metadata_across_dp in _dummy_run')
         moe_comm_type = self._select_moe_comm_method(num_tokens, with_prefill)
         
         # If cudagraph_mode.decode_mode() == FULL and
@@ -2577,7 +2577,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         logger.info(f"dummy_run, ubatch_slices: {ubatch_slices}")
         # send is_ubatch to ffn side
         is_ubatch = True if ubatch_slices else False
-        print(f'###yxj debug  is_ubatch in dummy run {is_ubatch}')
+        #print(f'###yxj debug  is_ubatch in dummy run {is_ubatch}')
         # to support inequal AF,[ffn_size,ffn_size + min_size) send
         if self.afd_connector and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank) :
             logger.debug(f'yxj self.afd_connector.rank in dummy_run is {self.afd_connector.rank}')
@@ -2671,7 +2671,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 def dummy_compute_logits(hidden_states):
                     return self.model.compute_logits(
                         hidden_states[dummy_indices])
-            print(f'yxj num_tokens is {num_tokens_after_padding},num_tokens_across_dp is {num_tokens_across_dp}')
+            # print(f'yxj num_tokens is {num_tokens_after_padding},num_tokens_across_dp is {num_tokens_across_dp}')
             
             afd_metadata = self._build_afd_metadata(ubatch_slices, num_tokens_after_padding)
             with set_ascend_forward_context(
@@ -2713,7 +2713,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if not self.in_profile_run and self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
-            print(f'self.attn_dummy_run_call_cnt is {self.attn_dummy_run_call_cnt}')
+            #print(f'self.attn_dummy_run_call_cnt is {self.attn_dummy_run_call_cnt}')
             self.attn_dummy_run_call_cnt += 1
             return hidden_states
 

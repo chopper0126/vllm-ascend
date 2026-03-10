@@ -27,6 +27,8 @@ from vllm.utils import direct_register_custom_op
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm_ascend.utils import npu_stream_switch_within_graph
 
+import umdk_cam_op_lib
+
 logger = init_logger(__name__)
 
 def _get_group_ep(ubatch_idx: int, hccl_comm_name: str, hccl_comm_name2: str, hccl_comm_name3: Optional[str]) -> str:
@@ -282,11 +284,11 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
         
-        torch_npu.cam_e2a(expandXOut = ffn_output, attenBatchSize = handle[0],
-                            batchSize = batch_size, hiddenSize = h, topk = k,
-                            expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
-                            rank = self.rank, groupEp = groupEp,
-                            aivNum = aiv_num)
+        torch.ops.umdk_cam_op_lib.e2a(expand_x = ffn_output, atten_batch_size = handle[0],
+                            batch_size = batch_size, hidden_size = h, topk = k,
+                            expert_rank_size = self.ffn_size, attention_rank_size = self.attn_size,
+                            rank = self.rank, group_ep = groupEp,
+                            aiv_num = aiv_num)
 
         return
 
@@ -302,13 +304,13 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
 
-        outputs = torch_npu.cam_a2e(expandX=torch.tensor([], dtype=torch.bfloat16, device='npu'),
-                                    expertIds=torch.tensor([], dtype=torch.int32, device='npu'),
+        outputs = torch.ops.umdk_cam_op_lib.a2e(x=torch.tensor([], dtype=torch.bfloat16, device='npu'),
+                                    expert_ids=torch.tensor([], dtype=torch.int32, device='npu'),
                                     scales=torch.tensor([], dtype=torch.float, device='npu'),
-                                    batchSize=batch_size, hiddenSize=h, topk=k,
-                                    expertRankSize=self.ffn_size, attentionRankSize=self.attn_size,
-                                    rank=self.rank, groupEp=groupEp,
-                                    aivNum=aiv_num)
+                                    batch_size=batch_size, hidden_size=h, topk=k,
+                                    expert_rank_size=self.ffn_size, atten_rank_size=self.attn_size,
+                                    rank=self.rank, group_ep=groupEp,
+                                    aiv_num=aiv_num)
 
         # outputs: [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut]
         from vllm.distributed.afd_transfer.afd_connector.metadata import AFDRecvOutput
@@ -428,12 +430,12 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
 
     curr_stream = torch.npu.current_stream()
     with npu_stream_switch_within_graph(curr_stream, comm_stream, multistream_enable):
-        handle_out = torch_npu.cam_a2e(expandX = hidden_states, expertIds = topk_idx,
+        handle_out = torch.ops.umdk_cam_op_lib.a2e(x = hidden_states, expert_ids = topk_idx,
                             scales = topk_weights,
-                            batchSize = batch_size, hiddenSize = h, topk = k,
-                            expertRankSize = ffn_size, attentionRankSize = attn_size,
-                            rank = rank, groupEp = groupEp,
-                            aivNum = aiv_num)
+                            batch_size = batch_size, hidden_size = h, topk = k,
+                            expert_rank_size = ffn_size, atten_rank_size = attn_size,
+                            rank = rank, group_ep = groupEp,
+                            aiv_num = aiv_num)
 
         hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut = handle_out[0:5]
         handle = [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize]
@@ -484,11 +486,11 @@ def cam_recv_ffn_output_impl(hidden_states: torch.Tensor,
     if multistream_enable:
         curr_stream = torch.npu.current_stream()
         comm_event.wait(curr_stream)
-    output2 = torch_npu.cam_e2a(expandXOut = hidden_states, attenBatchSize = handle[3],
-                        batchSize = batch_size, hiddenSize = h, topk = k,
-                        expertRankSize = ffn_size, attentionRankSize = attn_size,
-                        rank = rank, groupEp = groupEp,
-                        aivNum = aiv_num)
+    output2 = torch.ops.umdk_cam_op_lib.e2a(expand_x = hidden_states, atten_batch_size = handle[3],
+                        batch_size = batch_size, hidden_size = h, topk = k,
+                        expert_rank_size = ffn_size, attention_rank_size = attn_size,
+                        rank = rank, group_ep = groupEp,
+                        aiv_num = aiv_num)
     return output2
 
 def cam_recv_ffn_output_fake_impl(hidden_states: torch.Tensor,

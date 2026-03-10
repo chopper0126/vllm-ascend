@@ -343,7 +343,7 @@ class UBatchWrapper(GPUUBatchWrapper):
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
             aclgraph_metadata = self.aclgraphs[num_tokens]
             aclgraph_metadata.aclgraph.replay()
-            print("UBatchWrapper replay")
+            print("UBatchWrapper replay",flush=True)
             return aclgraph_metadata.outputs
         else:
             ubatch_metadata = self._make_ubatch_metadata(
