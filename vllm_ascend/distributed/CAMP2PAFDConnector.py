@@ -29,7 +29,7 @@ from vllm.distributed.afd_transfer.afd_connector.p2p_connector import DefaultPro
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.forward_context import ForwardContext, get_forward_context
 
-# from vllm_ascend.utils import npu_stream_switch_within_graph
+from vllm_ascend.utils import npu_stream_switch_within_graph
 
 logger = init_logger(__name__)
 
@@ -160,7 +160,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                 self.dst_list.append(dst)
                 dst += self.min_size
 
-        self.aiv_num = 48
+        self.aiv_num = int(self.config.afd_config.multistream_info["core_num"]) if self.config.afd_config.is_multistream else 48
 
         logger.debug(f"[CAM] world_rank={self.rank}, p2p_rank={self.p2p_rank}, min_size={self.min_size}, "
                      f"dst_list={self.dst_list}, cam connector initialized")
@@ -271,7 +271,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             k = self.hf_config.num_experts_per_tok
             moe_expert_num = self.hf_config.n_routed_experts
 
-        multistream_enable = False  # dense层的后一层不分流
+        multistream_enable = False if metadata.layer_idx == self.hf_config.first_k_dense_replace else self.config.afd_config.is_multistream # dense层的后一层不分流
         return torch.ops.vllm.cam_send_attn_output(hidden_states, topk_weights, topk_idx,
                                                    self.hccl_comm_name,
                                                    self.hccl_comm_name2,
@@ -297,7 +297,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                                                   self.rank,
                                                   self.ffn_size,
                                                   self.attn_size,
-                                                  False)
+                                                  self.config.afd_config.is_multistream)
 
     # MOE发给ATTN(MOE发送)
     def send_ffn_output(self, ffn_output: torch.Tensor, metadata: CAMP2PAFDConnectorMetadata, **kwargs):
@@ -404,7 +404,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             scale=None,
             handle=None,
             quant_mode=0,
-            aiv_num=self.aiv_num,
+            aiv_num=48,
             batch_size=max_num_tokens,
             h=hf_config.hidden_size,
             k=k
@@ -436,8 +436,8 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                               multistream_enable: bool,
                               aiv_num: int) -> torch.Tensor:
     ubatch_idx = get_forward_context().ubatch_idx
-    # comm_stream = get_forward_context().afd_comm_stream
-    # comm_event = get_forward_context().afd_comm_event
+    comm_stream = get_forward_context().afd_comm_stream
+    comm_event = get_forward_context().afd_comm_event
     if get_forward_context().cam_afdconnector_data is None:
         cam_afdconnector_data = CAMP2PAFDConnectorMetadata(
             moe_expert_num=moe_expert_num,
@@ -460,21 +460,21 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
 
     groupEp = _get_group_ep(ubatch_idx, hccl_comm_name, hccl_comm_name2, hccl_comm_name3)
 
-    # curr_stream = torch.npu.current_stream()
-    # with npu_stream_switch_within_graph(curr_stream, comm_stream, multistream_enable):
-    handle_out = torch.ops.umdk_cam_op_lib.a2e(x=hidden_states, expert_ids=topk_idx,
-                                               scales=topk_weights,
-                                               batch_size=batch_size, hidden_size=h, topk=k,
-                                               expert_rank_size=ffn_size, atten_rank_size=attn_size,
-                                               rank=rank, group_ep=groupEp,
-                                               aiv_num=aiv_num)
+    curr_stream = torch.npu.current_stream()
+    with npu_stream_switch_within_graph(curr_stream, comm_stream, multistream_enable):
+        handle_out = torch.ops.umdk_cam_op_lib.a2e(x=hidden_states, expert_ids=topk_idx,
+                                                scales=topk_weights,
+                                                batch_size=batch_size, hidden_size=h, topk=k,
+                                                expert_rank_size=ffn_size, atten_rank_size=attn_size,
+                                                rank=rank, group_ep=groupEp,
+                                                aiv_num=aiv_num)
 
-    hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut = handle_out[0:5]
-    handle = [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize]
-    cam_metadata.handle = handle
-    get_forward_context().cam_afdconnector_data = cam_metadata
-    # if multistream_enable:
-    #     comm_event.record(comm_stream)
+        hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut = handle_out[0:5]
+        handle = [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize]
+        cam_metadata.handle = handle
+        get_forward_context().cam_afdconnector_data = cam_metadata
+        if multistream_enable:
+            comm_event.record(comm_stream)
     return hidden_states
 
 
@@ -507,7 +507,7 @@ def cam_recv_ffn_output_impl(hidden_states: torch.Tensor,
     cam_metadata = get_forward_context().cam_afdconnector_data
     assert cam_metadata is not None, "cam_metadata is None"
     ubatch_idx = get_forward_context().ubatch_idx
-    # comm_event = get_forward_context().afd_comm_event
+    comm_event = get_forward_context().afd_comm_event
     batch_size = cam_metadata.batch_size
     h = cam_metadata.h
     k = cam_metadata.k
@@ -516,9 +516,9 @@ def cam_recv_ffn_output_impl(hidden_states: torch.Tensor,
 
     groupEp = _get_group_ep(ubatch_idx, hccl_comm_name, hccl_comm_name2, hccl_comm_name3)
 
-    # if multistream_enable:
-    #     curr_stream = torch.npu.current_stream()
-    #     comm_event.wait(curr_stream)
+    if multistream_enable:
+        curr_stream = torch.npu.current_stream()
+        comm_event.wait(curr_stream)
     output2 = torch.ops.umdk_cam_op_lib.e2a(expand_x=hidden_states, atten_batch_size=handle[3],
                                             batch_size=batch_size, hidden_size=h, topk=k,
                                             expert_rank_size=ffn_size, attention_rank_size=attn_size,
