@@ -392,7 +392,7 @@ class NPUModelRunner(GPUModelRunner):
         #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=20, repeat=1, skip_first=120),
         #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
         #     experimental_config=experimental_config,
-        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/profile")
+        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/ttg/prof")
         # )
         # self.prof.start()
 
@@ -1614,7 +1614,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
-        # self.prof.step()
+        self.prof.step()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
@@ -2258,8 +2258,7 @@ class NPUModelRunner(GPUModelRunner):
                     runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
-                                           self.speculative_config,
-                                           self.is_ubatch)
+                                           self.speculative_config,self.is_ubatch)
             else:
                 if self.pcp_size * self.dcp_size > 1:
                     update_attn_dcp_pcp_params(self.update_stream,
