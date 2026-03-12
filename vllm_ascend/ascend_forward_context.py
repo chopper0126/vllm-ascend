@@ -40,7 +40,8 @@ def set_ascend_forward_context(
         model_instance: torch.nn.Module = None,
         is_draft_model=False,
         is_multimodal_model=False,
-        afd_metadata: Optional[AFDMetadata] = None,):
+        afd_metadata: Optional[AFDMetadata] = None,
+        afd_comm_stream: torch.npu.Stream = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
@@ -57,7 +58,8 @@ def set_ascend_forward_context(
             ubatch_slices=ubatch_slices
     ):
         forward_context = get_forward_context()
-
+        forward_context.afd_comm_stream = afd_comm_stream
+        forward_context.afd_comm_event = torch.npu.Event()
         from vllm_ascend.ops.fused_moe.moe_comm_method import \
             get_moe_comm_method
         moe_comm_type = select_moe_comm_method(num_tokens, vllm_config,
