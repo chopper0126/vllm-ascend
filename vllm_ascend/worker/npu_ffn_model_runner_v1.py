@@ -67,13 +67,13 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.aclgraph_batch_sizes = list(
             reversed(
                 self.vllm_config.compilation_config.cudagraph_capture_sizes))
-        
-        # Storage for captured graphs
-        self._acl_graphs_full: dict[int, torch.npu.NPUGraph] = {
-        }  # {num_tokens: ACLGraph}
-        self._acl_graphs_ubatch_full: dict[int, torch.npu.NPUGraph] = {
-        }  # {num_tokens: ACLGraph}
+
+        # Storage for captured graphs - 使用 dp_metadata_key 作为 key
+        # key 格式: ((stage_idx, tuple(num_tokens_across_dp_cpu)), ...)
+        self._acl_graphs: dict[tuple, dict] = {}
         self.graph_pool = None
+        if self.use_aclgraph:
+            self.graph_pool = current_platform.get_global_graph_pool()
 
         assert self.afd_config.is_ffn_server
         self.connector = AFDConnectorFactory.create_connector(
@@ -98,12 +98,6 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         print(f'self.topk is {self.topk}')
         self.decode_max_num_token = self.scheduler_config.max_num_seqs * \
                         self.uniform_decode_query_len
-
-        # Initialize cudagraph keys for FFN server as initialize_kv_cache is not called
-        self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            self.vllm_config.compilation_config.cudagraph_mode,
-            self.uniform_decode_query_len
-        )
 
         # Initialize cudagraph keys for FFN server as initialize_kv_cache is not called
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
@@ -138,90 +132,73 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
 
     def _get_current_layer_idx(self) -> int:
         return (self._counter // self._current_num_ubatches) % self.num_layers
-    
-    def profile_run(self):
-        self._dummy_run(self.max_num_tokens)
-
         
     @torch.inference_mode()
-    def execute_model(self, scheduler_output=None, intermediate_tensors=None, is_ubatch:bool=False):
-        """Execute FFN computation for a single request"""
-        # self.prof.step()
+    def execute_model(self, scheduler_output=None, intermediate_tensors=None,
+                     dp_metadata_list: dict | None = None):
+        """Execute FFN computation for a single request
+
+        Args:
+            scheduler_output: 调度器输出（FFN侧通常为None）
+            intermediate_tensors: 中间张量（FFN侧通常为None）
+            dp_metadata_list: dp_metadata列表，包含每个stage的token数量信息
+        """
         try:
-            if self.use_aclgraph and not is_ubatch:
-                # TODO(yxj):use _acl_graphs_full replay
-                self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch)
-                print(f"is_ubatch is false eager",flush=True)
-            elif self.use_aclgraph and is_ubatch:
-                # TODO(yxj):ffn图模式会直接replay，应该设计成ffn收到attn消息才开始replay
-                # replay
-                if self.connector_name == "camm2nconnector":
-                    #TODO(yxj):self.decode_max_num_token * self.attn_size * (self.topk // self.ffn_size)
-                    max_num_tokens = self.decode_max_num_token * self.topk * self.attn_size
+            # 从dp_metadata_list中获取is_ubatch
+            is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
+
+            if self.use_aclgraph:
+                # 用 dp_metadata_key 查找 graph
+                dp_metadata_key = self._get_dp_metadata_key(dp_metadata_list)
+                acl_graph_info = self._acl_graphs.get(dp_metadata_key)
+                if acl_graph_info is not None:
+                    graph = acl_graph_info['graph']
+                    graph.replay()
+                    self.replay_cnt += 1
+                    logger.debug(f"ffn replay, replay_cnt is {self.replay_cnt}, dp_metadata_key={dp_metadata_key}")
                 else:
-                    # max_num_tokens = self.decode_max_num_token * self.topk * self.attn_size
-                    max_num_tokens = self.decode_max_num_token
-                acl_graph_info = self._acl_graphs_ubatch_full.get(max_num_tokens)
-                graph = acl_graph_info['graph']
-                graph.replay()
-                self.replay_cnt += 1
-                print(f"ffn replay,replay_cnt is {self.replay_cnt}", flush=True)
+                    # fallback to eager mode
+                    logger.warning(f"No acl graph found for dp_metadata_key={dp_metadata_key}, fallback to eager")
+                    self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, dp_metadata_list=dp_metadata_list)
             else:
-                print(f"ffn_forward,is_ubatch is {is_ubatch}", flush=True)
-                self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, is_ubatch=is_ubatch) 
-            
+                # eager mode for non-ubatch or no aclgraph
+                logger.debug(f"ffn_forward, is_ubatch is {is_ubatch}")
+                self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, dp_metadata_list=dp_metadata_list)
+
         except Exception as e:
             raise ValueError(
                 f"Error computing FFN: {e}"
             ) from e
         return None  # FFN server doesn't return ModelRunnerOutput
-    
-    def _execute_with_acl_graph(self, 
-                                hidden_states: torch.Tensor,
-                                current_layer_idx: int,
-                                acl_graph_info: Optional[dict] = None,
-                                router_logits: Optional[torch.Tensor] = None,
-                                group_list: Optional[torch.Tensor] = None,
-                                dynamic_scales: Optional[torch.Tensor] = None,
-                                topk_weights: Optional[torch.Tensor] = None,
-                                topk_ids: Optional[torch.Tensor] = None,
-                                row_idx: Optional[torch.Tensor] = None,
-                                x_active_mask: Optional[torch.Tensor] = None,
-                                ):
-        """Execute FFN computation using captured ACL graph."""
-        graph = acl_graph_info['graph']
-        input_tensor = acl_graph_info['input_hidden_states']
-        output_tensor = acl_graph_info['output']
 
-        # Copy input data to graph's input tensor
-        # Handle padding if necessary
-        actual_tokens = hidden_states.shape[0]
-        graph_tokens = input_tensor.shape[0]
+    def capture_model(self,
+                      dp_metadata_list: Optional[dict] = None,
+                      is_warmup: bool = False,
+                      is_attn_graph_capturing: bool = True) -> int:
+        """Capture ACL graphs for FFN operations.
 
-        if actual_tokens <= graph_tokens:
-            # Copy actual data and pad with zeros if needed
-            input_tensor[:actual_tokens].copy_(hidden_states)
-            if actual_tokens < graph_tokens:
-                input_tensor[actual_tokens:].zero_()
-        else:
-            raise ValueError(
-                f"Input size {actual_tokens} exceeds graph capacity "
-                f"{graph_tokens}")
+        Args:
+            dp_metadata_list: 从Attention侧接收的dp_metadata列表
+            is_warmup: 是否为warmup模式（只执行forward，不capture graph）
+            is_attn_graph_capturing: Attention侧是否正在capture（用于同步）
+        """
+        if not self.use_aclgraph:
+            return 0
 
-        # Replay the captured graph
-        graph.replay()
-        print("FFN Replay graphs")
-        # Return only the actual output (without padding)
-        return output_tensor[:actual_tokens].clone()
-        
-    def capture_model(self) -> int:
-        """Capture ACL graphs for FFN operations."""
-        
-        logger.debug("Starting ACL graph capture for FFN operations...")
+        logger.debug("Starting ACL graph capture for FFN operations, "
+                     "is_warmup=%s", is_warmup)
         start_time = time.perf_counter()
         start_free_npu_memory = torch.npu.mem_get_info()[0]
-        
-        self._capture_model()
+
+        set_cudagraph_capturing_enabled(True)
+        if is_warmup:
+            # Warmup模式：只执行forward，不capture graph
+            self._warmup_model(dp_metadata_list=dp_metadata_list)
+            logger.info("FFN warmup completed, dp_metadata_list=%s", dp_metadata_list)
+        else:
+            # 正式Capture模式：根据dp_metadata_list捕获单个graph
+            self._capture_model(dp_metadata_list=dp_metadata_list)
+        set_cudagraph_capturing_enabled(False)
 
         end_time = time.perf_counter()
         end_free_npu_memory = torch.npu.mem_get_info()[0]
@@ -233,22 +210,60 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
 
         return npu_graph_size
 
-    def _capture_model(self):
-        parent_module_name = self.__class__.__base__.__module__
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(
-                parent_module_name):
-            self._capture_ffn_model()
-           
-        set_cudagraph_capturing_enabled(False)
+    def _get_dp_metadata_key(self, dp_metadata_list: dict) -> tuple:
+        """Extract a hashable key from dp_metadata_list for CUDA graph lookup.
 
-    def _capture_ffn_model(self) -> None:
-        set_cudagraph_capturing_enabled(True)
+        与 GPU 版本的 _make_graph_key 保持一致。
+        The key is a tuple of (stage_idx, tuple(num_tokens_across_dp_cpu))
+        for each stage, sorted by stage_idx.
+
+        Args:
+            dp_metadata_list: {stage_idx: DPMetadata}
+
+        Returns:
+            tuple: ((stage_idx, tuple(num_tokens_across_dp_cpu)), ...)
+        """
+        if dp_metadata_list is None:
+            return ()
+
+        return tuple(
+            (stage_idx, tuple(meta.num_tokens_across_dp_cpu.tolist()))
+            for stage_idx, meta in sorted(dp_metadata_list.items())
+        )
+
+    def _warmup_model(self, dp_metadata_list: dict = None) -> None:
+        """执行warmup，只运行forward不capture graph
+
+        Args:
+            is_ubatch: 是否为ubatch模式
+            dp_metadata_list: 从Attention侧接收的dp_metadata列表
+        """
+        # Warmup只执行eager模式的forward，根据dp_metadata_list确定num_tokens
+        dp_metadata_key = self._get_dp_metadata_key(dp_metadata_list)
+
+        self._dummy_run(aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                        uniform_decode=True,
+                        dp_metadata_list=dp_metadata_list,
+                        dp_metadata_key=dp_metadata_key)
+        logger.debug("FFN warmup for dp_metadata_key=%s", dp_metadata_key)
+
+    def _capture_model(self, dp_metadata_list: dict = None):
+        """内部capture实现 - 根据dp_metadata_list捕获单个graph
+
+        Args:
+            is_ubatch: 是否为ubatch模式
+            dp_metadata_list: 从Attention侧接收的dp_metadata列表
+        """
+        if dp_metadata_list is None:
+            logger.warning("dp_metadata_list is None, skip capture")
+            return
+
+        # 生成 dp_metadata key
+        dp_metadata_key = self._get_dp_metadata_key(dp_metadata_list)
 
         @contextmanager
         def freeze_gc():
             # Optimize garbage collection during CUDA graph capture.
-            # Clean up, then freeze all remaining objects from being included
-            # in future collections.
             gc.collect()
             should_freeze = not envs.VLLM_ENABLE_CUDAGRAPH_GC
             if should_freeze:
@@ -261,107 +276,80 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     gc.collect()
 
         with freeze_gc(), graph_capture(device=self.device):
-            max_num_tokens = self.scheduler_config.max_num_seqs * \
-                             self.uniform_decode_query_len
-            decode_cudagraph_batch_sizes = [
-                x for x in self.aclgraph_batch_sizes if max_num_tokens >= x >= self.uniform_decode_query_len
-            ]
-            compilation_cases_decode = list(
-                reversed(decode_cudagraph_batch_sizes))
-            self._capture_aclgraphs(
-                compilation_cases=compilation_cases_decode,
+            # 直接捕获单个graph，无warmup（warmup已通过Attention侧同步完成）
+            self._capture_single_aclgraph(
                 cudagraph_runtime_mode=CUDAGraphMode.FULL,
                 uniform_decode=True,
+                dp_metadata_key=dp_metadata_key,
+                dp_metadata_list=dp_metadata_list
             )
 
-        set_cudagraph_capturing_enabled(False)
-        
-    def _capture_aclgraphs(self, compilation_cases: list[int],
-                           cudagraph_runtime_mode: CUDAGraphMode,
-                           uniform_decode: bool,
-                           ):
-        assert cudagraph_runtime_mode != CUDAGraphMode.NONE and \
-            cudagraph_runtime_mode in [CUDAGraphMode.FULL,
-                                      CUDAGraphMode.PIECEWISE]
+    def _capture_single_aclgraph(self,
+                                  cudagraph_runtime_mode: CUDAGraphMode,
+                                  uniform_decode: bool,
+                                  dp_metadata_key: tuple = None,
+                                  dp_metadata_list: dict = None):
+        """捕获单个 ACL graph（无 warmup 循环）
 
-        # Only rank 0 should print progress bar during capture
-        if is_global_first_rank():
-            compilation_cases = tqdm(
-                compilation_cases,
-                disable=not self.load_config.use_tqdm_on_load,
-                desc="Capturing CUDA graphs ({}, {})".format(
-                    "decode" if uniform_decode else "mixed prefill-decode",
-                    cudagraph_runtime_mode.name,
-                ),
-            )
-        for num_tokens in compilation_cases:
-            # Warm up the operations for this specific layer
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
-                force_attention = (cudagraph_runtime_mode == CUDAGraphMode.FULL)
-                self._dummy_run(num_tokens,
-                                aclgraph_runtime_mode=CUDAGraphMode.NONE,
-                                force_attention=force_attention,
-                                uniform_decode=uniform_decode,
-                                )
-            self._dummy_run(num_tokens,
-                            aclgraph_runtime_mode=CUDAGraphMode.FULL,
-                            uniform_decode=uniform_decode
-                            )
-    
-    def _dummy_run(self, 
-                   num_tokens: int = 1, 
+        Args:
+            num_tokens: token数量
+            cudagraph_runtime_mode: graph模式
+            uniform_decode: 是否为uniform decode
+            is_ubatch: 是否为ubatch模式
+            dp_metadata_key: dp_metadata的key，用于存储graph
+        """
+        assert cudagraph_runtime_mode != CUDAGraphMode.NONE
+        logger.info("Capturing ACL graph for dp_metadata_key=%s", dp_metadata_key)
+
+        # 直接capture，不做warmup（warmup由Attention侧控制）
+        self._dummy_run(aclgraph_runtime_mode=cudagraph_runtime_mode,
+                        uniform_decode=uniform_decode,
+                        dp_metadata_list=dp_metadata_list,
+                        dp_metadata_key=dp_metadata_key)
+
+    def _dummy_run(self,
                    aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
-                   force_attention: bool = False,
                    uniform_decode: bool = False,
+                   dp_metadata_list: dict | None = None,
+                   dp_metadata_key: tuple = None,
                    **kwargs):
-        is_ubatch = self.connector.recv_is_ubatch()
+        """执行dummy run用于warmup或capture
+
+        Args:
+            num_tokens: token数量
+            aclgraph_runtime_mode: ACL graph运行模式
+            force_attention: 是否强制attention
+            uniform_decode: 是否为uniform decode
+            dp_metadata_list: dp_metadata列表，包含每个stage的token数量信息
+            dp_metadata_key: dp_metadata的key，用于存储graph（替代num_tokens作为key）
+        """
+        is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
         print(f'is_ubatch in _dummy_run is {is_ubatch}')
-        
+
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
         }
-        # filter out the valid batch descriptor
-        _ag_mode, batch_descriptor = \
-            self.cudagraph_dispatcher.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=False)
-        if aclgraph_runtime_mode is not None:
-            # we allow forcing NONE when the dispatcher disagrees to support
-            # warm ups for aclgraph capture
-            assert aclgraph_runtime_mode == CUDAGraphMode.NONE or \
-                aclgraph_runtime_mode == _ag_mode, (
-                f"Aclgraph runtime mode mismatch at dummy_run. "
-                f"Expected {_ag_mode}, but got {aclgraph_runtime_mode}.")
-        else:
-            aclgraph_runtime_mode = _ag_mode
+        # _ag_mode, batch_descriptor = \
+        #     self.cudagraph_dispatcher.dispatch(num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=False)
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
-            # capture
             # Create and capture the graph
             aclgraph = torch.npu.NPUGraph()
             with torch.npu.graph(aclgraph, pool=self.graph_pool):
                 # compute_ffn_output
-                output = self._ffn_forward(batch_descriptor=batch_descriptor,
+                output = self._ffn_forward(
                                   aclgraph_runtime_mode=aclgraph_runtime_mode,
-                                  is_ubatch=is_ubatch)
-            print(f'output shape is {output.shape}')
-            # Store the captured graph with token count as key
-            if is_ubatch:
-                self._acl_graphs_ubatch_full[output.shape[0]] = {
-                    'graph': aclgraph,
-                    'input_hidden_states': output,
-                    'output': output
-                }
-                print(f'self._acl_graphs_ubatch_full is {self._acl_graphs_ubatch_full}',flush=True)
-            else:
-                self._acl_graphs_full[output.shape[0]] = {
-                    'graph': aclgraph,
-                    'input_hidden_states': output,
-                    'output': output
-                }
-                print(f'self._acl_graphs_full is {self._acl_graphs_full}',flush=True)
+                                  dp_metadata_list=dp_metadata_list)
+            # Store the captured graph with dp_metadata_key as key
+            self._acl_graphs[dp_metadata_key] = {
+                'graph': aclgraph,
+                'input_hidden_states': output,
+                'output': output
+            }
+            print(f'self._acl_graphs key={dp_metadata_key}', flush=True)
         else:
-            self._ffn_forward(batch_descriptor=batch_descriptor,
-                                  aclgraph_runtime_mode=aclgraph_runtime_mode,
-                                  is_ubatch=is_ubatch) 
+            self._ffn_forward(aclgraph_runtime_mode=aclgraph_runtime_mode,
+                              dp_metadata_list=dp_metadata_list)
             print("finsh capture warm_up or prefile run",flush=True)
         print(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
         self.dummy_run_call_cnt += 1
@@ -393,66 +381,110 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         m2n_afdconnector_data.topk_weights = recv_output.topk_weights
         
         return recv_output
+    
+    def _build_ffn_num_tokens_across_dp(self, dp_metadata_list: dict) -> Optional[torch.Tensor]:
+        """构造 FFN 侧的 num_tokens_across_dp tensor
 
-    def _ffn_forward(self,
-                     batch_descriptor=None,
-                     aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
-                     is_ubatch:bool=False):
-        num_ubatches = self.parallel_config.num_ubatches if is_ubatch else 1
-        rank_ffn_output = None
-        for layer_idx in range(self.first_k_dense_replace,self.num_layers):
-            for ubatch_idx in range(num_ubatches):
-                # recv
-                afd_connector_data = self.connector.create_recv_metadata(max_num_tokens=self.max_num_tokens)
-                recv_output = self.connector.recv_attn_output(metadata=afd_connector_data, ubatch_idx=ubatch_idx)
+        对于不对称 A/F 场景（A > F），需要将多个 A 的 token 数量合并到对应的 F。
+        """
+        # 从 dp_metadata_list 获取 dp_metadata
+        dp_metadata = dp_metadata_list.get(0, None) if dp_metadata_list else None
 
-                if hasattr(self.connector, "update_metadata") and afd_connector_data is not None:
-                    self.connector.update_metadata(afd_connector_data, recv_output)
-                print(f'{self.connector_name} recv_attn_output success ,layer id is {layer_idx}, '
-                      f'ubatch_idx is {ubatch_idx}', flush=True)
+        if dp_metadata is None:
+            return None
 
-                hidden_states = recv_output.hidden_states
-                dynamic_scales = recv_output.dynamic_scales
-                group_list = recv_output.group_list
-                topk_weights = recv_output.topk_weights
-                topk_ids = recv_output.topk_ids
-                router_logits = recv_output.router_logits
-                row_idx = recv_output.row_idx
-                x_active_mask = recv_output.x_active_mask
+        attn_num_tokens = dp_metadata.num_tokens_across_dp_cpu
 
-                # Construct AFDMetadata to ensure afd_forward takes the correct branch
-                afd_metadata = AFDMetadata(
-                    afd_tokens_start_loc=[],
-                    afd_reqs_start_loc=[],
-                    afd_stage_idx=0,
-                    afd_connector=self.connector,
-                    afd_tokens_lens=[],
-                    num_of_stages=1
+        # For asymmetric A/F, scale token counts by ratio
+        # because FFN receives concatenated tokens from multiple A's
+        if hasattr(self.connector, 'ratio') and self.connector.ratio > 1:
+            ffn_size = self.connector.ffn_size
+            ratio = self.connector.ratio
+
+            ffn_num_tokens_list = []
+            for f_idx in range(ffn_size):
+                start_a_idx = f_idx * ratio
+                end_a_idx = start_a_idx + ratio
+                ffn_num_tokens_list.append(
+                    attn_num_tokens[start_a_idx:end_a_idx].sum().item()
                 )
 
-                with set_ascend_forward_context(
-                            attn_metadata=None,
-                            vllm_config=self.vllm_config,
-                            batch_descriptor=batch_descriptor,
-                            aclgraph_runtime_mode=aclgraph_runtime_mode,
-                            model_instance=self.model,
-                            afd_metadata=afd_metadata):
-                        rank_ffn_output = self._run_ffn_computation(
-                            hidden_states=hidden_states,
-                            layer_idx=layer_idx,
-                            capture_mode=True,
-                            group_list=group_list,
-                            dynamic_scales=dynamic_scales if self.connector.quant_mode == 1 else None,
-                            topk_weights=topk_weights,
-                            topk_ids=topk_ids,
-                            router_logits=router_logits,
-                            row_idx=row_idx,
-                            x_active_mask=x_active_mask,
-                            cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
-                        )
-                # send
-                self.connector.send_ffn_output(rank_ffn_output, afd_connector_data, ubatch_idx=ubatch_idx)
-                print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}', flush=True)
+            ffn_num_tokens_across_dp_cpu = torch.tensor(
+                ffn_num_tokens_list,
+                dtype=attn_num_tokens.dtype,
+                device=attn_num_tokens.device,
+            )
+            return ffn_num_tokens_across_dp_cpu
+        else:
+            return attn_num_tokens
+
+    def _ffn_forward(self,
+                     aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
+                     dp_metadata_list: dict | None = None):
+        """Run FFN computation for graph capture or replay"""
+        # 从 dp_metadata_list 获取 is_ubatch
+        is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
+        num_ubatches = self.parallel_config.num_ubatches if is_ubatch else 1
+        rank_ffn_output = None
+        print(f"jcz _ffn_forward max_num_tokens:{self.max_num_tokens}")
+        
+        afd_metadata = AFDMetadata(
+            afd_tokens_start_loc=[],
+            afd_reqs_start_loc=[],
+            afd_stage_idx=0,
+            afd_connector=self.connector,
+            afd_tokens_lens=[],
+            num_of_stages=num_ubatches
+        )
+        # 构造 FFN 侧的 num_tokens_across_dp
+        num_tokens_across_dp = self._build_ffn_num_tokens_across_dp(dp_metadata_list)
+        with set_ascend_forward_context(
+                    attn_metadata=None,
+                    vllm_config=self.vllm_config,
+                    batch_descriptor=None,
+                    aclgraph_runtime_mode=aclgraph_runtime_mode,
+                    model_instance=self.model,
+                    afd_metadata=afd_metadata,
+                    num_tokens=num_tokens_across_dp[0],
+                    num_tokens_across_dp=num_tokens_across_dp):
+            for layer_idx in range(self.first_k_dense_replace,self.num_layers):
+                for ubatch_idx in range(num_ubatches):
+                    # recv
+                    afd_connector_data = self.connector.create_recv_metadata(
+                        dp_metadata_list=dp_metadata_list,
+                        ubatch_idx=ubatch_idx,
+                        max_num_tokens=self.max_num_tokens)
+                    recv_output = self.connector.recv_attn_output(metadata=afd_connector_data, ubatch_idx=ubatch_idx)
+                    if hasattr(self.connector, "update_metadata") and afd_connector_data is not None:
+                        self.connector.update_metadata(afd_connector_data, recv_output)
+                    print(f'{self.connector_name} recv_attn_output success ,layer id is {layer_idx}, '
+                        f'ubatch_idx is {ubatch_idx} recv_output:{recv_output.hidden_states.shape}', flush=True)
+
+                    hidden_states = recv_output.hidden_states
+                    dynamic_scales = recv_output.dynamic_scales
+                    group_list = recv_output.group_list
+                    topk_weights = recv_output.topk_weights
+                    topk_ids = recv_output.topk_ids
+                    router_logits = recv_output.router_logits
+                    row_idx = recv_output.row_idx
+                    x_active_mask = recv_output.x_active_mask
+
+                    # Construct AFDMetadata to ensure afd_forward takes the correct branch
+                    rank_ffn_output = self._run_ffn_computation(
+                        hidden_states=hidden_states,
+                        layer_idx=layer_idx,
+                        group_list=group_list,
+                        dynamic_scales=dynamic_scales if self.connector.quant_mode == 1 else None,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        router_logits=router_logits,
+                        row_idx=row_idx,
+                        x_active_mask=x_active_mask,
+                        cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
+                    )
+                    # send
+                    self.connector.send_ffn_output(rank_ffn_output, afd_connector_data, ubatch_idx=ubatch_idx)
+                    print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}', flush=True)
         return rank_ffn_output
 
     def _run_ffn_computation(self,
@@ -468,32 +500,8 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                              x_active_mask: Optional[torch.Tensor] = None,
                              cam_p2p_ep_name: Optional[str] = ""):
         """Run FFN computation for graph capture or replay."""
-        if layer_idx is None:
-            current_layer_idx = self._get_current_layer_idx(
-            ) if not capture_mode else 0
-        else:
-            current_layer_idx = layer_idx
-
-        # tp_world_size = get_tensor_model_parallel_world_size()
-        # if tp_world_size > 1:
-        #     # Handle TP case: all-gather tensors from all TP ranks
-        #     gathered_hidden_states = tensor_model_parallel_all_gather(
-        #         hidden_states, dim=0)
-        #     ffn_output = self.model.compute_ffn_output(current_layer_idx,
-        #                                                gathered_hidden_states)
-
-        #     # Extract the output corresponding to current rank
-        #     start_idx = hidden_states.shape[
-        #         0] * get_tensor_model_parallel_rank()
-        #     end_idx = start_idx + hidden_states.shape[0]
-        #     rank_ffn_output = ffn_output[start_idx:end_idx, :]
-        # else:
-        # Single TP case
-
-        # TODO(yxj):support m2n\cam\p2p
-
         rank_ffn_output = self.model.compute_ffn_output(
-            layer_idx=current_layer_idx,
+            layer_idx=layer_idx,
             hidden_states=hidden_states,
             router_logits=router_logits,
             group_list=group_list,
@@ -503,24 +511,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             row_idx=row_idx,
             x_active_mask=x_active_mask,
             cam_p2p_ep_name=cam_p2p_ep_name)
-
-        # rank_ffn_output = self.model.compute_ffn_output(
-        #     current_layer_idx, hidden_states)
-
         return rank_ffn_output
-
-    def _find_cuda_graph(self, layer_idx: int, num_tokens: int):
-        """Find the smallest graph that can handle the given layer and
-        number of tokens."""
-        if not self.use_aclgraph:
-            return None
-
-        # Find the minimum capture size that can handle num_tokens for this
-        # layer
-        for capture_size in self.aclgraph_batch_sizes:
-            if num_tokens <= capture_size:
-                return self._acl_graphs.get((layer_idx, capture_size))
-        return None
 
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         """FFN servers don't use samplers."""

@@ -267,39 +267,14 @@ class NPUWorker(WorkerBase):
                 self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
     def start_ffn_server_loop(self) -> None:
-        """Start FFN server loop for AFD FFN workers"""
+        """Start FFN server loop for AFD FFN workers
+
+        FFN server不再独立执行profile_run、warmup、capture_model，
+        而是根据Attention侧发送的dp_metadata_list来决定执行什么操作。
+        """
         if not (self.vllm_config.afd_config
                 and self.vllm_config.afd_config.is_ffn_server):
             return
-        if not self.model_config.enforce_eager:
-            print("start to ffn profile_run  ")
-            self.model_runner.profile_run()
-            # self.model_runner.initialize_afd_connector()
-            print("finsh  ffn profile_run  ")
-            print("start  ffn compile_or_warm_up_model  ")
-            warmup_sizes = (self.vllm_config.compilation_config.compile_sizes
-                            or []).copy()
-
-            warmup_sizes = [
-                x for x in warmup_sizes if x not in
-                self.vllm_config.compilation_config.cudagraph_capture_sizes
-            ]
-            for size in sorted(warmup_sizes, reverse=True):
-                logger.info("Compile and warming up model for size %d", size)
-                self.model_runner._dummy_run(size)
-            print("finsh  ffn compile_or_warm_up_model  ")
-            print("start to capture ffn capture_model")
-            self.model_runner.capture_model()
-            # self.model_runner.initialize_afd_connector()
-            print("finsh  capture ffn capture_model")
-        if self.profiler:
-            self.profiler.start()
-            for _ in range(1000):  # FIXME: hardcoded profiler iterations
-                self.model_runner.execute_model(scheduler_output=None)
-            torch.npu.synchronize()  # Ensure NPU operations complete
-            self.profiler.stop()
-            print(self.profiler.key_averages().table(
-                sort_by="self_cuda_time_total"))
 
         import threading
         self._ffn_shutdown_event = threading.Event()
@@ -312,10 +287,28 @@ class NPUWorker(WorkerBase):
 
             try:
                 while not self._ffn_shutdown_event.is_set():
-                    # Execute FFN computation
-                    # self.model_runner.prof.step()
-                    is_ubatch = self.model_runner.connector.recv_is_ubatch()
-                    self.model_runner.execute_model(scheduler_output=None, is_ubatch=is_ubatch)
+                    # 接收dp_metadata_list
+                    (
+                        dp_metadata_list,
+                        is_attn_graph_capturing,
+                        is_warmup,
+                    ) = self.model_runner.connector.recv_dp_metadata_list()
+                    print(f"jcz dp_metadata_list:{dp_metadata_list} is_attn_graph_capturing:{is_attn_graph_capturing} is_warmup:{is_warmup}")
+                    if is_attn_graph_capturing or (is_warmup and not self.model_config.enforce_eager):
+                        # Capture模式：根据metadata执行warmup或capture
+                        self.model_runner.capture_model(
+                            dp_metadata_list=dp_metadata_list,
+                            is_warmup=is_warmup,
+                            is_attn_graph_capturing=is_attn_graph_capturing,
+                        )
+                    else:
+                        # 正常推理
+                        self.model_runner.execute_model(
+                            scheduler_output=None,
+                            dp_metadata_list=dp_metadata_list,
+                        )
+
+                    torch.npu.synchronize()
             except Exception as e:
                 logger.error("FFN worker loop error: %s", e)
                 raise
