@@ -91,6 +91,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             re.match(r"(\d+)\D+(\d+)", afd_size).groups())
 
         self.min_size = min(self.ffn_size, self.attn_size)
+        self.ratio = self.attn_size // self.ffn_size  # attn_size / ffn_size, for asymmetric A/F
         world_rank = self.rank + self.ffn_size if role == "attention" else self.rank
         # p2p_rank: 所有FFN [0, ffn_size), 前min_size个Attention [ffn_size, ffn_size+min_size)
         self.p2p_rank = self.rank + self.min_size if role == "attention" else self.rank
@@ -99,7 +100,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         print(f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
         logger.debug(
             f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
-        # TODO(jcz) : 这里要根据实际的num_of_stages创建，需要改成list
+        
         self.afd_pg_list = []
         self.hccl_comm_name_list = []
         num_ubatches = self.config.parallel_config.num_ubatches if self.config.parallel_config.num_ubatches else 1
@@ -390,7 +391,31 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         return data
 
     def create_recv_metadata(self, **kwargs):
-        max_num_tokens = kwargs.get('max_num_tokens', 0)
+        # 从 kwargs 获取 dp_metadata_list 和 ubatch_idx
+        dp_metadata_list = kwargs.get('dp_metadata_list')
+        ubatch_idx = kwargs.get('ubatch_idx', 0)
+
+        # 从 dp_metadata_list 和 ubatch_idx 获取 max_num_tokens
+        if dp_metadata_list is not None and ubatch_idx in dp_metadata_list:
+            dp_metadata = dp_metadata_list[ubatch_idx]
+            num_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu.tolist()
+
+            # 计算 max_num_tokens：根据 A > F 且 A 是 F 的倍数的场景
+            # 例如 4A2F：第一个F取前两个之和，第二个F取后两个之和
+            # TODO(jcz): 需要补不对称场景的计算逻辑
+            if self.attn_size >= self.ffn_size and self.attn_size % self.ffn_size == 0:
+                # 每个 FFN 处理 group_size 个 Attention 的数据
+                group_size = self.attn_size // self.ffn_size
+                start_idx = self.rank * group_size
+                end_idx = start_idx + group_size
+                max_num_tokens = sum(num_tokens_across_dp[start_idx:end_idx])
+                print(f"rank {self.rank} get max_num_tokens {max_num_tokens} from dp_metadata_list with group_size {group_size}")
+            else:
+                max_num_tokens = kwargs.get('max_num_tokens', 0)
+                print(f"rank {self.rank} get max_num_tokens {max_num_tokens} from kwargs due to attn_size {self.attn_size} and ffn_size {self.ffn_size}")
+        else:
+            max_num_tokens = kwargs.get('max_num_tokens', 0)
+
         hf_config = self.config.model_config.hf_config
 
         if self.mix_placement:
@@ -418,6 +443,88 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             recv_output.ep_recv_counts,
             recv_output.atten_batch_size
         ]
+
+    def send_dp_metadata_list(
+        self,
+        data,
+        is_graph_capturing: bool = False,
+        is_warmup: bool = False,
+    ):
+        """发送dp_metadata_list给对应的FFN rank
+
+        Args:
+            data: dp_metadata_list字典
+            is_graph_capturing: 是否处于graph capture阶段
+            is_warmup: 是否处于warmup阶段
+        """
+        send_data = (data, is_graph_capturing, is_warmup)
+
+        for dst in self.dst_list:
+            object_bytes = pickle.dumps(send_data)
+            object_tensor_cpu = torch.frombuffer(bytearray(object_bytes), dtype=torch.uint8)
+
+            object_tensor_npu = torch.empty(object_tensor_cpu.shape,
+                                            dtype=torch.uint8,
+                                            device="npu")
+            object_tensor_npu.copy_(object_tensor_cpu)
+
+            size_tensor = torch.tensor([object_tensor_cpu.numel()],
+                                       dtype=torch.long,
+                                       device="npu")
+
+            logger.debug(
+                "send_dp_metadata_list dst:%s is_graph_capturing:%s is_warmup:%s",
+                dst, is_graph_capturing, is_warmup)
+
+            torch.distributed.send(size_tensor, dst=dst, group=self.p2p_pg)
+            torch.distributed.send(object_tensor_npu, dst=dst, group=self.p2p_pg)
+
+    def recv_dp_metadata_list(self):
+        """接收dp_metadata_list
+
+        Returns:
+            tuple: (data, is_graph_capturing, is_warmup)
+        """
+        src = self.p2p_rank % self.min_size + self.ffn_size
+        logger.debug(f"recv_dp_metadata_list src:{src}")
+
+        size_tensor = torch.empty(1, dtype=torch.long, device="npu")
+        rank_size = torch.distributed.recv(size_tensor, src=src, group=self.p2p_pg)
+
+        object_tensor_npu = torch.empty(size_tensor.item(), dtype=torch.uint8, device="npu")
+        rank_object = torch.distributed.recv(object_tensor_npu, src=src, group=self.p2p_pg)
+
+        assert rank_object == rank_size, \
+            "Received object sender rank does not match the size sender rank."
+
+        object_tensor_cpu = object_tensor_npu.cpu()
+        obj = pickle.loads(object_tensor_cpu.numpy().tobytes())
+
+        if len(obj) == 3:
+            data, is_graph_capturing, is_warmup = obj
+        else:
+            # 兼容旧格式
+            data, is_graph_capturing = obj
+            is_warmup = False
+
+        logger.debug("recv_dp_metadata_list is_graph_capturing:%s is_warmup:%s",
+                    is_graph_capturing, is_warmup)
+
+        return data, is_graph_capturing, is_warmup
+
+    def update_state_from_dp_metadata(
+        self,
+        dp_metadata_list: dict,
+        is_graph_capturing: bool = False,
+    ):
+        """更新connector状态
+
+        Args:
+            dp_metadata_list: dp_metadata_list字典
+            is_graph_capturing: 是否处于graph capture阶段
+        """
+        self.dp_metadata_list = dp_metadata_list
+        self.is_graph_capturing = is_graph_capturing
 
 
 def cam_send_attn_output_impl(hidden_states: torch.Tensor,

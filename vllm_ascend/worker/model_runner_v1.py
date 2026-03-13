@@ -214,6 +214,7 @@ class NPUModelRunner(GPUModelRunner):
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.afd_config = vllm_config.afd_config
         self.max_num_reqs = self.scheduler_config.max_num_seqs
+        self._is_warmup = False  # 标记是否处于warmup阶段
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         try:
@@ -424,6 +425,32 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_indices = self._make_buffer(self.max_num_reqs,
                                                          dtype=torch.int64)
         self.num_discarded_requests = 0
+
+    def _build_afd_dp_metadata_list(self, ubatch_slices_padded) -> dict:
+        """构建dp_metadata_list用于发送给FFN侧
+
+        Args:
+            ubatch_slices_padded: ubatch slices with padding
+
+        Returns:
+            dict: {stage_idx: DPMetadata}
+        """
+        dp_metadata_list = {}
+        if ubatch_slices_padded is not None:
+            for idx, ubatch_slice in enumerate(ubatch_slices_padded):
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                ubatch_num_tokens_across_dp = torch.tensor(
+                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
+                )
+                dp_metadata_list[idx] = DPMetadata.make(
+                    self.vllm_config.parallel_config,
+                    ubatch_slice.num_tokens,
+                    ubatch_num_tokens_across_dp,
+                )
+        else:
+            # 单个stage，使用当前的dp_metadata
+            dp_metadata_list[0] = get_forward_context().dp_metadata
+        return dp_metadata_list
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method,
@@ -799,13 +826,7 @@ class NPUModelRunner(GPUModelRunner):
         pad_attn = cudagraph_mode == CUDAGraphMode.FULL
         ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-        # send is_ubatch to ffn side
-        # support inequal AF,[ffn_size,ffn_size + min_size) send
-        if self.afd_connector and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
-            self.afd_connector.send_is_ubatch(should_ubatch)
-            self.is_ubatch = should_ubatch
-            logger.info(f'afd_connector.rank in prepare input is {self.afd_connector.rank}, '
-                        f'should_ubatch: {should_ubatch}, ubatch_slices: {ubatch_slices_attn}')
+        self.is_ubatch = should_ubatch
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
@@ -1280,7 +1301,8 @@ class NPUModelRunner(GPUModelRunner):
                     runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
-                                           self.speculative_config,self.is_ubatch)
+                                           self.speculative_config,
+                                           self.is_ubatch)
             else:
                 if self.pcp_size * self.dcp_size > 1:
                     update_attn_dcp_pcp_params(self.update_stream,
@@ -1682,7 +1704,21 @@ class NPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                     afd_comm_stream=self.afd_comm_stream):
                 self.maybe_setup_kv_connector(scheduler_output)
+                # send dp_metadata_list to ffn side
+                # support inequal AF,[ffn_size,ffn_size + min_size) send
+                if self.afd_config and self.afd_connector:
+                    # 构建dp_metadata_list
+                    dp_metadata_list = self._build_afd_dp_metadata_list(ubatch_slices)
+                    # 更新connector状态
+                    self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, False)
 
+                    if self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
+                        self.afd_connector.send_dp_metadata_list(
+                            dp_metadata_list,
+                            is_warmup=self._is_warmup,
+                        )
+                        logger.info(f'afd_connector.rank send_dp_metadata_list is {dp_metadata_list}, '
+                                    f'is_warmup: {self._is_warmup}, ubatch_slices: {ubatch_slices}')
                 hidden_states = self._generate_process_reqs_hidden_states(
                     maybe_padded_num_tokens, input_ids, positions,
                     intermediate_tensors, inputs_embeds, model_kwargs)
@@ -2222,12 +2258,14 @@ class NPUModelRunner(GPUModelRunner):
                     runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
-                                           self.speculative_config,self.is_ubatch)
+                                           self.speculative_config,
+                                           self.is_ubatch)
             else:
                 if self.pcp_size * self.dcp_size > 1:
                     update_attn_dcp_pcp_params(self.update_stream,
                                                forward_context,
-                                               runtime_shape,self.is_ubatch)
+                                               runtime_shape,
+                                               self.is_ubatch)
                 else:
                     update_attn_params(self.update_stream, forward_context,
                                        num_tokens, self.vllm_config)
@@ -2414,15 +2452,7 @@ class NPUModelRunner(GPUModelRunner):
             ubatch_slices_padded,
         )
 
-        # send is_ubatch to ffn side
-        logger.info(f"dummy_run: should_ubatch is {should_ubatch}, ubatch_slices: {ubatch_slices}")
-        # support inequal AF,[ffn_size,ffn_size + min_size) send
-        if self.afd_connector and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
-            logger.info(f'afd_connector.rank in dummy_run is {self.afd_connector.rank}')
-            self.is_ubatch = should_ubatch
-            self.afd_connector.send_is_ubatch(should_ubatch)
-            logger.info(f'afd_connector.rank in dummy_run is {self.afd_connector.rank}, '
-                        f'should_ubatch in dummy_run  is {should_ubatch}')
+        self.is_ubatch = should_ubatch
 
         if not is_profile and self.dynamic_eplb:
             self.eplb_updator.forward_before()
@@ -2515,14 +2545,6 @@ class NPUModelRunner(GPUModelRunner):
                     for k, v in self.intermediate_tensors.items()
                 })
 
-            # if ubatch_slices is not None:
-            #     # Adjust values to reflect a single ubatch.
-            #     # TODO(sage,lucas): this is cruft that should be addressed in
-            #     #  the padding refactor.
-            #     num_tokens_after_padding = ubatch_slices[0].num_tokens
-            #     if num_tokens_across_dp is not None:
-            #         num_tokens_across_dp[:] = num_tokens_after_padding
-
             need_dummy_logits = (not is_profile and lmhead_tp_enable())
             max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
             dummy_indices = torch.zeros(max_num_reqs_across_dp,
@@ -2556,6 +2578,22 @@ class NPUModelRunner(GPUModelRunner):
                     afd_metadata=afd_metadata,
                     ubatch_slices=ubatch_slices,
                     afd_comm_stream=self.afd_comm_stream):
+                # support inequal AF,[ffn_size,ffn_size + min_size) send
+                if self.afd_config and self.afd_connector:
+                    # 构建dp_metadata_list
+                    dp_metadata_list = self._build_afd_dp_metadata_list(ubatch_slices_padded)
+
+                    # 更新connector状态
+                    self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, is_graph_capturing)
+
+                    if self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
+                        self.afd_connector.send_dp_metadata_list(
+                            dp_metadata_list,
+                            is_graph_capturing=is_graph_capturing,
+                            is_warmup=self._is_warmup,
+                        )
+                        logger.info(f'afd_connector.rank in dummy_run send_dp_metadata_list is {dp_metadata_list}, '
+                                    f'is_graph_capturing: {is_graph_capturing}, is_warmup: {self._is_warmup}')
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
                     intermediate_tensors, inputs_embeds)
