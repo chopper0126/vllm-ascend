@@ -377,24 +377,23 @@ class NPUModelRunner(GPUModelRunner):
         self.long_seq_metadata = None
 
         self.afd_comm_stream = torch.npu.Stream()
-        #
-        # import os
-        # experimental_config = torch_npu.profiler._ExperimentalConfig(
-        #     export_type=torch_npu.profiler.ExportType.Text,
-        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        # )
-        # self.prof = torch_npu.profiler.profile(
-        #     activities=[
-        #         torch_npu.profiler.ProfilerActivity.CPU,
-        #         torch_npu.profiler.ProfilerActivity.NPU
-        #     ],
-        #     schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=10, repeat=1, skip_first=1500),
-        #     # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
-        #     experimental_config=experimental_config,
-        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/y00889327/prof")
-        # )
-        # self.prof.start()
+        
+        import os
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        )
+        self.prof = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+            ],
+            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=10, repeat=1, skip_first=1500),
+            # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/j00586476/profile/attn")
+        )
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -1614,7 +1613,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
-        # self.prof.step()
+        self.prof.step()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
