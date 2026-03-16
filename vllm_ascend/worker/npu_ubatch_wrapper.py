@@ -382,6 +382,7 @@ class UBatchWrapper(GPUUBatchWrapper):
                 return self.runnable(*args, **kwargs)
             else:
                 assert self.aclgraph_wrapper is not None
+                print("jcz ubatch wrapper 2")
                 return self.aclgraph_wrapper(*args, **kwargs)
 
         attn_metadata = forward_context.attn_metadata
