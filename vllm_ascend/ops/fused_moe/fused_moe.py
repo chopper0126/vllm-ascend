@@ -776,8 +776,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias, w1_offset, w2_offset = \
             _detect_quantization_and_get_params(layer)
         torch_npu.npu.config.allow_internal_format = True
-        w1 = layer.w13_weight.to(torch.int8)
-        w2 = layer.w2_weight.to(torch.int8)
+        # w1 = layer.w13_weight.to(torch.int8)
+        # w2 = layer.w2_weight.to(torch.int8)
         # 1. Dispatch阶段
         dispatch_output = dispatch_experts(
             hidden_states=hidden_states,
