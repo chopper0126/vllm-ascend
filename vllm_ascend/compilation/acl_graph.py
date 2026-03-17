@@ -310,19 +310,20 @@ def update_attn_params(update_stream, forward_context, runtime_shape,
 
 
 def update_mla_attn_params(update_stream, forward_context, runtime_shape,
-                           speculative_config,is_ubatch):
+                           speculative_config,is_ubatch,num_ubatches):
     if forward_context.is_draft_model:
         graph_params = get_draft_graph_params()
-    elif forward_context.afd_metadata:
-        if is_ubatch:
-            graph_params_dict = get_graph_params_dict()
-            merged_graph_params = interleave_multiple_graph_params(*list(graph_params_dict.values()))
-            list_of_attn_metadata = list_of_dicts_to_dict_of_lists(forward_context.attn_metadata)
-            graph_params = merged_graph_params
-        else:
-            return
+    elif forward_context.afd_metadata and is_ubatch:
+        graph_params_dict = get_graph_params_dict()
+        merged_graph_params = interleave_multiple_graph_params(*list(graph_params_dict.values()))
+        list_of_attn_metadata = list_of_dicts_to_dict_of_lists(forward_context.attn_metadata)
+        graph_params = merged_graph_params
+    elif forward_context.afd_metadata and num_ubatches > 1:
+        logger.debug("AFD metadata is present but is_ubatch is False. This should not happen.")
+        return
     else:
         graph_params = get_graph_params()
+        logger.debug("AFD metadata is not present ,AFD metadata is present and DBO is unenabled")
         
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
@@ -389,6 +390,7 @@ def update_mla_attn_params(update_stream, forward_context, runtime_shape,
             torch.npu.graph_task_update_end(update_stream)
 
             event.record(update_stream)
+    logger.debug(f"update_mla_attn_params successfully executed") 
 
 
 def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):
