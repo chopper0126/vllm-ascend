@@ -287,6 +287,7 @@ class NPUWorker(WorkerBase):
 
             try:
                 while not self._ffn_shutdown_event.is_set():
+                    # self.model_runner.prof.step()
                     # 接收dp_metadata_list
                     (
                         dp_metadata_list,

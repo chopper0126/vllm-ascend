@@ -141,7 +141,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         timeout = datetime.timedelta(seconds=30000)
         if self.is_vaild_rank_for_inequal_AF(self.rank):
             self.p2p_pg = init_afd_process_group(
-                backend="hccl",
+                backend="gloo",
                 init_method=(
                     f"tcp://{self.config.afd_config.afd_host}"
                     f":{self.config.afd_config.afd_port}"
@@ -366,12 +366,12 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
             object_tensor_npu = torch.empty(object_tensor_cpu.shape,
                                             dtype=torch.uint8,
-                                            device="npu")
+                                            device="cpu")
             object_tensor_npu.copy_(object_tensor_cpu)
 
             size_tensor = torch.tensor([object_tensor_cpu.numel()],
                                        dtype=torch.long,
-                                       device="npu")
+                                       device="cpu")
 
             torch.distributed.send(size_tensor, dst=dst, group=self.p2p_pg)
             torch.distributed.send(object_tensor_npu, dst=dst, group=self.p2p_pg)
@@ -379,9 +379,9 @@ class CAMP2PAFDConnector(AFDConnectorBase):
     def recv_is_ubatch(self):
         src = self.p2p_rank % self.min_size + self.ffn_size
 
-        size_tensor = torch.empty(1, dtype=torch.long, device="npu")
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
         rank_size = torch.distributed.recv(size_tensor, src=src, group=self.p2p_pg)
-        object_tensor_npu = torch.empty(size_tensor.item(), dtype=torch.uint8, device="npu")
+        object_tensor_npu = torch.empty(size_tensor.item(), dtype=torch.uint8, device="cpu")
         rank_object = torch.distributed.recv(object_tensor_npu, src=src, group=self.p2p_pg)
 
         assert rank_object == rank_size, "Received object sender rank does not match the size sender rank."
@@ -465,12 +465,12 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
             object_tensor_npu = torch.empty(object_tensor_cpu.shape,
                                             dtype=torch.uint8,
-                                            device="npu")
+                                            device="cpu")
             object_tensor_npu.copy_(object_tensor_cpu)
 
             size_tensor = torch.tensor([object_tensor_cpu.numel()],
                                        dtype=torch.long,
-                                       device="npu")
+                                       device="cpu")
 
             logger.debug(
                 "send_dp_metadata_list dst:%s is_graph_capturing:%s is_warmup:%s",
@@ -488,10 +488,10 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         src = self.p2p_rank % self.min_size + self.ffn_size
         logger.debug(f"recv_dp_metadata_list src:{src}")
 
-        size_tensor = torch.empty(1, dtype=torch.long, device="npu")
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
         rank_size = torch.distributed.recv(size_tensor, src=src, group=self.p2p_pg)
 
-        object_tensor_npu = torch.empty(size_tensor.item(), dtype=torch.uint8, device="npu")
+        object_tensor_npu = torch.empty(size_tensor.item(), dtype=torch.uint8, device="cpu")
         rank_object = torch.distributed.recv(object_tensor_npu, src=src, group=self.p2p_pg)
 
         assert rank_object == rank_size, \
