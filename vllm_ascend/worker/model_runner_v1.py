@@ -1022,10 +1022,10 @@ class NPUModelRunner(GPUModelRunner):
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
-            print(f'ubatch_slices: {ubatch_slices}')
+            logger.debug(f'ubatch_slices: {ubatch_slices}')
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
         else:
-            print(f"ubatch_slices is None")
+            logger.debug(f"ubatch_slices is None")
 
         # pad_attn = self.compilation_config.cudagraph_mode.value == CUDAGraphMode.FULL.value
         # ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -1301,8 +1301,8 @@ class NPUModelRunner(GPUModelRunner):
                     runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
-                                           self.speculative_config,
-                                           self.is_ubatch)
+                                           self.speculative_config,self.is_ubatch,self.parallel_config.num_ubatches)
+                    logger.debug(f"update_mla_attn_params with runtime_shape {runtime_shape}, is_ubatch: {self.is_ubatch} ,num_ubatches: {self.parallel_config.num_ubatches}")
             else:
                 if self.pcp_size * self.dcp_size > 1:
                     update_attn_dcp_pcp_params(self.update_stream,
@@ -2242,8 +2242,8 @@ class NPUModelRunner(GPUModelRunner):
                                    inputs_embeds=inputs_embeds)
         forward_context = get_forward_context()
         assert forward_context is not None
-        print(f'forward_context.cudagraph_runtime_mode in _generate_dummy_run_hidden_states is {forward_context.cudagraph_runtime_mode}',flush=True)
-        print(f'forward_context.capturing in _generate_dummy_run_hidden_states is {forward_context.capturing}',flush=True)
+        logger.debug(f'forward_context.cudagraph_runtime_mode in _generate_dummy_run_hidden_states is {forward_context.cudagraph_runtime_mode}')
+        logger.debug(f'forward_context.capturing in _generate_dummy_run_hidden_states is {forward_context.capturing}')
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             not forward_context.capturing and not self.use_sparse:
             if self.vllm_config.model_config.use_mla:
@@ -2258,8 +2258,7 @@ class NPUModelRunner(GPUModelRunner):
                     runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
-                                           self.speculative_config,
-                                           self.is_ubatch)
+                                           self.speculative_config,self.is_ubatch,self.parallel_config.num_ubatches)
             else:
                 if self.pcp_size * self.dcp_size > 1:
                     update_attn_dcp_pcp_params(self.update_stream,
@@ -2615,7 +2614,7 @@ class NPUModelRunner(GPUModelRunner):
             if not is_profile and self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
-            print(f'attn_dummy_run_call_cnt is {self.attn_dummy_run_call_cnt}')
+            logger.debug(f'attn_dummy_run_call_cnt is {self.attn_dummy_run_call_cnt}')
             self.attn_dummy_run_call_cnt += 1
             return hidden_states, hidden_states
 
@@ -2702,6 +2701,7 @@ class NPUModelRunner(GPUModelRunner):
             self.model = ACLGraphWrapper(self.model,
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL)
+            logger.debug(f"Model wrapped with ACLGraphWrapper in FULL mode.")
         elif self.parallel_config.use_ubatching:
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -2709,6 +2709,7 @@ class NPUModelRunner(GPUModelRunner):
                 set_graph_params_dict([size // self.parallel_config.num_ubatches for size in self.compilation_config.cudagraph_capture_sizes],self.parallel_config.num_ubatches)
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.FULL, self.device)
+                logger.debug(f"Model wrapped with UBatchWrapper in FULL mode, graph capture sizes: {self.compilation_config.cudagraph_capture_sizes}, num_ubatches: {self.parallel_config.num_ubatches}.")
             else:
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.NONE, self.device)

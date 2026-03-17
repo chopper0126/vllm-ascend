@@ -310,20 +310,20 @@ def update_attn_params(update_stream, forward_context, runtime_shape,
 
 
 def update_mla_attn_params(update_stream, forward_context, runtime_shape,
-                           speculative_config,is_ubatch):
+                           speculative_config,is_ubatch,num_ubatches):
     if forward_context.is_draft_model:
         graph_params = get_draft_graph_params()
-    elif forward_context.afd_metadata:
-        if is_ubatch:
-            graph_params_dict = get_graph_params_dict()
-            # only support nums_ubatch = 2
-            merged_graph_params = interleave_graph_params(graph_params_dict[0], graph_params_dict[1])
-            list_of_attn_metadata = list_of_dicts_to_dict_of_lists(forward_context.attn_metadata)
-            graph_params = merged_graph_params
-        else:
-            return
+    elif forward_context.afd_metadata and is_ubatch:
+        graph_params_dict = get_graph_params_dict()
+        merged_graph_params = interleave_multiple_graph_params(*list(graph_params_dict.values()))
+        list_of_attn_metadata = list_of_dicts_to_dict_of_lists(forward_context.attn_metadata)
+        graph_params = merged_graph_params
+    elif forward_context.afd_metadata and num_ubatches > 1:
+        logger.debug("AFD metadata is present but is_ubatch is False. This should not happen.")
+        return
     else:
         graph_params = get_graph_params()
+        logger.debug("AFD metadata is not present ,AFD metadata is present and DBO is unenabled")
         
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
@@ -390,6 +390,7 @@ def update_mla_attn_params(update_stream, forward_context, runtime_shape,
             torch.npu.graph_task_update_end(update_stream)
 
             event.record(update_stream)
+    logger.debug(f"update_mla_attn_params successfully executed") 
 
 
 def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):
@@ -607,63 +608,7 @@ def get_draft_graph_params():
 def get_graph_params_dict():
     return _graph_params_dict
 
-def interleave_lists(list0: List, list1: List) -> List:
-    """
-    Interleave two lists element-wise by index.
-    Example: list0 = [a0, a1], list1 = [b0, b1] → [a0, b0, a1, b1]
-    If lengths differ, remaining elements are appended at the end.
-    """
-    result = []
-    min_len = min(len(list0), len(list1))
-    for i in range(min_len):
-        result.append(list0[i])
-        result.append(list1[i])
-    result.extend(list0[min_len:])
-    result.extend(list1[min_len:])
-    return result
 
-
-def interleave_dict_of_lists(
-    dict0: Dict[int, List],
-    dict1: Dict[int, List]
-) -> Dict[int, List]:
-    """
-    For each key present in either dictionary, interleave the corresponding lists.
-    If a key exists only in one dict, its list is kept as-is.
-    """
-    all_keys = set(dict0.keys()) | set(dict1.keys())
-    new_dict = {}
-    for key in all_keys:
-        list0 = dict0.get(key, [])
-        list1 = dict1.get(key, [])
-        new_dict[key] = interleave_lists(list0, list1)
-    return new_dict
-
-
-def interleave_graph_params(params0: GraphParams, params1: GraphParams) -> GraphParams:
-    """
-    Interleave all Dict[int, List] fields of two GraphParams objects by their inner keys.
-    The workspaces field is Dict[int, Tensor] and does not contain lists;
-    a specific merging policy must be defined. Here we demonstrate:
-    keep workspaces from params0, and add entries from params1 that are missing.
-    Adjust according to your actual requirements.
-    """
-    # Interleave events
-    new_events = interleave_dict_of_lists(params0.events, params1.events)
-    # Interleave handles
-    new_handles = interleave_dict_of_lists(params0.handles, params1.handles)
-    # Interleave attn_params
-    new_attn_params = interleave_dict_of_lists(params0.attn_params, params1.attn_params)
-
-    # workspaces: no merging required – keep params0's workspaces as-is
-    new_workspaces = params0.workspaces.copy()
-
-    return GraphParams(
-        events=new_events,
-        workspaces=new_workspaces,
-        handles=new_handles,
-        attn_params=new_attn_params
-    )
 
 
 def list_of_dicts_to_dict_of_lists(list_of_dicts: List[Dict]):
@@ -683,3 +628,77 @@ def list_of_dicts_to_dict_of_lists(list_of_dicts: List[Dict]):
     return ans
 
 
+from typing import Dict, List, TypeVar, Generic, Any
+
+T = TypeVar('T')
+
+def interleave_multiple_lists(*lists: List[T]) -> List[T]:
+    """
+    Interleave multiple lists element by element.
+    Example: [a, b], [x, y], [1, 2] -> [a, x, 1, b, y, 2]
+    """
+    if not lists:
+        return []
+    
+    max_len = max(len(lst) for lst in lists) if lists else 0
+    result = []
+    
+    for i in range(max_len):
+        for lst in lists:
+            if i < len(lst):
+                result.append(lst[i])
+    
+    return result
+
+
+def interleave_multiple_dict_of_lists(*dicts: Dict[int, List]) -> Dict[int, List]:
+    """
+    For each key present in any dictionary, interleave the corresponding lists.
+    If a key exists only in some dicts, those lists are interleaved while missing ones are treated as empty.
+    """
+    if not dicts:
+        return {}
+    
+    all_keys = set()
+    for d in dicts:
+        all_keys.update(d.keys())
+    
+    new_dict = {}
+    for key in all_keys:
+        # Get the corresponding list from each dict, defaulting to empty list if key not found
+        lists_to_interleave = [d.get(key, []) for d in dicts]
+        new_dict[key] = interleave_multiple_lists(*lists_to_interleave)
+    
+    return new_dict
+
+def interleave_multiple_graph_params(*params_list) -> GraphParams:
+    """
+    Interleave multiple GraphParams objects.
+    For Dict[int, List] fields (events, handles, attn_params): interleave corresponding lists by key
+    For Dict[int, Tensor] field (workspaces): keep values from the first param, add missing entries from others
+    """
+    if not params_list:
+        return GraphParams()
+    
+    # Interleave events
+    new_events = interleave_multiple_dict_of_lists(*(p.events for p in params_list))
+    
+    # Interleave handles
+    new_handles = interleave_multiple_dict_of_lists(*(p.handles for p in params_list))
+    
+    # Interleave attn_params
+    new_attn_params = interleave_multiple_dict_of_lists(*(p.attn_params for p in params_list))
+    
+    # Merge workspaces: start with first param's workspaces, then add missing entries from others
+    new_workspaces = params_list[0].workspaces.copy()
+    # for param in params_list[1:]:
+    #     for key, value in param.workspaces.items():
+    #         if key not in new_workspaces:
+    #             new_workspaces[key] = value
+    
+    return GraphParams(
+        events=new_events,
+        workspaces=new_workspaces,
+        handles=new_handles,
+        attn_params=new_attn_params
+    )
