@@ -214,22 +214,21 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             num_shared_experts: int = 0,
             global_num_experts: int = -1,
             **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            mix_placement=mix_placement,
-            num_logical_experts=num_logical_experts,
-            num_shared_experts=num_shared_experts,
-            global_num_experts=global_num_experts,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.cam_select_experts(
+            hidden_states,
+            router_logits,
+            top_k,
+            use_grouped_topk,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            float(routed_scaling_factor),
+            e_score_correction_bias,
+            bool(mix_placement),
+            num_logical_experts,
+            num_shared_experts,
+            global_num_experts
         )
 
     def compute_moe(self, experts, hidden_states, **kwargs):
@@ -527,6 +526,64 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         self.is_graph_capturing = is_graph_capturing
 
 
+def cam_select_experts_impl(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        use_grouped_topk: bool,
+        renormalize: bool,
+        topk_group: Optional[int],
+        num_expert_group: Optional[int],
+        routed_scaling_factor: float,
+        e_score_correction_bias: Optional[torch.Tensor],
+        mix_placement: bool,
+        num_logical_experts: int,
+        num_shared_experts: int,
+        global_num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        top_k=top_k,
+        use_grouped_topk=use_grouped_topk,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        custom_routing_function=None,
+        routed_scaling_factor=routed_scaling_factor,
+        e_score_correction_bias=e_score_correction_bias,
+        mix_placement=mix_placement,
+        num_logical_experts=num_logical_experts,
+        num_shared_experts=num_shared_experts,
+        global_num_experts=global_num_experts,
+    )
+
+
+def cam_select_experts_fake_impl(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        use_grouped_topk: bool,
+        renormalize: bool,
+        topk_group: Optional[int],
+        num_expert_group: Optional[int],
+        routed_scaling_factor: float,
+        e_score_correction_bias: Optional[torch.Tensor],
+        mix_placement: bool,
+        num_logical_experts: int,
+        num_shared_experts: int,
+        global_num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = router_logits.shape[0]
+    out_k = top_k
+    if mix_placement:
+        out_k += num_shared_experts
+    
+    topk_weights = torch.empty((num_tokens, out_k), dtype=hidden_states.dtype, device=hidden_states.device)
+    topk_ids = torch.empty((num_tokens, out_k), dtype=torch.int32, device=hidden_states.device)
+    return topk_weights, topk_ids
+
+
 def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                               topk_weights: torch.Tensor,
                               topk_idx: torch.Tensor,
@@ -644,6 +701,12 @@ def cam_recv_ffn_output_fake_impl(hidden_states: torch.Tensor,
                                   multistream_enable: bool) -> torch.Tensor:
     return hidden_states
 
+
+direct_register_custom_op(op_name="cam_select_experts",
+                          op_func=cam_select_experts_impl,
+                          fake_impl=cam_select_experts_fake_impl,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
 
 direct_register_custom_op(op_name="cam_send_attn_output",
                           op_func=cam_send_attn_output_impl,
