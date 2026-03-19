@@ -426,11 +426,16 @@ class NPUModelRunner(GPUModelRunner):
                                                          dtype=torch.int64)
         self.num_discarded_requests = 0
 
-    def _build_afd_dp_metadata_list(self, ubatch_slices_padded) -> dict:
+    def _build_afd_dp_metadata_list(
+        self,
+        ubatch_slices_padded,
+        num_tokens_across_dp: Optional[torch.Tensor] = None
+    ) -> dict:
         """构建dp_metadata_list用于发送给FFN侧
 
         Args:
             ubatch_slices_padded: ubatch slices with padding
+            num_tokens_across_dp: 已聚合的所有DP rank的token数，大小为dp_size
 
         Returns:
             dict: {stage_idx: DPMetadata}
@@ -439,9 +444,13 @@ class NPUModelRunner(GPUModelRunner):
         if ubatch_slices_padded is not None:
             for idx, ubatch_slice in enumerate(ubatch_slices_padded):
                 dp_size = self.vllm_config.parallel_config.data_parallel_size
-                ubatch_num_tokens_across_dp = torch.tensor(
-                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-                )
+                # 使用传入的已聚合的num_tokens_across_dp
+                if num_tokens_across_dp is not None:
+                    ubatch_num_tokens_across_dp = num_tokens_across_dp
+                else:
+                    ubatch_num_tokens_across_dp = torch.tensor(
+                        [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
+                    )
                 dp_metadata_list[idx] = DPMetadata.make(
                     self.vllm_config.parallel_config,
                     ubatch_slice.num_tokens,
@@ -1705,14 +1714,17 @@ class NPUModelRunner(GPUModelRunner):
                     afd_comm_stream=self.afd_comm_stream):
                 self.maybe_setup_kv_connector(scheduler_output)
                 # send dp_metadata_list to ffn side
-                # support inequal AF,[ffn_size,ffn_size + min_size) send
+                # 每个Attention rank都发送数据给对应的FFN rank
                 if self.afd_config and self.afd_connector:
-                    # 构建dp_metadata_list
-                    dp_metadata_list = self._build_afd_dp_metadata_list(ubatch_slices)
+                    # 构建dp_metadata_list，传入已聚合的num_tokens_across_dp
+                    dp_metadata_list = self._build_afd_dp_metadata_list(
+                        ubatch_slices, num_tokens_across_dp
+                    )
                     # 更新connector状态
                     self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, False)
 
-                    if self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
+                    # 每个Attention rank都发送数据给对应的FFN rank
+                    if self.afd_connector.dst_list:
                         self.afd_connector.send_dp_metadata_list(
                             dp_metadata_list,
                             is_warmup=self._is_warmup,
@@ -2577,15 +2589,18 @@ class NPUModelRunner(GPUModelRunner):
                     afd_metadata=afd_metadata,
                     ubatch_slices=ubatch_slices,
                     afd_comm_stream=self.afd_comm_stream):
-                # support inequal AF,[ffn_size,ffn_size + min_size) send
+                # 每个Attention rank都发送数据给对应的FFN rank
                 if self.afd_config and self.afd_connector:
-                    # 构建dp_metadata_list
-                    dp_metadata_list = self._build_afd_dp_metadata_list(ubatch_slices_padded)
+                    # 构建dp_metadata_list，传入已聚合的num_tokens_across_dp
+                    dp_metadata_list = self._build_afd_dp_metadata_list(
+                        ubatch_slices_padded, num_tokens_across_dp
+                    )
 
                     # 更新connector状态
                     self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, is_graph_capturing)
 
-                    if self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
+                    # 每个Attention rank都发送数据给对应的FFN rank
+                    if self.afd_connector.dst_list:
                         self.afd_connector.send_dp_metadata_list(
                             dp_metadata_list,
                             is_graph_capturing=is_graph_capturing,

@@ -92,10 +92,33 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         self.min_size = min(self.ffn_size, self.attn_size)
         self.ratio = self.attn_size // self.ffn_size  # attn_size / ffn_size, for asymmetric A/F
+        # 计算分组相关变量
+        if self.attn_size >= self.ffn_size:
+            self.group_size = self.attn_size // self.ffn_size
+        else:
+            self.group_size = 1
         world_rank = self.rank + self.ffn_size if role == "attention" else self.rank
-        # p2p_rank: 所有FFN [0, ffn_size), 前min_size个Attention [ffn_size, ffn_size+min_size)
-        self.p2p_rank = self.rank + self.min_size if role == "attention" else self.rank
         self.rank = world_rank
+
+        # 计算是否为分组代表（用于p2p通信）
+        # FFN rank: 直接参与
+        # Attention rank: 只有每个分组的第一个rank参与
+        if role == "ffn":
+            self.is_p2p_participant = True
+            self.p2p_rank = self.rank  # FFN rank: 0, 1, ..., ffn_size-1
+        else:
+            # Attention rank
+            local_attn_rank = self.rank - self.ffn_size
+            # 只有分组第一个rank参与p2p（local_attn_rank % group_size == 0）
+            if self.attn_size >= self.ffn_size:
+                self.is_p2p_participant = (local_attn_rank % self.group_size == 0)
+            else:
+                self.is_p2p_participant = True  # attn_size < ffn_size时，所有attn都参与
+            # p2p_rank: FFN后面紧跟分组代表，每个分组一个代表
+            if self.is_p2p_participant:
+                self.p2p_rank = self.ffn_size + (local_attn_rank // self.group_size)
+            else:
+                self.p2p_rank = -1  # 不参与p2p
 
         print(f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
         logger.debug(
@@ -135,31 +158,45 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             )
             self.hccl_comm_name1 = self.afd_pg1._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
 
-        # 所有FFN和前min_size的Attention参与p2p通信
-        # 所有FFN: world_rank in [0, ffn_size), 前min_size个Attention: world_rank in [ffn_size, ffn_size+min_size)
+        # p2p通信组：所有FFN + 每个Attention分组的代表
+        # FFN: p2p_rank in [0, ffn_size)
+        # Attention分组代表: p2p_rank in [ffn_size, ffn_size + num_groups)
         import datetime
         timeout = datetime.timedelta(seconds=30000)
-        if self.is_vaild_rank_for_inequal_AF(self.rank):
+        if self.is_p2p_participant:
+            # p2p组大小 = ffn_size + 分组数（每个分组一个代表）
+            num_attn_groups = (self.attn_size + self.group_size - 1) // self.group_size
+            p2p_world_size = self.ffn_size + num_attn_groups
             self.p2p_pg = init_afd_process_group(
                 backend="gloo",
                 init_method=(
                     f"tcp://{self.config.afd_config.afd_host}"
                     f":{self.config.afd_config.afd_port}"
                 ),
-                world_size=self.ffn_size + self.min_size,
+                world_size=p2p_world_size,
                 rank=self.p2p_rank,
                 group_name="p2p",
                 timeout=timeout  # TODO(yxj):use timeout set
             )
 
-        # 前min_size的Attention向多个FFN发送metadata（1对多映射）
-        # attn_i 向所有 ffn_j (其中 j % min_size == i) 发送
-        if self.is_attn_top_min_size_rank(self.rank):
-            local_attn_rank = self.rank - self.ffn_size
-            dst = local_attn_rank
-            while dst < self.ffn_size:
-                self.dst_list.append(dst)
-                dst += self.min_size
+        # 每个Attention rank发送metadata给对应的FFN rank（分组映射）
+        # 映射方式：attn_i 发送给 ffn_j，其中 j = local_attn_rank // group_size
+        # 例如 4A2F：A0,A1 → F0，A2,A3 → F1
+        # 注意：由于num_tokens_across_dp已通过all_reduce聚合，每个分组的第一个rank发送即可
+        if role == "attention":
+            local_attn_rank = self.rank - self.ffn_size  # 0, 1, 2, ..., attn_size-1
+            if self.attn_size >= self.ffn_size:
+                group_size = self.attn_size // self.ffn_size
+                dst = local_attn_rank // group_size
+                # 只有每个分组的第一个rank发送（避免重复发送）
+                if local_attn_rank % group_size == 0:
+                    self.dst_list.append(dst)
+            else:
+                # attn_size < ffn_size 的情况：每个Attention发送给多个FFN
+                dst = local_attn_rank
+                while dst < self.ffn_size:
+                    self.dst_list.append(dst)
+                    dst += self.attn_size
 
         self.aiv_num = int(self.config.afd_config.multistream_info["core_num"]) if self.config.afd_config.is_multistream else 48
 
@@ -311,7 +348,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         handle = metadata.handle
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
-        torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[4],
+        torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[0],
                                       batch_size=batch_size, hidden_size=h, topk=k,
                                       expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
                                       rank=self.rank, group_ep=groupEp,
@@ -484,7 +521,8 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         Returns:
             tuple: (data, is_graph_capturing, is_warmup)
         """
-        src = self.p2p_rank % self.min_size + self.ffn_size
+        # FFN rank i 从对应的分组代表接收（分组代表的p2p_rank = ffn_size + i）
+        src = self.ffn_size + self.p2p_rank
         logger.debug(f"recv_dp_metadata_list src:{src}")
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
