@@ -272,6 +272,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             moe_expert_num = self.hf_config.n_routed_experts
 
         multistream_enable = False if metadata.layer_idx == self.hf_config.first_k_dense_replace else self.config.afd_config.is_multistream # dense层的后一层不分流
+        compute_gate = 1 if getattr(self.config.afd_config, 'compute_gate_on_attention', True) else 0
         return torch.ops.vllm.cam_send_attn_output(hidden_states, topk_weights, topk_idx,
                                                    self.hccl_comm_name,
                                                    self.hccl_comm_name2,
@@ -279,12 +280,13 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                                                    self.rank,
                                                    self.ffn_size,
                                                    self.attn_size,
-                                                   self.hf_config.n_routed_experts,
+                                                   moe_expert_num,
                                                    self.max_num_reqs,
                                                    self.hf_config.hidden_size,
                                                    k,
                                                    multistream_enable,
-                                                   self.aiv_num), None
+                                                   self.aiv_num,
+                                                   compute_gate), None
 
     # MOE发给ATTN（ATTN接收）
     def recv_ffn_output(self,
@@ -328,23 +330,26 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         h = metadata.h
         k = metadata.k
         aiv_num = metadata.aiv_num
+        
+        compute_gate = 1 if getattr(self.config.afd_config, 'compute_gate_on_attention', True) else 0
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
         outputs = torch.ops.umdk_cam_op_lib.a2e(x=torch.tensor([], dtype=torch.bfloat16, device='npu'),
-                                                expert_ids=torch.tensor([], dtype=torch.int32, device='npu'),
-                                                scales=torch.tensor([], dtype=torch.float, device='npu'),
+                                                expert_ids=torch.tensor([], dtype=torch.int32, device='npu') if compute_gate == 1 else None,
+                                                scales=torch.tensor([], dtype=torch.float, device='npu') if compute_gate == 1 else None,
                                                 batch_size=batch_size, hidden_size=h, topk=k,
                                                 expert_rank_size=self.ffn_size, atten_rank_size=self.attn_size,
                                                 rank=self.rank, group_ep=groupEp,
-                                                aiv_num=aiv_num)
+                                                aiv_num=aiv_num,
+                                                compute_gate=compute_gate)
 
         # outputs: [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut]
         from vllm.distributed.afd_transfer.afd_connector.metadata import AFDRecvOutput
         return AFDRecvOutput(
             hidden_states=outputs[0],
             metadata=afdmetadata,
-            topk_ids=outputs[1],  # simulateExpertIdss
-            topk_weights=outputs[2],  # simulateExpertScales
+            topk_ids=outputs[1] if compute_gate == 1 else None,  # simulateExpertIdss
+            topk_weights=outputs[2] if compute_gate == 1 else None,  # simulateExpertScales
             atten_batch_size=outputs[3],
             x_active_mask=outputs[4],
             cam_p2p_ep_name=self.hccl_comm_name1
@@ -585,8 +590,8 @@ def cam_select_experts_fake_impl(
 
 
 def cam_send_attn_output_impl(hidden_states: torch.Tensor,
-                              topk_weights: torch.Tensor,
-                              topk_idx: torch.Tensor,
+                              topk_weights: Optional[torch.Tensor],
+                              topk_idx: Optional[torch.Tensor],
                               hccl_comm_name: str,
                               hccl_comm_name2: str,
                               hccl_comm_name3: Optional[str],
@@ -598,7 +603,8 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                               h: int,
                               k: int,
                               multistream_enable: bool,
-                              aiv_num: int) -> torch.Tensor:
+                              aiv_num: int,
+                              compute_gate: int = 1) -> torch.Tensor:
     ubatch_idx = get_forward_context().ubatch_idx
     comm_stream = get_forward_context().afd_comm_stream
     comm_event = get_forward_context().afd_comm_event
@@ -631,7 +637,8 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                                                 batch_size=batch_size, hidden_size=h, topk=k,
                                                 expert_rank_size=ffn_size, atten_rank_size=attn_size,
                                                 rank=rank, group_ep=groupEp,
-                                                aiv_num=aiv_num)
+                                                aiv_num=aiv_num,
+                                                compute_gate=compute_gate)
 
         hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut = handle_out[0:5]
         handle = [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize]
@@ -643,8 +650,8 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
 
 
 def cam_send_attn_output_fake_impl(hidden_states: torch.Tensor,
-                                   topk_weights: torch.Tensor,
-                                   topk_idx: torch.Tensor,
+                                   topk_weights: Optional[torch.Tensor],
+                                   topk_idx: Optional[torch.Tensor],
                                    hccl_comm_name: str,
                                    hccl_comm_name2: str,
                                    hccl_comm_name3: Optional[str],
@@ -656,7 +663,8 @@ def cam_send_attn_output_fake_impl(hidden_states: torch.Tensor,
                                    h: int,
                                    k: int,
                                    multistream_enable: bool,
-                                   aiv_num: int) -> torch.Tensor:
+                                   aiv_num: int,
+                                   compute_gate: int = 1) -> torch.Tensor:
     return hidden_states
 
 
