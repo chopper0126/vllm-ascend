@@ -311,7 +311,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         handle = metadata.handle
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
-        torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[0],
+        torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[4],
                                       batch_size=batch_size, hidden_size=h, topk=k,
                                       expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
                                       rank=self.rank, group_ep=groupEp,
