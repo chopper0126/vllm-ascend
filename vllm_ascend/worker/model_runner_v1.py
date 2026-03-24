@@ -436,29 +436,43 @@ class NPUModelRunner(GPUModelRunner):
         Args:
             ubatch_slices_padded: ubatch slices with padding
             num_tokens_across_dp: 已聚合的所有DP rank的token数，大小为dp_size
+                注意：对于ubatch场景，此参数不适用（因为需要per-ubatch的token数）
 
         Returns:
             dict: {stage_idx: DPMetadata}
         """
         dp_metadata_list = {}
         if ubatch_slices_padded is not None:
+            # ubatch场景：每个ubatch有自己的token数
+            # DPMetadata要求num_tokens_across_dp[dp_rank] == batchsize (ubatch_slice.num_tokens)
+            # 所以需要为每个ubatch创建对应的数组
             for idx, ubatch_slice in enumerate(ubatch_slices_padded):
                 dp_size = self.vllm_config.parallel_config.data_parallel_size
-                # 使用传入的已聚合的num_tokens_across_dp
-                if num_tokens_across_dp is not None:
-                    ubatch_num_tokens_across_dp = num_tokens_across_dp
-                else:
-                    ubatch_num_tokens_across_dp = torch.tensor(
-                        [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-                    )
+                # 对于ubatch，使用per-ubatch的token数创建数组
+                # 假设所有DP rank在同一个ubatch中有相同的token数
+                ubatch_num_tokens_across_dp = torch.tensor(
+                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
+                )
                 dp_metadata_list[idx] = DPMetadata.make(
                     self.vllm_config.parallel_config,
                     ubatch_slice.num_tokens,
                     ubatch_num_tokens_across_dp,
                 )
         else:
-            # 单个stage，使用当前的dp_metadata
-            dp_metadata_list[0] = get_forward_context().dp_metadata
+            # 单个stage，使用传入的已聚合num_tokens_across_dp
+            if num_tokens_across_dp is not None:
+                dp_size = self.vllm_config.parallel_config.data_parallel_size
+                # 获取当前rank的token数作为batchsize
+                dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+                batchsize = int(num_tokens_across_dp[dp_rank].item())
+                dp_metadata_list[0] = DPMetadata.make(
+                    self.vllm_config.parallel_config,
+                    batchsize,
+                    num_tokens_across_dp,
+                )
+            else:
+                # fallback：使用forward_context中的dp_metadata
+                dp_metadata_list[0] = get_forward_context().dp_metadata
         return dp_metadata_list
 
     def _get_drafter(self):
