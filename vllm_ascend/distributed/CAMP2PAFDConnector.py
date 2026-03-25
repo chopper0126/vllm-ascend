@@ -336,7 +336,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                                                 batch_size=batch_size, hidden_size=h, topk=k,
                                                 expert_rank_size=self.ffn_size, atten_rank_size=self.attn_size,
                                                 rank=self.rank, group_ep=groupEp,
-                                                aiv_num=aiv_num)
+                                                aiv_num=aiv_num, compute_gate=1)
 
         # outputs: [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut]
         from vllm.distributed.afd_transfer.afd_connector.metadata import AFDRecvOutput
@@ -631,7 +631,7 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
                                                 batch_size=batch_size, hidden_size=h, topk=k,
                                                 expert_rank_size=ffn_size, atten_rank_size=attn_size,
                                                 rank=rank, group_ep=groupEp,
-                                                aiv_num=aiv_num)
+                                                aiv_num=aiv_num, compute_gate=1)
 
         hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut = handle_out[0:5]
         handle = [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize]
