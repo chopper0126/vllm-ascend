@@ -73,6 +73,40 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE":
     lambda: bool(int(os.getenv("VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE", '0'))
                  ),
+    # Whether to enable the profiler in NPUModelRunner.
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_ENABLE",
+                               '1'))),
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_WAIT":
+    lambda: int(os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_WAIT", 2)),
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_WARMUP":
+    lambda: int(os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_WARMUP", 1)),
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_ACTIVE":
+    lambda: int(os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_ACTIVE", 10)),
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_REPEAT":
+    lambda: int(os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_REPEAT", 1)),
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_SKIP_FIRST":
+    lambda: int(
+        os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_SKIP_FIRST", 1500)),
+    "VLLM_ASCEND_MODEL_RUNNER_PROFILER_DIR":
+    lambda: os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_DIR") or os.getenv(
+        "VLLM_TORCH_PROFILER_DIR") or "/tmp/profile/attn",
+    # Whether to enable the profiler in NPUFFNModelRunner.
+    "VLLM_ASCEND_FFN_PROFILER_ENABLE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FFN_PROFILER_ENABLE", '1'))),
+    "VLLM_ASCEND_FFN_PROFILER_WAIT":
+    lambda: int(os.getenv("VLLM_ASCEND_FFN_PROFILER_WAIT", 2)),
+    "VLLM_ASCEND_FFN_PROFILER_WARMUP":
+    lambda: int(os.getenv("VLLM_ASCEND_FFN_PROFILER_WARMUP", 1)),
+    "VLLM_ASCEND_FFN_PROFILER_ACTIVE":
+    lambda: int(os.getenv("VLLM_ASCEND_FFN_PROFILER_ACTIVE", 20)),
+    "VLLM_ASCEND_FFN_PROFILER_REPEAT":
+    lambda: int(os.getenv("VLLM_ASCEND_FFN_PROFILER_REPEAT", 1)),
+    "VLLM_ASCEND_FFN_PROFILER_SKIP_FIRST":
+    lambda: int(os.getenv("VLLM_ASCEND_FFN_PROFILER_SKIP_FIRST", 1500)),
+    "VLLM_ASCEND_FFN_PROFILER_DIR":
+    lambda: os.getenv("VLLM_ASCEND_FFN_PROFILER_DIR") or os.getenv(
+        "VLLM_TORCH_PROFILER_DIR") or "/tmp/profile/ffn",
     # Some models are optimized by vllm ascend. While in some case, e.g. rlhf
     # training, the optimized model may not be suitable. In this case, set this
     # value to False to disable the optimized model.
