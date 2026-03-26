@@ -135,6 +135,7 @@ class AscendDeepseekV2MoE(DeepseekV2MoE, nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        set_substitute_tp(1)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Chunk the hidden states so they aren't replicated across TP ranks.
@@ -170,6 +171,7 @@ class AscendDeepseekV2MoE(DeepseekV2MoE, nn.Module):
         elif self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states)
+        set_substitute_tp(0)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def afd_forward(
