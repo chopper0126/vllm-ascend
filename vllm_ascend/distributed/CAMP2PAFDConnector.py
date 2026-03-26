@@ -335,8 +335,8 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
         outputs = torch.ops.umdk_cam_op_lib.a2e(x=torch.tensor([], dtype=torch.bfloat16, device='npu'),
-                                                expert_ids=torch.tensor([], dtype=torch.int32, device='npu') if compute_gate == 1 else None,
-                                                scales=torch.tensor([], dtype=torch.float, device='npu') if compute_gate == 1 else None,
+                                                expert_ids=torch.tensor([], dtype=torch.int32, device='npu'),
+                                                scales=torch.tensor([], dtype=torch.float, device='npu'),
                                                 batch_size=batch_size, hidden_size=h, topk=k,
                                                 expert_rank_size=self.ffn_size, atten_rank_size=self.attn_size,
                                                 rank=self.rank, group_ep=groupEp,
