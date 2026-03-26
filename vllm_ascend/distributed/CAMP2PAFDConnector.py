@@ -161,7 +161,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                 self.dst_list.append(dst)
                 dst += self.min_size
 
-        self.aiv_num = int(self.config.afd_config.multistream_info["core_num"]) if self.config.afd_config.is_multistream else 48
+        self.aiv_num = int(self.config.afd_config.multistream_info["core_num"]) if self.config.afd_config.is_multistream else 8
 
         logger.debug(f"[CAM] world_rank={self.rank}, p2p_rank={self.p2p_rank}, min_size={self.min_size}, "
                      f"dst_list={self.dst_list}, cam connector initialized")
