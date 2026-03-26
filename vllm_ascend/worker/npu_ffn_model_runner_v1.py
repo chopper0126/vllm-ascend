@@ -447,12 +447,13 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     afd_metadata=afd_metadata,
                     num_tokens=num_tokens_across_dp[0],
                     num_tokens_across_dp=num_tokens_across_dp):
-            for layer_idx in range(self.first_k_dense_replace,self.num_layers):
+            for layer_idx in range(0, self.num_layers):
                 for ubatch_idx in range(num_ubatches):
                     # recv
                     afd_connector_data = self.connector.create_recv_metadata(
                         dp_metadata_list=dp_metadata_list,
                         ubatch_idx=ubatch_idx,
+                        layer_idx=layer_idx,
                         max_num_tokens=self.max_num_tokens)
                     recv_output = self.connector.recv_attn_output(metadata=afd_connector_data, ubatch_idx=ubatch_idx)
                     if hasattr(self.connector, "update_metadata") and afd_connector_data is not None:
