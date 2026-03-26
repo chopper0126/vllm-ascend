@@ -90,7 +90,7 @@ env_variables: Dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_SKIP_FIRST", 1500)),
     "VLLM_ASCEND_MODEL_RUNNER_PROFILER_DIR":
     lambda: os.getenv("VLLM_ASCEND_MODEL_RUNNER_PROFILER_DIR") or os.getenv(
-        "VLLM_TORCH_PROFILER_DIR") or "/home/j00586476/profile/attn",
+        "VLLM_TORCH_PROFILER_DIR") or "/tmp/profile/attn",
     # Whether to enable the profiler in NPUFFNModelRunner.
     "VLLM_ASCEND_FFN_PROFILER_ENABLE":
     lambda: bool(int(os.getenv("VLLM_ASCEND_FFN_PROFILER_ENABLE", '1'))),
@@ -106,7 +106,7 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("VLLM_ASCEND_FFN_PROFILER_SKIP_FIRST", 1500)),
     "VLLM_ASCEND_FFN_PROFILER_DIR":
     lambda: os.getenv("VLLM_ASCEND_FFN_PROFILER_DIR") or os.getenv(
-        "VLLM_TORCH_PROFILER_DIR") or "/home/j00586476/profile/ffn",
+        "VLLM_TORCH_PROFILER_DIR") or "/tmp/profile/ffn",
     # Some models are optimized by vllm ascend. While in some case, e.g. rlhf
     # training, the optimized model may not be suitable. In this case, set this
     # value to False to disable the optimized model.
