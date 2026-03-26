@@ -28,6 +28,7 @@ from vllm_ascend.worker.model_runner_v1 import (NPUModelRunner, graph_capture,
                                               _replace_gpu_model_runner_function_wrapper)
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.distributed.metadata import (M2NAFDConnectorMetadata, CAMM2NAFDConnectorMetadata, CAMP2PAFDConnectorMetadata)
+import vllm_ascend.envs as envs_ascend
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (CompilationMode, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config)
@@ -105,24 +106,31 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             self.uniform_decode_query_len
         )
 
-        self.profiler
-        import os
-        experimental_config = torch_npu.profiler._ExperimentalConfig(
-            export_type=torch_npu.profiler.ExportType.Text,
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        )
-        self.prof = torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU
-            ],
-            schedule=torch_npu.profiler.schedule(wait=2, warmup=1, active=20, repeat=1, skip_first=1500),
-            # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
-            experimental_config=experimental_config,
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/home/j00586476/profile/ffn")
-        )
-        # self.prof.start()
+        self.prof = None
+        if envs_ascend.VLLM_ASCEND_FFN_PROFILER_ENABLE:
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                export_type=torch_npu.profiler.ExportType.Text,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            )
+            logger.info(
+                "NPUFFNModelRunner profiler enabled. Traces will be saved to: %s",
+                envs_ascend.VLLM_ASCEND_FFN_PROFILER_DIR)
+            self.prof = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU
+                ],
+                schedule=torch_npu.profiler.schedule(
+                    wait=envs_ascend.VLLM_ASCEND_FFN_PROFILER_WAIT,
+                    warmup=envs_ascend.VLLM_ASCEND_FFN_PROFILER_WARMUP,
+                    active=envs_ascend.VLLM_ASCEND_FFN_PROFILER_ACTIVE,
+                    repeat=envs_ascend.VLLM_ASCEND_FFN_PROFILER_REPEAT,
+                    skip_first=envs_ascend.VLLM_ASCEND_FFN_PROFILER_SKIP_FIRST),
+                # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
+                experimental_config=experimental_config,
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    envs_ascend.VLLM_ASCEND_FFN_PROFILER_DIR))
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -143,7 +151,8 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             intermediate_tensors: 中间张量（FFN侧通常为None）
             dp_metadata_list: dp_metadata列表，包含每个stage的token数量信息
         """
-        self.prof.step()
+        if self.prof is not None:
+            self.prof.step()
         try:
             # 从dp_metadata_list中获取is_ubatch
             is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
