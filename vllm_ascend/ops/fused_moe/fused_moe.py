@@ -151,6 +151,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                        device=topk_ids.device)
             topk_ids = torch.argsort(
                 random_matrix, dim=1)[:, :topk_ids.size(1)].to(topk_ids.dtype)
+        elif layer.enable_force_load_balance:
+            fake_routed_topk_ids = layer._get_force_lb_topk_ids(
+                batch_tokens=topk_ids.shape[0], device=topk_ids.device)
+            if fake_routed_topk_ids is not None:
+                fake_routed_topk_ids = fake_routed_topk_ids.to(topk_ids.dtype)
+                if layer.mix_placement:
+                    shared_topk_ids = topk_ids[:, top_k:]
+                    topk_ids = torch.cat([fake_routed_topk_ids, shared_topk_ids],
+                                         dim=1)
+                else:
+                    topk_ids = fake_routed_topk_ids
 
         moe_comm_method = get_forward_context().moe_comm_method
         final_hidden_states = moe_comm_method.fused_experts(
@@ -176,6 +187,7 @@ class AscendFusedMoE(FusedMoE):
         super().__init__(*args, **kwargs)
 
         num_experts = kwargs["num_experts"]
+        self.n_routed_experts = num_experts
         intermediate_size = kwargs["intermediate_size"]
         num_shared_experts = kwargs.get("n_shared_experts", 0)
 
@@ -200,14 +212,23 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.mc2_group = get_mc2_group()
         self.moe_config.supports_eplb = self.quant_method.supports_eplb
         ascend_config = get_ascend_config()
+        vllm_config = get_current_vllm_config()
+        additional_config = vllm_config.additional_config or {}
         # flashcommon3 gate stream
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
         if self.multistream_overlap_gate and AscendFusedMoE.gate_stream is None:
             AscendFusedMoE.gate_stream = torch.npu.Stream()
         if self.custom_routing_function is None and self.e_score_correction_bias is not None:
-            vllm_config = get_current_vllm_config()
             self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
                 dtype=vllm_config.model_config.dtype)
+        self.enable_force_load_balance = bool(
+            additional_config.get("enable_force_load_balance", False))
+        self.force_load_balance_topn_per_rank = int(
+            additional_config.get("force_load_balance_topn_per_rank", 0))
+        self.max_force_lb_tokens = max(
+            getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 128),
+            1)
+        self.force_lb_fake_topk_buffer: torch.Tensor | None = None
 
         # init moe
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
@@ -251,11 +272,86 @@ class AscendFusedMoE(FusedMoE):
                 in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if (self.enable_force_load_balance
+                and isinstance(self.quant_method,
+                               AscendUnquantizedFusedMoEMethod)):
+            self._validate_force_lb_config()
+            self._init_force_lb_buffer(max_tokens=self.max_force_lb_tokens,
+                                       device=self.w13_weight.device)
 
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         setup_moe_comm_method(self.moe_config)
         self.quant_type = self._get_quant_type()
+
+    def _validate_force_lb_config(self) -> None:
+        if self.force_load_balance_topn_per_rank == 0:
+            return
+
+        assert self.force_load_balance_topn_per_rank > 0, (
+            "force_load_balance_topn_per_rank must be >= 0")
+        assert self.ep_size > 0, "ep_size must be positive"
+        assert self.n_routed_experts % self.ep_size == 0, (
+            "force_load_balance_topn_per_rank requires n_routed_experts "
+            "to be divisible by ep_size")
+
+        local_routed_experts = self.n_routed_experts // self.ep_size
+        assert self.force_load_balance_topn_per_rank <= local_routed_experts, (
+            "force_load_balance_topn_per_rank exceeds routed experts on each "
+            "FFN rank")
+        assert self.top_k <= self.force_load_balance_topn_per_rank * self.ep_size, (
+            "top_k must be <= force_load_balance_topn_per_rank * ep_size")
+
+    def _build_force_lb_expert_cycle(self, device: torch.device) -> torch.Tensor:
+        if self.force_load_balance_topn_per_rank > 0:
+            local_routed_experts = self.n_routed_experts // self.ep_size
+            per_rank_cycles = [
+                torch.arange(
+                    rank * local_routed_experts,
+                    rank * local_routed_experts
+                    + self.force_load_balance_topn_per_rank,
+                    device=device,
+                    dtype=torch.int32,
+                ) for rank in range(self.ep_size)
+            ]
+            return torch.cat(per_rank_cycles, dim=0)
+
+        base = torch.randperm(self.n_routed_experts,
+                              device=device,
+                              dtype=torch.int32)
+        base_chunks = [base[i::self.ep_size] for i in range(self.ep_size)]
+        shifted_chunks = base_chunks[self.ep_rank:] + base_chunks[:self.ep_rank]
+        return torch.cat(shifted_chunks, dim=0)
+
+    def _init_force_lb_buffer(self, max_tokens: int, device: torch.device) -> None:
+        base_shifted = self._build_force_lb_expert_cycle(device)
+        total_needed = max_tokens * self.top_k
+        repeat_times = (total_needed + base_shifted.numel() -
+                        1) // base_shifted.numel()
+        expanded = base_shifted.repeat(repeat_times)[:total_needed]
+        self.force_lb_fake_topk_buffer = expanded.reshape(max_tokens, self.top_k)
+        preview_rows = min(8, max_tokens)
+        logger.info(
+            "force load balance buffer initialized: ep_rank=%s ep_size=%s "
+            "top_k=%s topn_per_rank=%s shape=%s preview=%s",
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            self.force_load_balance_topn_per_rank,
+            tuple(self.force_lb_fake_topk_buffer.shape),
+            self.force_lb_fake_topk_buffer[:preview_rows].cpu().tolist(),
+        )
+
+    def _get_force_lb_topk_ids(self, batch_tokens: int,
+                               device: torch.device) -> torch.Tensor | None:
+        if self.force_lb_fake_topk_buffer is None:
+            raise RuntimeError("force_lb_fake_topk_buffer is not initialized")
+        if self.force_lb_fake_topk_buffer.device != device:
+            self.force_lb_fake_topk_buffer = self.force_lb_fake_topk_buffer.to(
+                device, non_blocking=True)
+        if batch_tokens > self.force_lb_fake_topk_buffer.size(0):
+            return None
+        return self.force_lb_fake_topk_buffer[:batch_tokens, :self.top_k]
 
     def _get_quant_type(self) -> QuantType:
         quant_method = self.quant_method
