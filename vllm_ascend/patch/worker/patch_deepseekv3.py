@@ -135,6 +135,7 @@ class AscendDeepseekV2MoE(DeepseekV2MoE, nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        set_substitute_tp(1)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Chunk the hidden states so they aren't replicated across TP ranks.
@@ -170,6 +171,7 @@ class AscendDeepseekV2MoE(DeepseekV2MoE, nn.Module):
         elif self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states)
+        set_substitute_tp(0)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def afd_forward(
@@ -283,19 +285,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                     continue
 
             if self.afd_role == "attention" and self.is_moe_weight(name):
-                # We need to distinguish between MoE layer weights and Dense layer weights.
-                # Dense layers (before first_k_dense_replace) are initialized in Attention role.
-                import re
-                layer_match = re.search(r"model\.layers\.(\d+)\.", name)
-                if layer_match:
-                    layer_idx = int(layer_match.group(1))
-                    if layer_idx < self.config.first_k_dense_replace:
-                         # This is a dense layer, not an MoE layer, so we should not skip it
-                         pass
-                    else:
-                        continue
-                else:
-                    continue
+                continue
 
             if (self.afd_role == "ffn" and
                     self.afd_config.compute_gate_on_attention and
