@@ -374,8 +374,8 @@ class UBatchWrapper(GPUUBatchWrapper):
             # for this shape during a normal run.
             if cudagraph_runtime_mode is CUDAGraphMode.FULL:
                 assert batch_descriptor is not None
-                if batch_descriptor.num_tokens in self.aclgraphs:
-                    cudagraph_runtime_mode = CUDAGraphMode.NONE
+                # if batch_descriptor.num_tokens in self.aclgraphs:
+                #     cudagraph_runtime_mode = CUDAGraphMode.NONE
 
             if cudagraph_runtime_mode in (CUDAGraphMode.NONE,
                                           CUDAGraphMode.PIECEWISE):
