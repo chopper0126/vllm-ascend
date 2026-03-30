@@ -251,6 +251,17 @@ class AscendW8A8DynamicFusedMoEMethod:
                                        device=topk_ids.device)
             topk_ids = torch.argsort(
                 random_matrix, dim=1)[:, :topk_ids.size(1)].to(topk_ids.dtype)
+        elif layer.enable_force_load_balance:
+            fake_routed_topk_ids = layer._get_force_lb_topk_ids(
+                batch_tokens=topk_ids.shape[0], device=topk_ids.device)
+            if fake_routed_topk_ids is not None:
+                fake_routed_topk_ids = fake_routed_topk_ids.to(topk_ids.dtype)
+                if layer.mix_placement:
+                    shared_topk_ids = topk_ids[:, top_k:]
+                    topk_ids = torch.cat([fake_routed_topk_ids, shared_topk_ids],
+                                         dim=1)
+                else:
+                    topk_ids = fake_routed_topk_ids
 
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
