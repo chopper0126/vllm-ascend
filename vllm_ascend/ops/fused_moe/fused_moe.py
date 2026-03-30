@@ -272,9 +272,10 @@ class AscendFusedMoE(FusedMoE):
                 in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
         self.quant_method.create_weights(layer=self, **moe_quant_params)
-        if (self.enable_force_load_balance
-                and isinstance(self.quant_method,
-                               AscendUnquantizedFusedMoEMethod)):
+        if (self.enable_force_load_balance and isinstance(
+                self.quant_method,
+            (AscendUnquantizedFusedMoEMethod,
+             AscendW8A8DynamicFusedMoEMethod))):
             self._validate_force_lb_config()
             self._init_force_lb_buffer(max_tokens=self.max_force_lb_tokens,
                                        device=self.w13_weight.device)
