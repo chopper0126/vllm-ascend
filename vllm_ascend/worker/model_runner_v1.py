@@ -1311,7 +1311,7 @@ class NPUModelRunner(GPUModelRunner):
                                                    maybe_padded_num_tokens)
                 else:
                     # FIXME: Try using `auto_dispatch_capture=True`
-                    runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
+                    runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config and self.is_ubatch else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
                                            self.speculative_config,self.is_ubatch,self.parallel_config.num_ubatches)
@@ -2270,7 +2270,7 @@ class NPUModelRunner(GPUModelRunner):
                                                    positions.shape[0])
                 else:
                     # FIXME: Try using `auto_dispatch_capture=True`
-                    runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config else positions.shape[0]
+                    runtime_shape = positions.shape[0] // self.parallel_config.num_ubatches if self.afd_config and self.is_ubatch else positions.shape[0]
                     update_mla_attn_params(self.update_stream, forward_context,
                                            runtime_shape,
                                            self.speculative_config,self.is_ubatch,self.parallel_config.num_ubatches)
