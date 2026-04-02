@@ -449,7 +449,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             scale=None,
             handle=None,
             quant_mode=0,
-            aiv_num=48,
+            aiv_num=self.aiv_num,
             batch_size=max_num_tokens,
             h=hf_config.hidden_size,
             k=k
