@@ -84,6 +84,11 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.connector.init_afd_connector()
         self.attn_size = self.connector.attn_size
         self.ffn_size = self.connector.ffn_size
+
+        self.ffn_multistream_capable = self.afd_config.is_multistream
+        num_ubatches_cfg = self.parallel_config.num_ubatches if self.parallel_config.num_ubatches else 1
+        self.ffn_comm_streams = [torch.npu.Stream() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
+        self.ffn_comm_events = [torch.npu.Event() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
         print(f'attn_size = {self.attn_size},ffn_size = {self.ffn_size}')
         if getattr(self.model_config.hf_config, "text_config",
                    None) is not None:
@@ -432,12 +437,13 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                      aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
                      dp_metadata_list: dict | None = None):
         """Run FFN computation for graph capture or replay"""
-        # 从 dp_metadata_list 获取 is_ubatch
         is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
         num_ubatches = self.parallel_config.num_ubatches if is_ubatch else 1
         rank_ffn_output = None
         print(f"jcz _ffn_forward max_num_tokens:{self.max_num_tokens}")
-        
+
+        ffn_multistream_enable = self.ffn_multistream_capable and num_ubatches > 1
+
         afd_metadata = AFDMetadata(
             afd_tokens_start_loc=[],
             afd_reqs_start_loc=[],
@@ -446,8 +452,8 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             afd_tokens_lens=[],
             num_of_stages=num_ubatches
         )
-        # 构造 FFN 侧的 num_tokens_across_dp
         num_tokens_across_dp = self._build_ffn_num_tokens_across_dp(dp_metadata_list)
+        ffn_event_recorded = [False] * num_ubatches
         with set_ascend_forward_context(
                     attn_metadata=None,
                     vllm_config=self.vllm_config,
@@ -458,8 +464,11 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     num_tokens=num_tokens_across_dp[0],
                     num_tokens_across_dp=num_tokens_across_dp):
             for layer_idx in range(0, self.num_layers):
+                layer_multistream = ffn_multistream_enable and (layer_idx > self.first_k_dense_replace)
                 for ubatch_idx in range(num_ubatches):
-                    # recv
+                    if ffn_multistream_enable and ffn_event_recorded[ubatch_idx]:
+                        self.ffn_comm_events[ubatch_idx].wait(torch.npu.current_stream())
+                    # recv (a2f): runs on default stream
                     afd_connector_data = self.connector.create_recv_metadata(
                         dp_metadata_list=dp_metadata_list,
                         ubatch_idx=ubatch_idx,
@@ -480,7 +489,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     row_idx = recv_output.row_idx
                     x_active_mask = recv_output.x_active_mask
 
-                    # Construct AFDMetadata to ensure afd_forward takes the correct branch
+                    # FFN compute: runs on default stream
                     rank_ffn_output = self._run_ffn_computation(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
@@ -493,9 +502,22 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                         x_active_mask=x_active_mask,
                         cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
                     )
-                    # send
-                    self.connector.send_ffn_output(rank_ffn_output, afd_connector_data, ubatch_idx=ubatch_idx)
+                    # send (f2a): when multistream enabled, dispatched to per-ubatch comm_stream
+                    self.connector.send_ffn_output(
+                        rank_ffn_output, afd_connector_data,
+                        ubatch_idx=ubatch_idx,
+                        multistream_enable=layer_multistream,
+                        comm_stream=self.ffn_comm_streams[ubatch_idx] if layer_multistream else None,
+                        comm_event=self.ffn_comm_events[ubatch_idx] if layer_multistream else None)
+                    if layer_multistream:
+                        ffn_event_recorded[ubatch_idx] = True
                     print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}', flush=True)
+
+            if ffn_multistream_enable:
+                curr_stream = torch.npu.current_stream()
+                for i, ev in enumerate(self.ffn_comm_events):
+                    if ffn_event_recorded[i]:
+                        ev.wait(curr_stream)
         return rank_ffn_output
 
     def _run_ffn_computation(self,

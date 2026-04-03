@@ -307,6 +307,10 @@ class CAMP2PAFDConnector(AFDConnectorBase):
     # MOE发给ATTN(MOE发送)
     def send_ffn_output(self, ffn_output: torch.Tensor, metadata: CAMP2PAFDConnectorMetadata, **kwargs):
         ubatch_idx = kwargs.get('ubatch_idx', 0)
+        multistream_enable = kwargs.get('multistream_enable', False)
+        comm_stream = kwargs.get('comm_stream', None)
+        comm_event = kwargs.get('comm_event', None)
+
         batch_size = metadata.batch_size
         h = metadata.h
         k = metadata.k
@@ -316,11 +320,16 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         handle = metadata.handle
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
-        torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[4],
-                                      batch_size=batch_size, hidden_size=h, topk=k,
-                                      expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
-                                      rank=self.rank, group_ep=groupEp,
-                                      aiv_num=aiv_num)
+
+        curr_stream = torch.npu.current_stream()
+        with npu_stream_switch_within_graph(curr_stream, comm_stream, multistream_enable):
+            torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[4],
+                                          batch_size=batch_size, hidden_size=h, topk=k,
+                                          expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
+                                          rank=self.rank, group_ep=groupEp,
+                                          aiv_num=aiv_num)
+            if multistream_enable and comm_event is not None:
+                comm_event.record(comm_stream)
 
         return
 
