@@ -87,7 +87,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
 
         self.ffn_multistream_capable = self.afd_config.is_multistream
         num_ubatches_cfg = self.parallel_config.num_ubatches if self.parallel_config.num_ubatches else 1
-        self.ffn_comm_streams = [torch.npu.Stream() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
+        self.ffn_comm_stream = torch.npu.Stream() if self.ffn_multistream_capable else None
         self.ffn_comm_events = [torch.npu.Event() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
         print(f'attn_size = {self.attn_size},ffn_size = {self.ffn_size}')
         if getattr(self.model_config.hf_config, "text_config",
@@ -502,12 +502,12 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                         x_active_mask=x_active_mask,
                         cam_p2p_ep_name=recv_output.cam_p2p_ep_name or ""
                     )
-                    # send (f2a): when multistream enabled, dispatched to per-ubatch comm_stream
+                    # send (f2a): when multistream enabled, dispatched to comm_stream
                     self.connector.send_ffn_output(
                         rank_ffn_output, afd_connector_data,
                         ubatch_idx=ubatch_idx,
                         multistream_enable=layer_multistream,
-                        comm_stream=self.ffn_comm_streams[ubatch_idx] if layer_multistream else None,
+                        comm_stream=self.ffn_comm_stream if layer_multistream else None,
                         comm_event=self.ffn_comm_events[ubatch_idx] if layer_multistream else None)
                     if layer_multistream:
                         ffn_event_recorded[ubatch_idx] = True
