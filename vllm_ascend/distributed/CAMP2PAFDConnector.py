@@ -271,7 +271,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             k = self.hf_config.num_experts_per_tok
             moe_expert_num = self.hf_config.n_routed_experts
 
-        multistream_enable = False if metadata.layer_idx <= self.hf_config.first_k_dense_replace else self.config.afd_config.is_multistream # dense层及其后一层不分流
+        multistream_enable = False if metadata.layer_idx < self.hf_config.first_k_dense_replace else self.config.afd_config.is_multistream # dense层及其后一层不分流
         if metadata.layer_idx < self.hf_config.first_k_dense_replace:
             compute_gate = 0
         else:
