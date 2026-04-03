@@ -161,7 +161,10 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                 self.dst_list.append(dst)
                 dst += self.min_size
 
-        self.aiv_num = int(self.config.afd_config.multistream_info["core_num"]) if self.config.afd_config.is_multistream else 8
+        if self.config.afd_config.is_attention_server:
+            self.aiv_num = self.config.afd_config.attn_core_num if self.config.afd_config.is_attn_multistream else 8
+        else:
+            self.aiv_num = self.config.afd_config.ffn_core_num if self.config.afd_config.is_ffn_multistream else 8
 
         logger.debug(f"[CAM] world_rank={self.rank}, p2p_rank={self.p2p_rank}, min_size={self.min_size}, "
                      f"dst_list={self.dst_list}, cam connector initialized")
@@ -271,7 +274,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             k = self.hf_config.num_experts_per_tok
             moe_expert_num = self.hf_config.n_routed_experts
 
-        multistream_enable = False if metadata.layer_idx < self.hf_config.first_k_dense_replace else self.config.afd_config.is_multistream # dense层及其后一层不分流
+        multistream_enable = False if metadata.layer_idx < self.hf_config.first_k_dense_replace else self.config.afd_config.is_attn_multistream
         if metadata.layer_idx < self.hf_config.first_k_dense_replace:
             compute_gate = 0
         else:
@@ -302,7 +305,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                                                   self.rank,
                                                   self.ffn_size,
                                                   self.attn_size,
-                                                  self.config.afd_config.is_multistream)
+                                                  self.config.afd_config.is_attn_multistream)
 
     # MOE发给ATTN(MOE发送)
     def send_ffn_output(self, ffn_output: torch.Tensor, metadata: CAMP2PAFDConnectorMetadata, **kwargs):

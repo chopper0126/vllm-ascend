@@ -85,7 +85,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.attn_size = self.connector.attn_size
         self.ffn_size = self.connector.ffn_size
 
-        self.ffn_multistream_capable = self.afd_config.is_multistream
+        self.ffn_multistream_capable = self.afd_config.is_ffn_multistream
         num_ubatches_cfg = self.parallel_config.num_ubatches if self.parallel_config.num_ubatches else 1
         self.ffn_comm_stream = torch.npu.Stream() if self.ffn_multistream_capable else None
         self.ffn_comm_events = [torch.npu.Event() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
