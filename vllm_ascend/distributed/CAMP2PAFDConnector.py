@@ -16,8 +16,6 @@ import re
 import torch
 from torch.distributed.distributed_c10d import _update_default_pg, _get_default_group
 
-import umdk_cam_op_lib
-
 from vllm.distributed.parallel_state import init_afd_process_group, init_model_parallel_group
 from vllm.logger import init_logger
 from vllm_ascend.distributed.metadata import (CAMP2PAFDConnectorMetadata)
@@ -326,11 +324,11 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         curr_stream = torch.npu.current_stream()
         with npu_stream_switch_within_graph(curr_stream, comm_stream, multistream_enable):
-            torch.ops.umdk_cam_op_lib.e2a(expand_x=ffn_output, atten_batch_size=handle[4],
-                                          batch_size=batch_size, hidden_size=h, topk=k,
-                                          expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
-                                          rank=self.rank, group_ep=groupEp,
-                                          aiv_num=aiv_num)
+            torch.ops._C_ascend.e2a(expand_x=ffn_output, atten_batch_size=handle[4],
+                                      batch_size=batch_size, hidden_size=h, topk=k,
+                                      expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
+                                      rank=self.rank, group_ep=groupEp,
+                                      aiv_num=aiv_num)
             if multistream_enable and comm_event is not None:
                 comm_event.record(comm_stream)
 
@@ -352,11 +350,11 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             compute_gate = 1 if getattr(self.config.afd_config, 'compute_gate_on_attention', True) else 0
 
         groupEp = _get_group_ep(ubatch_idx, self.hccl_comm_name, self.hccl_comm_name2, self.hccl_comm_name3)
-        outputs = torch.ops.umdk_cam_op_lib.a2e(x=torch.tensor([], dtype=torch.bfloat16, device='npu'),
+        outputs = torch.ops._C_ascend.a2e(x=torch.tensor([], dtype=torch.bfloat16, device='npu'),
                                                 expert_ids=torch.tensor([], dtype=torch.int32, device='npu'),
                                                 scales=torch.tensor([], dtype=torch.float, device='npu'),
                                                 batch_size=batch_size, hidden_size=h, topk=k,
-                                                expert_rank_size=self.ffn_size, atten_rank_size=self.attn_size,
+                                                expert_rank_size=self.ffn_size, attention_rank_size=self.attn_size,
                                                 rank=self.rank, group_ep=groupEp,
                                                 aiv_num=aiv_num,
                                                 compute_gate=compute_gate)
@@ -653,10 +651,10 @@ def cam_send_attn_output_impl(hidden_states: torch.Tensor,
 
     curr_stream = torch.npu.current_stream()
     with npu_stream_switch_within_graph(curr_stream, comm_stream, multistream_enable):
-        handle_out = torch.ops.umdk_cam_op_lib.a2e(x=hidden_states, expert_ids=topk_idx,
+        handle_out = torch.ops._C_ascend.a2e(x=hidden_states, expert_ids=topk_idx,
                                                 scales=topk_weights,
                                                 batch_size=batch_size, hidden_size=h, topk=k,
-                                                expert_rank_size=ffn_size, atten_rank_size=attn_size,
+                                                expert_rank_size=ffn_size, attention_rank_size=attn_size,
                                                 rank=rank, group_ep=groupEp,
                                                 aiv_num=aiv_num,
                                                 compute_gate=compute_gate)
@@ -712,7 +710,7 @@ def cam_recv_ffn_output_impl(hidden_states: torch.Tensor,
     if multistream_enable:
         curr_stream = torch.npu.current_stream()
         comm_event.wait(curr_stream)
-    output2 = torch.ops.umdk_cam_op_lib.e2a(expand_x=hidden_states, atten_batch_size=handle[3],
+    output2 = torch.ops._C_ascend.e2a(expand_x=hidden_states, atten_batch_size=handle[3],
                                             batch_size=batch_size, hidden_size=h, topk=k,
                                             expert_rank_size=ffn_size, attention_rank_size=attn_size,
                                             rank=rank, group_ep=groupEp,
