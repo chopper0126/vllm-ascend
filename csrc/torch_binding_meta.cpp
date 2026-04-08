@@ -187,6 +187,82 @@ std::tuple<at::Tensor, at::Tensor> dispatch_gmm_combine_decode_meta(
     return {output, expert_token_nums};
 }
 
+std::vector<at::Tensor> a2e_meta(
+    const at::Tensor &x,
+    const c10::optional<at::Tensor> &expert_ids,
+    const c10::optional<at::Tensor> &scales,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t topk,
+    int64_t expert_rank_size,
+    int64_t attention_rank_size,
+    int64_t rank,
+    c10::string_view group_ep,
+    int64_t aiv_num,
+    int64_t compute_gate)
+{
+    int32_t base_batch_size = (rank >= expert_rank_size) ? x.sizes()[0] : batch_size;
+
+    at::Tensor expand_x_out;
+    if (rank >= expert_rank_size) {
+        expand_x_out = at::empty({1, 1}, x.options().dtype(at::kBFloat16).device(at::kMeta));
+    } else {
+        expand_x_out = at::empty({base_batch_size, hidden_size}, x.options().dtype(at::kBFloat16).device(at::kMeta));
+    }
+
+    at::Tensor simulate_expert_ids;
+    at::Tensor simulate_expert_scales;
+    at::Tensor atten_batch_size;
+    at::Tensor x_active_mask_out;
+    if (rank < expert_rank_size && rank < attention_rank_size) {
+        simulate_expert_ids = at::empty({base_batch_size, topk}, x.options().dtype(at::kInt).device(at::kMeta));
+        simulate_expert_scales = at::empty({base_batch_size, topk}, x.options().dtype(at::kFloat).device(at::kMeta));
+        x_active_mask_out = at::empty(base_batch_size, x.options().dtype(at::kBool).device(at::kMeta));
+    } else {
+        simulate_expert_ids = at::empty({1, 1}, x.options().dtype(at::kInt).device(at::kMeta));
+        simulate_expert_scales = at::empty({1, 1}, x.options().dtype(at::kFloat).device(at::kMeta));
+        x_active_mask_out = at::empty(1, x.options().dtype(at::kBool).device(at::kMeta));
+    }
+    atten_batch_size = at::empty({(attention_rank_size + expert_rank_size - 1) / expert_rank_size},
+        x.options().dtype(at::kInt).device(at::kMeta));
+
+    std::vector<at::Tensor> result = {
+        expand_x_out,
+        simulate_expert_ids,
+        simulate_expert_scales,
+        atten_batch_size,
+        x_active_mask_out
+    };
+    return result;
+}
+
+at::Tensor e2a_meta(
+    const at::Tensor &expand_x,
+    const at::Tensor &atten_batch_size,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t topk,
+    int64_t expert_rank_size,
+    int64_t attention_rank_size,
+    int64_t rank,
+    c10::string_view group_ep,
+    int64_t aiv_num)
+{
+    int32_t base_batch_size = batch_size;
+    if (rank >= expert_rank_size) {
+        base_batch_size = expand_x.sizes()[0];
+    }
+    
+    at::Tensor x_out;
+    if (rank < expert_rank_size) {
+        x_out = at::empty({1, 1}, expand_x.options().dtype(at::kBFloat16).device(at::kMeta));
+    } else {
+        x_out = at::empty({base_batch_size, hidden_size}, expand_x.options().dtype(at::kBFloat16).device(at::kMeta));
+    }
+
+    return x_out;
+}
+
 void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor_b, at::Tensor &tensor_c,
                                     c10::optional<c10::string_view> format_mode,
                                     c10::optional<c10::string_view> quant_mode)
@@ -441,5 +517,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_moe_init_routing_custom", &vllm_ascend::meta::npu_moe_init_routing_custom_meta);
     // Moe_gating_top_k
     ops.impl("moe_gating_top_k", &vllm_ascend::meta::moe_gating_top_k_meta);
+    // a2e
+    ops.impl("a2e", &vllm_ascend::meta::a2e_meta);
+    // e2a
+    ops.impl("e2a", &vllm_ascend::meta::e2a_meta);
 }
 }
