@@ -464,7 +464,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     num_tokens=num_tokens_across_dp[0],
                     num_tokens_across_dp=num_tokens_across_dp):
             for layer_idx in range(0, self.num_layers):
-                layer_multistream = ffn_multistream_enable and (layer_idx >= self.first_k_dense_replace)
+                layer_multistream = ffn_multistream_enable and (layer_idx > 0)
                 for ubatch_idx in range(num_ubatches):
                     if ffn_multistream_enable and ffn_event_recorded[ubatch_idx]:
                         self.ffn_comm_events[ubatch_idx].wait(torch.npu.current_stream())
