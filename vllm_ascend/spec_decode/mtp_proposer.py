@@ -1,4 +1,4 @@
-﻿from typing import Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -121,7 +121,8 @@ class MtpProposer(EagleProposer):
                         previous_hidden_states)
                 self.model(input_ids=input_ids,
                            positions=positions,
-                           hidden_states=previous_hidden_states)
+                           hidden_states=previous_hidden_states,
+                           spec_step_idx=i)
                 forward_context = get_forward_context()
                 if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
                     not forward_context.capturing and not self.use_sparse:
@@ -299,8 +300,7 @@ class MtpProposer(EagleProposer):
         common_attn_metadata.graph_pad_size = graph_pad_size
         common_attn_metadata.num_input_tokens = num_input_tokens
         builder = self.runner.attn_groups[0][0].get_metadata_builder()
-        attn_metadata_mtp = builder.build(0, common_attn_metadata,
-                                          self.runner.get_model())
+        attn_metadata_mtp = builder.build(0, common_attn_metadata)
         attn_metadata = {}
         for layer_name in self.attn_layer_name:
             attn_metadata[layer_name] = attn_metadata_mtp
@@ -351,7 +351,8 @@ class MtpProposer(EagleProposer):
 
                     hidden_states = self.model(input_ids=input_ids,
                                                positions=positions,
-                                               hidden_states=hidden_states)
+                                               hidden_states=hidden_states,
+                                               spec_step_idx=step)
                     forward_context = get_forward_context()
                     if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not self.use_sparse:
                         self._update_full_graph_params(forward_context,
@@ -379,7 +380,8 @@ class MtpProposer(EagleProposer):
                     pcp_allgather_restore_idx.gpu[:hidden_states.shape[0]])
 
             sample_hidden_states = hidden_states[last_token_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = self.model.compute_logits(sample_hidden_states,
+                                               spec_step_idx=step)
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
                 last_token_indices = last_token_indices[:num_indices]
