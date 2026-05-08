@@ -16,7 +16,8 @@ import re
 import torch
 from torch.distributed.distributed_c10d import _update_default_pg, _get_default_group
 
-from vllm.distributed.parallel_state import init_afd_process_group, init_model_parallel_group
+from vllm.distributed.parallel_state import (get_dp_group, init_afd_process_group,
+                                              init_model_parallel_group)
 from vllm.logger import init_logger
 from vllm_ascend.distributed.metadata import (CAMP2PAFDConnectorMetadata)
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
@@ -29,7 +30,161 @@ from vllm.forward_context import ForwardContext, get_forward_context
 
 from vllm_ascend.utils import npu_stream_switch_within_graph
 
+import vllm_ascend.envs as envs_ascend
+
 logger = init_logger(__name__)
+
+
+def _diag_topk_line(
+        name: str,
+        t: Optional[torch.Tensor],
+        moe_expert_num: int,
+) -> str:
+    if t is None:
+        return f"{name}=None"
+    if t.numel() == 0:
+        return f"{name}.shape={tuple(t.shape)} empty"
+    tmin = int(t.min().item())
+    tmax = int(t.max().item())
+    ok = bool((t >= 0).all().item() and (t < moe_expert_num).all().item())
+    return (f"{name}.shape={tuple(t.shape)} dtype={t.dtype} "
+            f"[min,max]=[{tmin},{tmax}] in_[0,{moe_expert_num})={ok}")
+
+
+def _diag_mask_line(name: str, t: Optional[torch.Tensor]) -> str:
+    if t is None:
+        return f"{name}=None"
+    s = int(t.sum().item())
+    return f"{name}.shape={tuple(t.shape)} dtype={t.dtype} sum={s}"
+
+
+def _active_dp_metadata_from_forward_ctx(ctx: ForwardContext):
+    if ctx.dp_metadata is not None:
+        return ctx.dp_metadata
+    am = ctx.afd_metadata
+    if am is None:
+        return None
+    dpl = getattr(am, "dp_metadata_list", None)
+    if not dpl:
+        return None
+    idx = ctx.ubatch_idx
+    if idx < len(dpl):
+        return dpl[idx]
+    return dpl[0]
+
+
+def _expected_local_attn_rows_for_a2e(dm) -> Optional[int]:
+    """Rows this DP rank should send into a2e; must match dp_metadata treaty.
+
+    Always use num_tokens_across_dp_cpu[dp_rank] only. Do not index
+    dm.local_sizes by dp_rank when SP/chunking expands that list — lengths
+    can match num_tokens_across_dp by coincidence but semantics differ.
+    """
+    try:
+        dp_rank = get_dp_group().rank_in_group
+    except Exception:
+        return None
+    nta = dm.num_tokens_across_dp_cpu
+    if dp_rank < 0 or dp_rank >= nta.numel():
+        return None
+    return int(nta[dp_rank].item())
+
+
+def _barrier_attention_dp_before_cam_send() -> None:
+    """Match Attention DP ranks at the same layer before a2e / CAM collectives.
+
+    If one rank finishes attention earlier and enters cam_send while the other
+    is still in a prior layer, the paired FFN EP ranks can process different
+    layers and MoE HCCL collectives hang (stuck waiting for a peer).
+    """
+    try:
+        dp = get_dp_group()
+    except Exception:
+        return
+    if dp is None or dp.world_size <= 1:
+        return
+    dp.barrier()
+
+
+def _pad_attn_tensors_to_dp_metadata(
+    hidden_states: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    topk_idx: Optional[torch.Tensor],
+    compute_gate: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Align Attention send tensors with DPMetadata before a2e (torch_binding uses x.size(0))."""
+    ctx = get_forward_context()
+    if ctx is None:
+        return hidden_states, topk_weights, topk_idx
+    dm = _active_dp_metadata_from_forward_ctx(ctx)
+    if dm is None:
+        return hidden_states, topk_weights, topk_idx
+    expected = _expected_local_attn_rows_for_a2e(dm)
+    if expected is None:
+        return hidden_states, topk_weights, topk_idx
+    actual = int(hidden_states.shape[0])
+    if actual >= expected:
+        return hidden_states, topk_weights, topk_idx
+    if actual <= 0:
+        return hidden_states, topk_weights, topk_idx
+    pad_rows = expected - actual
+    # Ghost rows: duplicate last token hidden + routing; zero gate weights so
+    # they contribute nothing (avoids mass-routing padded rows to expert 0).
+    pad_hs = hidden_states[-1:].expand(pad_rows, hidden_states.shape[1]).clone()
+    hidden_states = torch.cat([hidden_states, pad_hs], dim=0)
+    if compute_gate == 1 and topk_idx is not None and topk_weights is not None:
+        k = topk_idx.shape[1]
+        pad_ids = topk_idx[-1:].expand(pad_rows, k).clone()
+        pad_w = torch.zeros(
+            (pad_rows, k), dtype=topk_weights.dtype, device=topk_weights.device)
+        topk_idx = torch.cat([topk_idx, pad_ids], dim=0)
+        topk_weights = torch.cat([topk_weights, pad_w], dim=0)
+    return hidden_states, topk_weights, topk_idx
+
+
+def _log_afd_cam_routing(phase: str, *, connector_rank: int, layer_idx: Optional[int],
+                         ubatch_idx: int, batch_size: int, h: int, k: int,
+                         moe_expert_num: int, compute_gate: int,
+                         hidden_states: Optional[torch.Tensor] = None,
+                         topk_ids: Optional[torch.Tensor] = None,
+                         topk_weights: Optional[torch.Tensor] = None,
+                         x_active_mask: Optional[torch.Tensor] = None):
+    if not envs_ascend.VLLM_ASCEND_AFD_CAM_ROUTING_DIAG:
+        return
+    ctx = get_forward_context()
+    dp_s = None
+    if ctx is not None and getattr(ctx, "dp_metadata", None) is not None:
+        dm = ctx.dp_metadata
+        dp_s = {
+            "num_tokens_across_dp": dm.num_tokens_across_dp_cpu.tolist(),
+            "max_tokens_across_dp": int(dm.max_tokens_across_dp_cpu.item()),
+        }
+    hs = tuple(hidden_states.shape) if hidden_states is not None else None
+    tw_info = (
+        f"topk_weights.shape={tuple(topk_weights.shape)} "
+        f"dtype={topk_weights.dtype}" if topk_weights is not None else
+        "topk_weights=None")
+    mask_info = (_diag_mask_line("x_active_mask", x_active_mask)
+                 if x_active_mask is not None else "x_active_mask=None")
+    logger.info(
+        "[AFD-CAM-ROUTING] %s | conn_rank=%s | layer_idx=%s | ubatch_idx=%s | "
+        "meta_batch_size=%s | h=%s k=%s moe_expert_num=%s | compute_gate=%s | "
+        "hidden_states.shape=%s | %s | %s | %s | dp_metadata=%s",
+        phase,
+        connector_rank,
+        layer_idx,
+        ubatch_idx,
+        batch_size,
+        h,
+        k,
+        moe_expert_num,
+        compute_gate,
+        hs,
+        _diag_topk_line("topk_ids", topk_ids, moe_expert_num),
+        tw_info,
+        mask_info,
+        dp_s,
+    )
 
 
 def _get_group_ep(ubatch_idx: int, hccl_comm_name: str, hccl_comm_name2: str, hccl_comm_name3: Optional[str]) -> str:
@@ -250,6 +405,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             topk_ids=topk_ids,
             x_active_mask=x_active_mask,
             cam_p2p_ep_name=cam_p2p_ep_name,
+            layer_idx=kwargs.get("layer_idx"),
         )
 
     # ATTN发给MOE（ATTN发送）
@@ -277,20 +433,44 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             compute_gate = 0
         else:
             compute_gate = 1 if getattr(self.config.afd_config, 'compute_gate_on_attention', True) else 0
-        return torch.ops.vllm.cam_send_attn_output(hidden_states, topk_weights, topk_idx,
-                                                   self.hccl_comm_name,
-                                                   self.hccl_comm_name2,
-                                                   self.hccl_comm_name3,
-                                                   self.rank,
-                                                   self.ffn_size,
-                                                   self.attn_size,
-                                                   moe_expert_num,
-                                                   self.max_num_reqs,
-                                                   self.hf_config.hidden_size,
-                                                   k,
-                                                   multistream_enable,
-                                                   self.aiv_num,
-                                                   compute_gate), None
+        # Padding is only for a2e wire format; return unpadded tensors so residual /
+        # next-layer hidden shapes stay consistent (see maybe_chunk_residual).
+        hs_ret, tw_ret, tid_ret = hidden_states, topk_weights, topk_idx
+        hs_send, tw_send, tid_send = _pad_attn_tensors_to_dp_metadata(
+            hidden_states, topk_weights, topk_idx, compute_gate)
+        h_dim = int(hs_send.shape[1]) if hs_send.dim() >= 2 else int(
+            self.hf_config.hidden_size)
+        _log_afd_cam_routing(
+            "SEND",
+            connector_rank=self.rank,
+            layer_idx=getattr(metadata, "layer_idx", None),
+            ubatch_idx=kwargs.get("ubatch_idx", 0),
+            batch_size=int(hs_send.shape[0]),
+            h=h_dim,
+            k=k,
+            moe_expert_num=moe_expert_num,
+            compute_gate=compute_gate,
+            hidden_states=hs_send,
+            topk_ids=tid_send if compute_gate == 1 else None,
+            topk_weights=tw_send if compute_gate == 1 else None,
+            x_active_mask=kwargs.get("x_active_mask"),
+        )
+        _barrier_attention_dp_before_cam_send()
+        torch.ops.vllm.cam_send_attn_output(hs_send, tw_send, tid_send,
+                                            self.hccl_comm_name,
+                                            self.hccl_comm_name2,
+                                            self.hccl_comm_name3,
+                                            self.rank,
+                                            self.ffn_size,
+                                            self.attn_size,
+                                            moe_expert_num,
+                                            self.max_num_reqs,
+                                            self.hf_config.hidden_size,
+                                            k,
+                                            multistream_enable,
+                                            self.aiv_num,
+                                            compute_gate)
+        return hs_ret, None
 
     # MOE发给ATTN（ATTN接收）
     def recv_ffn_output(self,
@@ -361,13 +541,31 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         # outputs: [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut]
         from vllm.distributed.afd_transfer.afd_connector.metadata import AFDRecvOutput
+        out_topk_ids = outputs[1] if compute_gate == 1 else None
+        out_topk_w = outputs[2] if compute_gate == 1 else None
+        out_mask = outputs[4]
+        _log_afd_cam_routing(
+            "RECV",
+            connector_rank=self.rank,
+            layer_idx=getattr(metadata, "layer_idx", None),
+            ubatch_idx=ubatch_idx,
+            batch_size=int(batch_size),
+            h=int(h),
+            k=int(k),
+            moe_expert_num=int(metadata.moe_expert_num),
+            compute_gate=compute_gate,
+            hidden_states=outputs[0],
+            topk_ids=out_topk_ids,
+            topk_weights=out_topk_w,
+            x_active_mask=out_mask,
+        )
         return AFDRecvOutput(
             hidden_states=outputs[0],
             metadata=afdmetadata,
-            topk_ids=outputs[1] if compute_gate == 1 else None,  # simulateExpertIdss
-            topk_weights=outputs[2] if compute_gate == 1 else None,  # simulateExpertScales
+            topk_ids=out_topk_ids,  # simulateExpertIdss
+            topk_weights=out_topk_w,  # simulateExpertScales
             atten_batch_size=outputs[3],
-            x_active_mask=outputs[4],
+            x_active_mask=out_mask,
             cam_p2p_ep_name=self.hccl_comm_name1
         )
 

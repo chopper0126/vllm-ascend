@@ -20,12 +20,16 @@ import torch
 import torch_npu
 from torch.nn.functional import pad
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.utils import (AscendDeviceType, dispose_tensor,
                                enable_custom_op, get_ascend_device_type,
                                get_weight_prefetch_method)
+
+logger = init_logger(__name__)
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -404,7 +408,9 @@ def fused_experts(
     return output
 
 
-def dispatch_experts(
+def _log_moe_dispatch_diag(
+        *,
+        layer_idx: Optional[int],
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -414,10 +420,80 @@ def dispatch_experts(
         ep_rank_id: int,
         moe_expert_num: int,
 ):
+    if not envs_ascend.VLLM_ASCEND_MOE_DISPATCH_DIAG:
+        return
+    ctx = get_forward_context()
+    dp_summary = None
+    if ctx is not None and getattr(ctx, "dp_metadata", None) is not None:
+        dm = ctx.dp_metadata
+        dp_summary = {
+            "num_tokens_across_dp": dm.num_tokens_across_dp_cpu.tolist(),
+            "max_tokens_across_dp": int(dm.max_tokens_across_dp_cpu.item()),
+        }
+    mask_sum = None
+    if x_active_mask is not None:
+        mask_sum = int(x_active_mask.sum().item())
+    n_el = topk_ids.numel()
+    if n_el > 0:
+        t_min = int(topk_ids.min().item())
+        t_max = int(topk_ids.max().item())
+        in_range = bool(
+            (topk_ids >= 0).all().item() and (topk_ids < moe_expert_num).all().item())
+    else:
+        t_min, t_max, in_range = None, None, True
+    tw_shape = tuple(topk_weights.shape) if topk_weights is not None else None
+    logger.info(
+        "[MOE-DISPATCH-DIAG] layer_idx=%s x.shape=%s x.dtype=%s "
+        "topk_ids.shape=%s topk_ids.dtype=%s topk_ids[min,max]=%s,%s "
+        "ids_in_[0,%s)=%s topk_weights.shape=%s x_active_mask.shape=%s "
+        "mask_sum=%s group_ep=%s ep_rank=%s/%s moe_expert_num=%s dp=%s",
+        layer_idx,
+        tuple(hidden_states.shape),
+        hidden_states.dtype,
+        tuple(topk_ids.shape),
+        topk_ids.dtype,
+        t_min,
+        t_max,
+        moe_expert_num,
+        in_range,
+        tw_shape,
+        tuple(x_active_mask.shape) if x_active_mask is not None else None,
+        mask_sum,
+        group_ep,
+        ep_rank_id,
+        ep_rank_size,
+        moe_expert_num,
+        dp_summary,
+    )
+
+
+def dispatch_experts(
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        x_active_mask: torch.Tensor,
+        group_ep: str,
+        ep_rank_size: int,
+        ep_rank_id: int,
+        moe_expert_num: int,
+        layer_idx: Optional[int] = None,
+):
     """
     Dispatch阶段：将token分发到对应的专家
     返回值：dispatch_output的所有输出
     """
+
+    _log_moe_dispatch_diag(
+        layer_idx=layer_idx,
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        x_active_mask=x_active_mask,
+        group_ep=group_ep,
+        ep_rank_size=ep_rank_size,
+        ep_rank_id=ep_rank_id,
+        moe_expert_num=moe_expert_num,
+    )
 
     dispatch_kwargs = {
         "x": hidden_states,

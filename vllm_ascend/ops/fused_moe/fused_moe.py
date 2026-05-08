@@ -860,6 +860,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             ep_rank_id: int,
             moe_expert_num: int,
             layer: torch.nn.Module,
+            layer_idx: Optional[int] = None,
     ):
         """
         实现拆分的dispatch、gmm、combine算子的调用。
@@ -882,6 +883,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             ep_rank_size=ep_rank_size,
             ep_rank_id=ep_rank_id,
             moe_expert_num=moe_expert_num,
+            layer_idx=layer_idx,
         )
 
         # 解析dispatch输出（完全保持原逻辑）
@@ -939,6 +941,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             group_list_type: Optional[int] = 1,
             connector_name: Optional[str] = "",
             cam_p2p_ep_name: Optional[str] = "",
+            layer_idx: Optional[int] = None,
     ):
         use_int8_w8a8, use_int4_w4a8, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias, w1_offset, w2_offset = \
             _detect_quantization_and_get_params(layer)
@@ -968,6 +971,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                 ep_rank_id=self.ep_rank,
                 moe_expert_num=self.global_num_experts,
                 layer=layer,
+                layer_idx=layer_idx,
             )
             return shared_out, mlp_output
         from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp

@@ -166,6 +166,19 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
+    # AFD FFN diagnostics: log enforce_eager / cudagraph flags once at runner init.
+    "VLLM_ASCEND_FFN_DIAG_LOG_INIT":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FFN_DIAG_LOG_INIT", '0'))),
+    # AFD FFN diagnostics: torch.npu.synchronize() after each full layer (all ubatches)
+    # to localize NPU failures that first appear at the worker sync point.
+    "VLLM_ASCEND_FFN_DIAG_SYNC_PER_LAYER":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FFN_DIAG_SYNC_PER_LAYER", '0'))),
+    # Log shapes/stats before npu_moe_distribute_dispatch_v2 (MTP/AFD EP debug).
+    "VLLM_ASCEND_MOE_DISPATCH_DIAG":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_MOE_DISPATCH_DIAG", '0'))),
+    # Log CAM P2P routing (topk_ids / shapes) on Attention send and FFN recv.
+    "VLLM_ASCEND_AFD_CAM_ROUTING_DIAG":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_AFD_CAM_ROUTING_DIAG", '0'))),
 }
 
 # end-env-vars-definition
