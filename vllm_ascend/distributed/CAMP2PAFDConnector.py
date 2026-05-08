@@ -18,7 +18,6 @@ from torch.distributed.distributed_c10d import _update_default_pg, _get_default_
 
 from vllm.distributed.parallel_state import (get_dp_group, init_afd_process_group,
                                               init_model_parallel_group)
-from vllm.logger import init_logger
 from vllm_ascend.distributed.metadata import (CAMP2PAFDConnectorMetadata)
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ascend_config import get_ascend_config
@@ -30,32 +29,25 @@ from vllm.forward_context import ForwardContext, get_forward_context
 
 from vllm_ascend.utils import npu_stream_switch_within_graph
 
-import vllm_ascend.envs as envs_ascend
 
-logger = init_logger(__name__)
-
-
-def _diag_topk_line(
-        name: str,
-        t: Optional[torch.Tensor],
-        moe_expert_num: int,
-) -> str:
-    if t is None:
-        return f"{name}=None"
-    if t.numel() == 0:
-        return f"{name}.shape={tuple(t.shape)} empty"
-    tmin = int(t.min().item())
-    tmax = int(t.max().item())
-    ok = bool((t >= 0).all().item() and (t < moe_expert_num).all().item())
-    return (f"{name}.shape={tuple(t.shape)} dtype={t.dtype} "
-            f"[min,max]=[{tmin},{tmax}] in_[0,{moe_expert_num})={ok}")
+# vLLM's TorchCompileWithNoGuardsWrapper rejects @torch._dynamo.disable callees
+# inside the compiled region; keep scalar tensor reads traceable where possible.
+try:
+    torch._dynamo.config.capture_scalar_outputs = True
+except Exception:
+    pass
 
 
-def _diag_mask_line(name: str, t: Optional[torch.Tensor]) -> str:
-    if t is None:
-        return f"{name}=None"
-    s = int(t.sum().item())
-    return f"{name}.shape={tuple(t.shape)} dtype={t.dtype} sum={s}"
+def _in_torch_compile_trace() -> bool:
+    try:
+        if hasattr(torch.compiler, "is_compiling"):
+            return bool(torch.compiler.is_compiling())
+    except Exception:
+        pass
+    try:
+        return bool(torch._dynamo.is_compiling())
+    except Exception:
+        return False
 
 
 def _active_dp_metadata_from_forward_ctx(ctx: ForwardContext):
@@ -97,6 +89,8 @@ def _barrier_attention_dp_before_cam_send() -> None:
     is still in a prior layer, the paired FFN EP ranks can process different
     layers and MoE HCCL collectives hang (stuck waiting for a peer).
     """
+    if _in_torch_compile_trace():
+        return
     try:
         dp = get_dp_group()
     except Exception:
@@ -119,15 +113,23 @@ def _pad_attn_tensors_to_dp_metadata(
     dm = _active_dp_metadata_from_forward_ctx(ctx)
     if dm is None:
         return hidden_states, topk_weights, topk_idx
-    expected = _expected_local_attn_rows_for_a2e(dm)
+    # Prefer int expected rows stashed on ForwardContext when the runner builds
+    # the batch (see vllm forward_context / npu_ubatch_wrapper). Reading
+    # num_tokens_across_dp_cpu inside torch.compile makes expected a
+    # data-dependent scalar (Dynamo UserError on `if actual >= expected`).
+    expected = getattr(ctx, "afd_expected_a2e_rows", None)
+    if expected is None:
+        expected = getattr(ctx, "num_tokens", None)
+    if expected is None:
+        expected = _expected_local_attn_rows_for_a2e(dm)
     if expected is None:
         return hidden_states, topk_weights, topk_idx
-    actual = int(hidden_states.shape[0])
-    if actual >= expected:
+    row0 = hidden_states.shape[0]
+    if row0 >= expected:
         return hidden_states, topk_weights, topk_idx
-    if actual <= 0:
+    if row0 <= 0:
         return hidden_states, topk_weights, topk_idx
-    pad_rows = expected - actual
+    pad_rows = expected - row0
     # Ghost rows: duplicate last token hidden + routing; zero gate weights so
     # they contribute nothing (avoids mass-routing padded rows to expert 0).
     pad_hs = hidden_states[-1:].expand(pad_rows, hidden_states.shape[1]).clone()
@@ -140,51 +142,6 @@ def _pad_attn_tensors_to_dp_metadata(
         topk_idx = torch.cat([topk_idx, pad_ids], dim=0)
         topk_weights = torch.cat([topk_weights, pad_w], dim=0)
     return hidden_states, topk_weights, topk_idx
-
-
-def _log_afd_cam_routing(phase: str, *, connector_rank: int, layer_idx: Optional[int],
-                         ubatch_idx: int, batch_size: int, h: int, k: int,
-                         moe_expert_num: int, compute_gate: int,
-                         hidden_states: Optional[torch.Tensor] = None,
-                         topk_ids: Optional[torch.Tensor] = None,
-                         topk_weights: Optional[torch.Tensor] = None,
-                         x_active_mask: Optional[torch.Tensor] = None):
-    if not envs_ascend.VLLM_ASCEND_AFD_CAM_ROUTING_DIAG:
-        return
-    ctx = get_forward_context()
-    dp_s = None
-    if ctx is not None and getattr(ctx, "dp_metadata", None) is not None:
-        dm = ctx.dp_metadata
-        dp_s = {
-            "num_tokens_across_dp": dm.num_tokens_across_dp_cpu.tolist(),
-            "max_tokens_across_dp": int(dm.max_tokens_across_dp_cpu.item()),
-        }
-    hs = tuple(hidden_states.shape) if hidden_states is not None else None
-    tw_info = (
-        f"topk_weights.shape={tuple(topk_weights.shape)} "
-        f"dtype={topk_weights.dtype}" if topk_weights is not None else
-        "topk_weights=None")
-    mask_info = (_diag_mask_line("x_active_mask", x_active_mask)
-                 if x_active_mask is not None else "x_active_mask=None")
-    logger.info(
-        "[AFD-CAM-ROUTING] %s | conn_rank=%s | layer_idx=%s | ubatch_idx=%s | "
-        "meta_batch_size=%s | h=%s k=%s moe_expert_num=%s | compute_gate=%s | "
-        "hidden_states.shape=%s | %s | %s | %s | dp_metadata=%s",
-        phase,
-        connector_rank,
-        layer_idx,
-        ubatch_idx,
-        batch_size,
-        h,
-        k,
-        moe_expert_num,
-        compute_gate,
-        hs,
-        _diag_topk_line("topk_ids", topk_ids, moe_expert_num),
-        tw_info,
-        mask_info,
-        dp_s,
-    )
 
 
 def _get_group_ep(ubatch_idx: int, hccl_comm_name: str, hccl_comm_name2: str, hccl_comm_name3: Optional[str]) -> str:
@@ -223,7 +180,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.num_logical_experts = self.hf_config.n_routed_experts
         self.num_shared_experts = self.hf_config.n_shared_experts
-        print(f'self.use_aclgraph in CAMP2PAFDConnector is {self.use_aclgraph}')
 
     def _use_aclgraph(self) -> bool:
         return self.config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and \
@@ -250,10 +206,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         self.p2p_rank = self.rank + self.min_size if role == "attention" else self.rank
         self.rank = world_rank
 
-        print(f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
-        logger.debug(
-            f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
-        
         self.afd_pg_list = []
         self.hccl_comm_name_list = []
         num_ubatches = self.config.parallel_config.num_ubatches if self.config.parallel_config.num_ubatches else 1
@@ -318,10 +270,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             self.aiv_num = self.config.afd_config.attn_core_num if self.config.afd_config.is_attn_multistream else 8
         else:
             self.aiv_num = self.config.afd_config.ffn_core_num if self.config.afd_config.is_ffn_multistream else 8
-
-        logger.debug(f"[CAM] world_rank={self.rank}, p2p_rank={self.p2p_rank}, min_size={self.min_size}, "
-                     f"dst_list={self.dst_list}, cam connector initialized")
-        logger.info("m2n connector initialized")
 
         self._initialized = True
 
@@ -438,23 +386,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         hs_ret, tw_ret, tid_ret = hidden_states, topk_weights, topk_idx
         hs_send, tw_send, tid_send = _pad_attn_tensors_to_dp_metadata(
             hidden_states, topk_weights, topk_idx, compute_gate)
-        h_dim = int(hs_send.shape[1]) if hs_send.dim() >= 2 else int(
-            self.hf_config.hidden_size)
-        _log_afd_cam_routing(
-            "SEND",
-            connector_rank=self.rank,
-            layer_idx=getattr(metadata, "layer_idx", None),
-            ubatch_idx=kwargs.get("ubatch_idx", 0),
-            batch_size=int(hs_send.shape[0]),
-            h=h_dim,
-            k=k,
-            moe_expert_num=moe_expert_num,
-            compute_gate=compute_gate,
-            hidden_states=hs_send,
-            topk_ids=tid_send if compute_gate == 1 else None,
-            topk_weights=tw_send if compute_gate == 1 else None,
-            x_active_mask=kwargs.get("x_active_mask"),
-        )
         _barrier_attention_dp_before_cam_send()
         torch.ops.vllm.cam_send_attn_output(hs_send, tw_send, tid_send,
                                             self.hccl_comm_name,
@@ -544,21 +475,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         out_topk_ids = outputs[1] if compute_gate == 1 else None
         out_topk_w = outputs[2] if compute_gate == 1 else None
         out_mask = outputs[4]
-        _log_afd_cam_routing(
-            "RECV",
-            connector_rank=self.rank,
-            layer_idx=getattr(metadata, "layer_idx", None),
-            ubatch_idx=ubatch_idx,
-            batch_size=int(batch_size),
-            h=int(h),
-            k=int(k),
-            moe_expert_num=int(metadata.moe_expert_num),
-            compute_gate=compute_gate,
-            hidden_states=outputs[0],
-            topk_ids=out_topk_ids,
-            topk_weights=out_topk_w,
-            x_active_mask=out_mask,
-        )
         return AFDRecvOutput(
             hidden_states=outputs[0],
             metadata=afdmetadata,
@@ -693,10 +609,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                                        dtype=torch.long,
                                        device="cpu")
 
-            logger.debug(
-                "send_dp_metadata_list dst:%s is_graph_capturing:%s is_warmup:%s",
-                dst, is_graph_capturing, is_warmup)
-
             torch.distributed.send(size_tensor, dst=dst, group=self.p2p_pg)
             torch.distributed.send(object_tensor_npu, dst=dst, group=self.p2p_pg)
 
@@ -707,7 +619,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             tuple: (data, is_graph_capturing, is_warmup)
         """
         src = self.p2p_rank % self.min_size + self.ffn_size
-        logger.debug(f"recv_dp_metadata_list src:{src}")
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
         rank_size = torch.distributed.recv(size_tensor, src=src, group=self.p2p_pg)
@@ -727,9 +638,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             # 兼容旧格式
             data, is_graph_capturing = obj
             is_warmup = False
-
-        logger.debug("recv_dp_metadata_list is_graph_capturing:%s is_warmup:%s",
-                    is_graph_capturing, is_warmup)
 
         return data, is_graph_capturing, is_warmup
 
