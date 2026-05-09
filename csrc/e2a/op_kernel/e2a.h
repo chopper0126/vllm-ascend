@@ -71,23 +71,20 @@ public:
         PipeBarrier<PIPE_ALL>();
 
         if (rank >= expertRankSize) {
-            shareAddrs[rank] = (GM_ADDR)(epWinContext_->localWindowsIn) + (this->magic % DOUBLE_BUFFER_COUNT) *
-                IPC_BUFF_MAX_SIZE_MUL_EXP + rank * OPT_RANK_OFFSET;
+            shareAddrs[rank] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
             shareAddrs[rank % expertRankSize] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->
-                remoteRes[rank % expertRankSize].nextDevicePtr))->windowsIn) + (this->magic % DOUBLE_BUFFER_COUNT) *
-                IPC_BUFF_MAX_SIZE_MUL_EXP + (rank % expertRankSize) * OPT_RANK_OFFSET;
+                remoteRes[rank % expertRankSize].nextDevicePtr))->windowsIn) + (rank % expertRankSize) * OPT_RANK_OFFSET;
             pipe_barrier(PIPE_ALL);
         } else {
             pipe_barrier(PIPE_ALL);
 
             for (int i = 0; i < rankSize; i++) {
                 if (i == rank) {
-                    shareAddrs[i] = (GM_ADDR)(epWinContext_->localWindowsIn) + (this->magic % DOUBLE_BUFFER_COUNT) *
-                        IPC_BUFF_MAX_SIZE_MUL_EXP + rank * OPT_RANK_OFFSET;
+                    shareAddrs[i] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
                     continue;
                 }
                 shareAddrs[i] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[i].nextDevicePtr))->
-                    windowsIn) + (this->magic % DOUBLE_BUFFER_COUNT) * IPC_BUFF_MAX_SIZE_MUL_EXP + i * OPT_RANK_OFFSET;
+                    windowsIn) + i * OPT_RANK_OFFSET;
             }
         }
 
