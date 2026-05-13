@@ -814,6 +814,16 @@ class NPUModelRunner(GPUModelRunner):
             num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
         )
 
+        # AFD + DP (scheme 2): ``coordinate_batch_across_dp`` may agree on a
+        # padded token count above this rank's value after
+        # ``_sync_metadata_across_dp`` (e.g. DBO + skip-allreduce). Realign
+        # only when ``batch_descriptor`` disagrees so eager batches that already
+        # match are unchanged.
+        if (self.afd_config and self.parallel_config.data_parallel_size > 1
+                and int(batch_descriptor.num_tokens) != int(num_input_tokens)):
+            num_input_tokens = int(batch_descriptor.num_tokens)
+            maybe_padded_num_tokens = num_input_tokens
+
         logger.info(
             "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
             "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -851,8 +861,44 @@ class NPUModelRunner(GPUModelRunner):
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, total_num_scheduled_tokens,
                                 cu_num_tokens)
-        self.positions.cpu[total_num_scheduled_tokens:num_input_tokens].zero_()
-        self.positions.copy_to_gpu()
+        if num_input_tokens > total_num_scheduled_tokens:
+            pad_id = 0
+            try:
+                hf_cfg = (getattr(self.model_config, "hf_text_config", None)
+                          or getattr(self.model_config, "hf_config", None))
+                if hf_cfg is not None and getattr(hf_cfg, "pad_token_id",
+                                                  None) is not None:
+                    pad_id = int(hf_cfg.pad_token_id)
+            except Exception:
+                pad_id = 0
+            t0, t1 = total_num_scheduled_tokens, num_input_tokens
+            # Pad on NPU only: CPU slice fill + ``copy_to_gpu`` can issue
+            # host memcpy that Ascend rejects under graph capture (rtMemcpy
+            # 107030: capture mode does not support this operation).
+            self.input_ids.gpu[t0:t1].fill_(pad_id)
+            if self.enable_prompt_embeds:
+                self.inputs_embeds.gpu[t0:t1].zero_()
+                self.is_token_ids.gpu[t0:t1].zero_()
+        # 1D positions: avoid full-buffer H2D when only the tail must be zero.
+        if self.uses_mrope or self.uses_xdrope_dim > 0:
+            self.positions.cpu[
+                total_num_scheduled_tokens:num_input_tokens].zero_()
+            self.positions.copy_to_gpu()
+            if self.uses_mrope and num_input_tokens > total_num_scheduled_tokens:
+                self.mrope_positions.gpu[:, total_num_scheduled_tokens:
+                                         num_input_tokens].zero_()
+            elif self.uses_xdrope_dim > 0 and (
+                    num_input_tokens > total_num_scheduled_tokens):
+                self.xdrope_positions.gpu[:, total_num_scheduled_tokens:
+                                          num_input_tokens].zero_()
+        else:
+            if num_input_tokens > total_num_scheduled_tokens:
+                self.positions.gpu[
+                    total_num_scheduled_tokens:num_input_tokens].zero_()
+            else:
+                self.positions.cpu[
+                    total_num_scheduled_tokens:num_input_tokens].zero_()
+                self.positions.copy_to_gpu()
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
@@ -947,6 +993,8 @@ class NPUModelRunner(GPUModelRunner):
             # then the embedding layer is not included in the ACL graph.
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
+        if inputs_embeds is not None and num_input_tokens > total_num_scheduled_tokens:
+            inputs_embeds[total_num_scheduled_tokens:].zero_()
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
         elif self.uses_xdrope_dim > 0:
