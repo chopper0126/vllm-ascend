@@ -1781,6 +1781,8 @@ class NPUModelRunner(GPUModelRunner):
                             dp_metadata_list,
                             is_warmup=self._is_warmup,
                         )
+                        logger.info(f'afd_connector.rank send_dp_metadata_list is {dp_metadata_list}, '
+                                    f'is_warmup: {self._is_warmup}, ubatch_slices: {ubatch_slices}')
                     dist.barrier(group=get_dp_group().cpu_group)
                 hidden_states = self._generate_process_reqs_hidden_states(
                     maybe_padded_num_tokens, input_ids, positions,
@@ -2654,6 +2656,8 @@ class NPUModelRunner(GPUModelRunner):
                             is_graph_capturing=is_graph_capturing,
                             is_warmup=self._is_warmup,
                         )
+                        logger.info(f'afd_connector.rank in dummy_run send_dp_metadata_list is {dp_metadata_list}, '
+                                    f'is_graph_capturing: {is_graph_capturing}, is_warmup: {self._is_warmup}')
                     dist.barrier(group=get_dp_group().cpu_group)
 
                 hidden_states = self._generate_dummy_run_hidden_states(

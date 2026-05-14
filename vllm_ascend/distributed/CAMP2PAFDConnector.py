@@ -18,6 +18,7 @@ from torch.distributed.distributed_c10d import _update_default_pg, _get_default_
 
 from vllm.distributed.parallel_state import (get_dp_group, init_afd_process_group,
                                               init_model_parallel_group)
+from vllm.logger import init_logger
 from vllm_ascend.distributed.metadata import (CAMP2PAFDConnectorMetadata)
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ascend_config import get_ascend_config
@@ -29,6 +30,7 @@ from vllm.forward_context import ForwardContext, get_forward_context
 
 from vllm_ascend.utils import npu_stream_switch_within_graph
 
+logger = init_logger(__name__)
 
 # vLLM's TorchCompileWithNoGuardsWrapper rejects @torch._dynamo.disable callees
 # inside the compiled region; keep scalar tensor reads traceable where possible.
@@ -180,6 +182,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.num_logical_experts = self.hf_config.n_routed_experts
         self.num_shared_experts = self.hf_config.n_shared_experts
+        print(f'self.use_aclgraph in CAMP2PAFDConnector is {self.use_aclgraph}')
 
     def _use_aclgraph(self) -> bool:
         return self.config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and \
@@ -205,6 +208,10 @@ class CAMP2PAFDConnector(AFDConnectorBase):
         # p2p_rank: 所有FFN [0, ffn_size), 前min_size个Attention [ffn_size, ffn_size+min_size)
         self.p2p_rank = self.rank + self.min_size if role == "attention" else self.rank
         self.rank = world_rank
+
+        print(f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
+        logger.debug(
+            f"world_size = {self.ffn_size + self.attn_size}, world_rank = {self.rank}")
 
         self.afd_pg_list = []
         self.hccl_comm_name_list = []
@@ -270,6 +277,10 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             self.aiv_num = self.config.afd_config.attn_core_num if self.config.afd_config.is_attn_multistream else 8
         else:
             self.aiv_num = self.config.afd_config.ffn_core_num if self.config.afd_config.is_ffn_multistream else 8
+
+        logger.debug(f"[CAM] world_rank={self.rank}, p2p_rank={self.p2p_rank}, min_size={self.min_size}, "
+                     f"dst_list={self.dst_list}, cam connector initialized")
+        logger.info("m2n connector initialized")
 
         self._initialized = True
 
@@ -609,6 +620,10 @@ class CAMP2PAFDConnector(AFDConnectorBase):
                                        dtype=torch.long,
                                        device="cpu")
 
+            logger.debug(
+                "send_dp_metadata_list dst:%s is_graph_capturing:%s is_warmup:%s",
+                dst, is_graph_capturing, is_warmup)
+
             torch.distributed.send(size_tensor, dst=dst, group=self.p2p_pg)
             torch.distributed.send(object_tensor_npu, dst=dst, group=self.p2p_pg)
 
@@ -619,6 +634,7 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             tuple: (data, is_graph_capturing, is_warmup)
         """
         src = self.p2p_rank % self.min_size + self.ffn_size
+        logger.debug(f"recv_dp_metadata_list src:{src}")
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
         rank_size = torch.distributed.recv(size_tensor, src=src, group=self.p2p_pg)
@@ -638,6 +654,9 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             # 兼容旧格式
             data, is_graph_capturing = obj
             is_warmup = False
+
+        logger.debug("recv_dp_metadata_list is_graph_capturing:%s is_warmup:%s",
+                    is_graph_capturing, is_warmup)
 
         return data, is_graph_capturing, is_warmup
 
