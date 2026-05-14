@@ -111,20 +111,6 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             self.uniform_decode_query_len
         )
 
-        if envs_ascend.VLLM_ASCEND_FFN_DIAG_LOG_INIT:
-            cc = self.vllm_config.compilation_config
-            logger.info(
-                "[FFN-DIAG] NPUFFNModelRunner init: enforce_eager=%s "
-                "compilation_mode=%s cudagraph_mode=%s capture_sizes=%s "
-                "use_aclgraph=%s num_ubatches_cfg=%s",
-                self.model_config.enforce_eager,
-                cc.mode,
-                cc.cudagraph_mode,
-                list(cc.cudagraph_capture_sizes or []),
-                self.use_aclgraph,
-                num_ubatches_cfg,
-            )
-
         self.prof = None
         if envs_ascend.VLLM_ASCEND_FFN_PROFILER_ENABLE:
             experimental_config = torch_npu.profiler._ExperimentalConfig(
@@ -187,12 +173,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     logger.debug(f"ffn replay, replay_cnt is {self.replay_cnt}, dp_metadata_key={dp_metadata_key}")
                 else:
                     # fallback to eager mode
-                    logger.warning(
-                        "No acl graph found for dp_metadata_key=%s, fallback to "
-                        "eager (captured_keys=%s)",
-                        dp_metadata_key,
-                        list(self._acl_graphs.keys()),
-                    )
+                    logger.warning(f"No acl graph found for dp_metadata_key={dp_metadata_key}, fallback to eager")
                     self._ffn_forward(aclgraph_runtime_mode=CUDAGraphMode.NONE, dp_metadata_list=dp_metadata_list)
             else:
                 # eager mode for non-ubatch or no aclgraph
@@ -531,17 +512,6 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     if layer_multistream:
                         ffn_event_recorded[ubatch_idx] = True
                     print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}', flush=True)
-
-                if envs_ascend.VLLM_ASCEND_FFN_DIAG_SYNC_PER_LAYER:
-                    torch.npu.synchronize()
-                    logger.info(
-                        "[FFN-DIAG] per-layer sync OK layer_idx=%s/%s dp_key=%s "
-                        "aclgraph_mode=%s",
-                        layer_idx,
-                        self.num_layers - 1,
-                        self._get_dp_metadata_key(dp_metadata_list),
-                        aclgraph_runtime_mode,
-                    )
 
             if ffn_multistream_enable:
                 curr_stream = torch.npu.current_stream()

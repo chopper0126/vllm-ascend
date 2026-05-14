@@ -28,7 +28,6 @@ from vllm_ascend.utils import (AscendDeviceType, dispose_tensor,
                                get_weight_prefetch_method)
 
 
-
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
     return fusion and dynamic_eplb and enable_custom_op()
 

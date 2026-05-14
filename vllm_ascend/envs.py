@@ -166,13 +166,6 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
-    # AFD FFN diagnostics: log enforce_eager / cudagraph flags once at runner init.
-    "VLLM_ASCEND_FFN_DIAG_LOG_INIT":
-    lambda: bool(int(os.getenv("VLLM_ASCEND_FFN_DIAG_LOG_INIT", '0'))),
-    # AFD FFN diagnostics: torch.npu.synchronize() after each full layer (all ubatches)
-    # to localize NPU failures that first appear at the worker sync point.
-    "VLLM_ASCEND_FFN_DIAG_SYNC_PER_LAYER":
-    lambda: bool(int(os.getenv("VLLM_ASCEND_FFN_DIAG_SYNC_PER_LAYER", '0'))),
 }
 
 # end-env-vars-definition
