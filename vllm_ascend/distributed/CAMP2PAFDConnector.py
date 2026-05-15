@@ -32,13 +32,6 @@ from vllm_ascend.utils import npu_stream_switch_within_graph
 
 logger = init_logger(__name__)
 
-# vLLM's TorchCompileWithNoGuardsWrapper rejects @torch._dynamo.disable callees
-# inside the compiled region; keep scalar tensor reads traceable where possible.
-try:
-    torch._dynamo.config.capture_scalar_outputs = True
-except Exception:
-    pass
-
 
 def _in_torch_compile_trace() -> bool:
     try:

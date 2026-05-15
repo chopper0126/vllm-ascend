@@ -880,25 +880,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.inputs_embeds.gpu[t0:t1].zero_()
                 self.is_token_ids.gpu[t0:t1].zero_()
         # 1D positions: avoid full-buffer H2D when only the tail must be zero.
-        if self.uses_mrope or self.uses_xdrope_dim > 0:
+        if num_input_tokens > total_num_scheduled_tokens:
+            self.positions.gpu[
+                total_num_scheduled_tokens:num_input_tokens].zero_()
+        else:
             self.positions.cpu[
                 total_num_scheduled_tokens:num_input_tokens].zero_()
             self.positions.copy_to_gpu()
-            if self.uses_mrope and num_input_tokens > total_num_scheduled_tokens:
-                self.mrope_positions.gpu[:, total_num_scheduled_tokens:
-                                         num_input_tokens].zero_()
-            elif self.uses_xdrope_dim > 0 and (
-                    num_input_tokens > total_num_scheduled_tokens):
-                self.xdrope_positions.gpu[:, total_num_scheduled_tokens:
-                                          num_input_tokens].zero_()
-        else:
-            if num_input_tokens > total_num_scheduled_tokens:
-                self.positions.gpu[
-                    total_num_scheduled_tokens:num_input_tokens].zero_()
-            else:
-                self.positions.cpu[
-                    total_num_scheduled_tokens:num_input_tokens].zero_()
-                self.positions.copy_to_gpu()
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
