@@ -364,7 +364,6 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             topk_ids=topk_ids,
             x_active_mask=x_active_mask,
             cam_p2p_ep_name=cam_p2p_ep_name,
-            layer_idx=kwargs.get("layer_idx"),
         )
 
     # ATTN发给MOE（ATTN发送）

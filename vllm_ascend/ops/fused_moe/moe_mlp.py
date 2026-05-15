@@ -413,7 +413,6 @@ def dispatch_experts(
         ep_rank_size: int,
         ep_rank_id: int,
         moe_expert_num: int,
-        layer_idx: Optional[int] = None,
 ):
     """
     Dispatch阶段：将token分发到对应的专家
