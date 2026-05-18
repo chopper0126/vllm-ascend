@@ -861,6 +861,8 @@ class NPUModelRunner(GPUModelRunner):
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, total_num_scheduled_tokens,
                                 cu_num_tokens)
+        self.positions.cpu[total_num_scheduled_tokens:num_input_tokens].zero_()
+        self.positions.copy_to_gpu()
         if num_input_tokens > total_num_scheduled_tokens:
             pad_id = 0
             try:
@@ -879,14 +881,6 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_prompt_embeds:
                 self.inputs_embeds.gpu[t0:t1].zero_()
                 self.is_token_ids.gpu[t0:t1].zero_()
-        # 1D positions: avoid full-buffer H2D when only the tail must be zero.
-        if num_input_tokens > total_num_scheduled_tokens:
-            self.positions.gpu[
-                total_num_scheduled_tokens:num_input_tokens].zero_()
-        else:
-            self.positions.cpu[
-                total_num_scheduled_tokens:num_input_tokens].zero_()
-            self.positions.copy_to_gpu()
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
