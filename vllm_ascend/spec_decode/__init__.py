@@ -30,7 +30,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return NgramProposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3"):
         return EagleProposer(vllm_config, device, runner)
-    elif method in ("mtp", "deepseek_mtp"):
+    elif method == "mtp":
         return MtpProposer(vllm_config, device, runner)
     elif method == 'suffix':
         return SuffixDecodingProposer(vllm_config, device, runner)
