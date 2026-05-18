@@ -475,16 +475,13 @@ class CAMP2PAFDConnector(AFDConnectorBase):
 
         # outputs: [hidden_states1, simulateExpertIds, simulateExpertScales, attenBatchSize, xActiveMaskOut]
         from vllm.distributed.afd_transfer.afd_connector.metadata import AFDRecvOutput
-        out_topk_ids = outputs[1] if compute_gate == 1 else None
-        out_topk_w = outputs[2] if compute_gate == 1 else None
-        out_mask = outputs[4]
         return AFDRecvOutput(
             hidden_states=outputs[0],
             metadata=afdmetadata,
-            topk_ids=out_topk_ids,  # simulateExpertIdss
-            topk_weights=out_topk_w,  # simulateExpertScales
+            topk_ids=outputs[1] if compute_gate == 1 else None,  # simulateExpertIdss
+            topk_weights=outputs[2] if compute_gate == 1 else None,  # simulateExpertScales
             atten_batch_size=outputs[3],
-            x_active_mask=out_mask,
+            x_active_mask=outputs[4],
             cam_p2p_ep_name=self.hccl_comm_name1
         )
 
