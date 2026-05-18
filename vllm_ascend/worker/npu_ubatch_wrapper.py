@@ -14,7 +14,6 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id)
 from vllm.forward_context import get_forward_context, override_forward_context, DPMetadata
-from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import make_ubatch_contexts
@@ -327,19 +326,8 @@ class UBatchWrapper(GPUUBatchWrapper):
             forward_context.afd_metadata = afd_metadata
             forward_context.num_ubatches = len(ubatch_slices)
             forward_context.num_tokens = ubatch_slice.num_tokens
-            try:
-                g = get_dp_group()
-                rid = g.rank_in_group
-                nta = ubatch_dp_metadata.num_tokens_across_dp_cpu
-                if rid is not None and 0 <= int(rid) < int(nta.numel()):
-                    forward_context.afd_expected_a2e_rows = int(
-                        nta[int(rid)].item())
-                else:
-                    forward_context.afd_expected_a2e_rows = int(
-                        ubatch_slice.num_tokens)
-            except Exception:
-                forward_context.afd_expected_a2e_rows = int(
-                    ubatch_slice.num_tokens)
+            forward_context.afd_expected_a2e_rows = int(
+                ubatch_slice.num_tokens)
             forward_context.afd_comm_event = torch.npu.Event()
             forward_contexts.append(forward_context)
 
