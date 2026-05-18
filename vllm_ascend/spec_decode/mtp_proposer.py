@@ -121,8 +121,7 @@ class MtpProposer(EagleProposer):
                         previous_hidden_states)
                 self.model(input_ids=input_ids,
                            positions=positions,
-                           hidden_states=previous_hidden_states,
-                           spec_step_idx=i)
+                           hidden_states=previous_hidden_states)
                 forward_context = get_forward_context()
                 if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
                     not forward_context.capturing and not self.use_sparse:
@@ -351,8 +350,7 @@ class MtpProposer(EagleProposer):
 
                     hidden_states = self.model(input_ids=input_ids,
                                                positions=positions,
-                                               hidden_states=hidden_states,
-                                               spec_step_idx=step)
+                                               hidden_states=hidden_states)
                     forward_context = get_forward_context()
                     if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not self.use_sparse:
                         self._update_full_graph_params(forward_context,
@@ -380,8 +378,7 @@ class MtpProposer(EagleProposer):
                     pcp_allgather_restore_idx.gpu[:hidden_states.shape[0]])
 
             sample_hidden_states = hidden_states[last_token_indices]
-            logits = self.model.compute_logits(sample_hidden_states,
-                                               spec_step_idx=step)
+            logits = self.model.compute_logits(sample_hidden_states)
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
                 last_token_indices = last_token_indices[:num_indices]
