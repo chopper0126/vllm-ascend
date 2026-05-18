@@ -213,7 +213,7 @@ class EagleProposer(VllmEagleProposer):
             else:
                 self.model.lm_head = model.lm_head
 
-        if self.method in ("mtp", "deepseek_mtp") and \
+        if self.method == "mtp" and \
             self.vllm_config.model_config.is_deepseek_mla:
             for _, layer_module in self.model.model.layers.items():
                 if torch.equal(layer_module.shared_head.head.weight,
@@ -393,7 +393,8 @@ class EagleProposer(VllmEagleProposer):
 
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         builder = self.runner.attn_groups[0][0].get_metadata_builder()
-        attn_metadata = builder.build(0, common_attn_metadata)
+        attn_metadata = builder.build(0, common_attn_metadata,
+                                      self.runner.get_model())
         # update global cos, sin
         update_cos_sin(self.positions[:num_input_tokens])
         per_layer_attn_metadata = {}
