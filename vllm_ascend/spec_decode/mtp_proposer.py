@@ -1,4 +1,4 @@
-from typing import Optional, Union
+﻿from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -299,7 +299,8 @@ class MtpProposer(EagleProposer):
         common_attn_metadata.graph_pad_size = graph_pad_size
         common_attn_metadata.num_input_tokens = num_input_tokens
         builder = self.runner.attn_groups[0][0].get_metadata_builder()
-        attn_metadata_mtp = builder.build(0, common_attn_metadata)
+        attn_metadata_mtp = builder.build(0, common_attn_metadata,
+                                          self.runner.get_model())
         attn_metadata = {}
         for layer_name in self.attn_layer_name:
             attn_metadata[layer_name] = attn_metadata_mtp
