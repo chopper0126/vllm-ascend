@@ -846,8 +846,9 @@ class NPUModelRunner(GPUModelRunner):
             self.parallel_config.num_ubatches,
         )
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
-        ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+        # Forward/AFD use ubatch_slices_padded; attn splits must match or RoPE
+        # rows (from metadata) diverge from hidden rows (from token slices).
+        ubatch_slices_attn = ubatch_slices_padded if ubatch_slices is not None else None
 
         self.is_ubatch = should_ubatch
 
@@ -1181,7 +1182,7 @@ class NPUModelRunner(GPUModelRunner):
                 slot_mapping=slot_mapping,
                 num_computed_tokens_cpu=self.input_batch.
                 num_computed_tokens_cpu_tensor[:num_reqs],
-                positions=self.positions.gpu,
+                positions=self.positions.gpu[:num_input_tokens],
                 attn_state=self.attn_state,
                 max_query_len=max_num_scheduled_tokens,
                 decode_token_per_req=self.decode_token_per_req,
@@ -2211,7 +2212,7 @@ class NPUModelRunner(GPUModelRunner):
                     block_table_tensor=block_table_tensor[:num_reqs],
                     slot_mapping=slot_mapping.gpu,
                     num_computed_tokens_cpu=num_computed_tokens_cpu,
-                    positions=self.positions.gpu,
+                    positions=self.positions.gpu[:num_tokens],
                     attn_state=self.attn_state,
                     max_query_len=max_query_len,
                     decode_token_per_req=self.decode_token_per_req,

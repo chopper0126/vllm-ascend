@@ -198,6 +198,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
+        assert cos.shape[0] == num_input_tokens and sin.shape[0] == num_input_tokens, (
+            f"SFA build: cos/sin rows ({cos.shape[0]}, {sin.shape[0]}) != "
+            f"num_input_tokens {num_input_tokens}")
 
         sfa_cp_context = None
         if self.enable_sfa_cp:
@@ -886,6 +889,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         if HAS_TRITON:
             q, _ = self.wq_b(qr)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
             q = q.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
+            num_q_tokens = q.shape[0]
+            if cos.shape[0] != num_q_tokens or sin.shape[0] != num_q_tokens:
+                raise RuntimeError(
+                    f"SFA RoPE row mismatch: q has {num_q_tokens} tokens, "
+                    f"cos rows={cos.shape[0]}, sin rows={sin.shape[0]}. "
+                    "Check DBO micro-batch cos/sin staging.")
 
             cos = cos.view(-1, self.qk_rope_head_dim)
             sin = sin.view(-1, self.qk_rope_head_dim)

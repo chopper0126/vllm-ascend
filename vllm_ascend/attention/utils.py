@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -306,10 +307,25 @@ def _make_metadata_with_slice(
     first_tok = token_slice.start
     last_req = request_slice.stop - 1
     last_tok = token_slice.stop - 1
+    # Padded ubatch_slices extend past scheduled tokens; only validate real rows.
+    num_scheduled_tokens = attn_metadata.num_actual_tokens
 
     assert start_locs[first_req] <= first_tok < start_locs[first_req + 1], \
         "Token slice start outside of first request"
-    assert start_locs[last_req] <= last_tok < start_locs[last_req+1], \
+    assert first_tok < num_scheduled_tokens, (
+        f"ubatch token_slice.start {first_tok} has no scheduled tokens "
+        f"(num_scheduled_tokens={num_scheduled_tokens})")
+    last_scheduled_tok = min(last_tok, num_scheduled_tokens - 1)
+    # Padded request_slice may include trailing reqs with no tokens this step
+    # (uniform decode + cudagraph req padding).
+    start_locs_arr = np.asarray(start_locs)
+    actual_last_req = int(
+        np.searchsorted(start_locs_arr, last_scheduled_tok, side="right") - 1)
+    actual_last_req = max(actual_last_req, first_req)
+    if actual_last_req < last_req:
+        request_slice = slice(request_slice.start, actual_last_req + 1)
+        last_req = actual_last_req
+    assert start_locs[last_req] <= last_scheduled_tok < start_locs[last_req + 1], \
         "Token slice end outside of last request"
 
     # If the "middle" request has tokens in both ubatches, we have to split it.
@@ -317,7 +333,7 @@ def _make_metadata_with_slice(
     # request. If it's the second microbatch, then we will be splitting the
     # first request
     splits_first_request = first_tok > start_locs[first_req]
-    splits_last_request = last_tok < start_locs[last_req + 1] - 1
+    splits_last_request = last_scheduled_tok < start_locs[last_req + 1] - 1
 
     query_start_loc_cpu = slice_query_start_locs(start_locs, request_slice)
     query_start_loc = slice_query_start_locs(attn_metadata.query_start_loc,
@@ -338,7 +354,8 @@ def _make_metadata_with_slice(
         # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
         # the tokens skipped because query_start_loc_cpu might have been modified
         # if splits_first_request is True.
-        tokens_skipped = start_locs[last_req + 1] - token_slice.stop
+        real_token_stop = min(token_slice.stop, num_scheduled_tokens)
+        tokens_skipped = start_locs[last_req + 1] - real_token_stop
         query_start_loc[-1] -= tokens_skipped
         query_start_loc_cpu[-1] -= tokens_skipped
 
@@ -353,7 +370,8 @@ def _make_metadata_with_slice(
     num_computed_tokens_cpu = attn_metadata.num_computed_tokens_cpu[request_slice]
 
     num_requests = request_slice.stop - request_slice.start
-    num_actual_tokens = token_slice.stop - token_slice.start
+    num_input_tokens = token_slice.stop - token_slice.start
+    num_actual_tokens = num_input_tokens
     max_query_len = int(torch.max(torch.abs(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1])).item())
 
     # This is to account for the case where we are in a dummy
@@ -362,11 +380,27 @@ def _make_metadata_with_slice(
         max_query_len = attn_metadata.max_query_len
 
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
-    slot_mapping = attn_metadata.slot_mapping[token_slice]
+    real_token_stop = min(token_slice.stop, num_scheduled_tokens)
+    slot_mapping = attn_metadata.slot_mapping[token_slice.start:real_token_stop]
+    num_pad_tokens = num_input_tokens - slot_mapping.numel()
+    if num_pad_tokens > 0:
+        slot_pad = torch.full(
+            (num_pad_tokens, ),
+            -1,
+            dtype=slot_mapping.dtype,
+            device=slot_mapping.device,
+        )
+        slot_mapping = torch.cat([slot_mapping, slot_pad])
 
     # adapt to Ascend common metadata
-    num_input_tokens = token_slice.stop - token_slice.start
-    positions = attn_metadata.positions[token_slice]
+    positions = attn_metadata.positions[token_slice.start:real_token_stop].clone()
+    if num_pad_tokens > 0:
+        pos_pad = torch.zeros(
+            num_pad_tokens,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        positions = torch.cat([positions, pos_pad])
     attn_state = attn_metadata.attn_state
     # if attn_metadata.attn_state != AscendAttentionState.ChunkedPrefill:
     # attn_mask = attn_metadata.attn_mask
