@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from vllm.config import CUDAGraphMode
 from vllm.distributed import get_pcp_group
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -249,23 +249,6 @@ class MtpProposer(EagleProposer):
 
         assert self.runner is not None
 
-        # Note(qcs): We may need to refactor these check logics.
-        if self.use_cuda_graph and num_scheduled_tokens <= self.runner.cudagraph_batch_sizes[
-                -1]:
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                num_scheduled_tokens)
-        else:
-            # Eager mode, no padding needed
-            num_input_tokens = num_tokens
-
-        # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions
-        self.hidden_states[:num_tokens] = target_hidden_states
-        # eager/acl piecewise mode need to update num_tokens_across_dp
-        (num_input_tokens, num_tokens_across_dp, with_prefill,
-         _) = self.runner._sync_metadata_across_dp(num_input_tokens,
-                                                   self.runner.with_prefill)
-
         # Enable shared_expert_dp and MTP FULL graph may cause accuracy issues.
         if scheduler_output and not self.enable_shared_expert_dp:
             max_query_len = common_attn_metadata.max_query_len
@@ -277,8 +260,15 @@ class MtpProposer(EagleProposer):
         else:
             uniform_decode = False
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
+
+        # Adaptive graph mode / padding (align with main model): dispatch on
+        # unpadded token count first; only pad when FULL graph is selected.
+        num_tokens_unpadded = num_scheduled_tokens
         aclgraph_runtime_mode, batch_descriptor = \
-            self.runner.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
+            self.runner.cudagraph_dispatcher.dispatch(
+                num_tokens=num_tokens_unpadded,
+                uniform_decode=uniform_decode,
+                has_lora=has_lora)
         if not self.use_cuda_graph:
             # there is synchronization between mtp steps when enabling aclgraph,
             # disable aclgraph when use async scheduling to avoid the
@@ -286,6 +276,35 @@ class MtpProposer(EagleProposer):
             # NOTE: we need to set aclgraph_runtime_mode to None in both dummy_run
             # and _propose.
             aclgraph_runtime_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens_unpadded)
+
+        num_input_tokens = batch_descriptor.num_tokens
+
+        # copy inputs to buffer for cudagraph
+        self.positions[:num_tokens] = target_positions
+        self.hidden_states[:num_tokens] = target_hidden_states
+        # eager/acl piecewise mode need to update num_tokens_across_dp
+        (num_input_tokens, num_tokens_across_dp, with_prefill,
+         synced_cudagraph_mode) = self.runner._sync_metadata_across_dp(
+             num_input_tokens,
+             self.runner.with_prefill,
+             aclgraph_runtime_mode.value)
+
+        # Re-dispatch after DP sync (same as main model) when padding or graph
+        # mode changed across ranks.
+        if (int(batch_descriptor.num_tokens) != int(num_input_tokens)
+                or synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value):
+            aclgraph_runtime_mode, batch_descriptor = \
+                self.runner.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_input_tokens,
+                    uniform_decode=uniform_decode,
+                    has_lora=has_lora,
+                    disable_full=synced_cudagraph_mode
+                    <= CUDAGraphMode.PIECEWISE.value)
+            if not self.use_cuda_graph:
+                aclgraph_runtime_mode = CUDAGraphMode.NONE
+                batch_descriptor = BatchDescriptor(num_input_tokens)
+            num_input_tokens = batch_descriptor.num_tokens
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs(
         ) and aclgraph_runtime_mode == CUDAGraphMode.FULL:
