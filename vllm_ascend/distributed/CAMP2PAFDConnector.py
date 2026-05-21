@@ -16,8 +16,7 @@ import re
 import torch
 from torch.distributed.distributed_c10d import _update_default_pg, _get_default_group
 
-from vllm.distributed.parallel_state import (get_dp_group, init_afd_process_group,
-                                              init_model_parallel_group)
+from vllm.distributed.parallel_state import init_afd_process_group, init_model_parallel_group
 from vllm.logger import init_logger
 from vllm_ascend.distributed.metadata import (CAMP2PAFDConnectorMetadata)
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
@@ -31,114 +30,6 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm_ascend.utils import npu_stream_switch_within_graph
 
 logger = init_logger(__name__)
-
-
-def _in_torch_compile_trace() -> bool:
-    try:
-        if hasattr(torch.compiler, "is_compiling"):
-            return bool(torch.compiler.is_compiling())
-    except Exception:
-        pass
-    try:
-        return bool(torch._dynamo.is_compiling())
-    except Exception:
-        return False
-
-
-def _active_dp_metadata_from_forward_ctx(ctx: ForwardContext):
-    if ctx.dp_metadata is not None:
-        return ctx.dp_metadata
-    am = ctx.afd_metadata
-    if am is None:
-        return None
-    dpl = getattr(am, "dp_metadata_list", None)
-    if not dpl:
-        return None
-    idx = ctx.ubatch_idx
-    if idx < len(dpl):
-        return dpl[idx]
-    return dpl[0]
-
-
-def _expected_local_attn_rows_for_a2e(dm) -> Optional[int]:
-    """Rows this DP rank should send into a2e; must match dp_metadata treaty.
-
-    Always use num_tokens_across_dp_cpu[dp_rank] only. Do not index
-    dm.local_sizes by dp_rank when SP/chunking expands that list — lengths
-    can match num_tokens_across_dp by coincidence but semantics differ.
-    """
-    try:
-        dp_rank = get_dp_group().rank_in_group
-    except Exception:
-        return None
-    nta = dm.num_tokens_across_dp_cpu
-    if dp_rank < 0 or dp_rank >= nta.numel():
-        return None
-    return int(nta[dp_rank].item())
-
-
-def _barrier_attention_dp_before_cam_send() -> None:
-    """Match Attention DP ranks at the same layer before a2e / CAM collectives.
-
-    If one rank finishes attention earlier and enters cam_send while the other
-    is still in a prior layer, the paired FFN EP ranks can process different
-    layers and MoE HCCL collectives hang (stuck waiting for a peer).
-    """
-    if _in_torch_compile_trace():
-        return
-    try:
-        dp = get_dp_group()
-    except Exception:
-        return
-    if dp is None or dp.world_size <= 1:
-        return
-    dp.barrier()
-
-
-def _expected_a2e_rows_from_forward_ctx(ctx: ForwardContext) -> Optional[int]:
-    """Rows DP/a2e expect for this forward step (see runner / ubatch wrapper)."""
-    expected = getattr(ctx, "afd_expected_a2e_rows", None)
-    if expected is not None:
-        return int(expected)
-    num_tokens = getattr(ctx, "num_tokens", None)
-    if num_tokens is not None:
-        return int(num_tokens)
-    dm = _active_dp_metadata_from_forward_ctx(ctx)
-    if dm is None:
-        return None
-    return _expected_local_attn_rows_for_a2e(dm)
-
-
-def _assert_attn_rows_for_a2e(
-    hidden_states: torch.Tensor,
-    *,
-    use_aclgraph: bool,
-) -> None:
-    """Verify hidden row count before a2e (torch_binding uses x.size(0)).
-
-    Ghost-row padding was removed after MTP and the main model share the same
-    graph/DP padding path. Under ACL graph, mismatch is a hard error so we
-    catch runner/metadata regressions early.
-    """
-    if _in_torch_compile_trace():
-        return
-    ctx = get_forward_context()
-    if ctx is None:
-        return
-    expected = _expected_a2e_rows_from_forward_ctx(ctx)
-    if expected is None:
-        return
-    actual = int(hidden_states.shape[0])
-    if actual >= expected:
-        return
-    msg = (
-        f"a2e row mismatch: hidden_states has {actual} rows but DP treaty "
-        f"expects >= {expected}. Align num_input_tokens / batch_descriptor in "
-        f"model_runner before attn forward (ubatch_idx={getattr(ctx, 'ubatch_idx', None)})."
-    )
-    if use_aclgraph:
-        raise AssertionError(msg)
-    logger.warning(msg)
 
 
 def _get_group_ep(ubatch_idx: int, hccl_comm_name: str, hccl_comm_name2: str, hccl_comm_name3: Optional[str]) -> str:
@@ -386,24 +277,20 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             compute_gate = 0
         else:
             compute_gate = 1 if getattr(self.config.afd_config, 'compute_gate_on_attention', True) else 0
-        _assert_attn_rows_for_a2e(
-            hidden_states, use_aclgraph=self.use_aclgraph)
-        _barrier_attention_dp_before_cam_send()
-        torch.ops.vllm.cam_send_attn_output(hidden_states, topk_weights, topk_idx,
-                                            self.hccl_comm_name,
-                                            self.hccl_comm_name2,
-                                            self.hccl_comm_name3,
-                                            self.rank,
-                                            self.ffn_size,
-                                            self.attn_size,
-                                            moe_expert_num,
-                                            self.max_num_reqs,
-                                            self.hf_config.hidden_size,
-                                            k,
-                                            multistream_enable,
-                                            self.aiv_num,
-                                            compute_gate)
-        return hidden_states, None
+        return torch.ops.vllm.cam_send_attn_output(hidden_states, topk_weights, topk_idx,
+                                                   self.hccl_comm_name,
+                                                   self.hccl_comm_name2,
+                                                   self.hccl_comm_name3,
+                                                   self.rank,
+                                                   self.ffn_size,
+                                                   self.attn_size,
+                                                   moe_expert_num,
+                                                   self.max_num_reqs,
+                                                   self.hf_config.hidden_size,
+                                                   k,
+                                                   multistream_enable,
+                                                   self.aiv_num,
+                                                   compute_gate), None
 
     # MOE发给ATTN（ATTN接收）
     def recv_ffn_output(self,
