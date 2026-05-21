@@ -285,26 +285,11 @@ class MtpProposer(EagleProposer):
         self.hidden_states[:num_tokens] = target_hidden_states
         # eager/acl piecewise mode need to update num_tokens_across_dp
         (num_input_tokens, num_tokens_across_dp, with_prefill,
-         synced_cudagraph_mode) = self.runner._sync_metadata_across_dp(
+         _) = self.runner._sync_metadata_across_dp(
              num_input_tokens,
              self.runner.with_prefill,
              aclgraph_runtime_mode.value)
 
-        # Re-dispatch after DP sync (same as main model) when padding or graph
-        # mode changed across ranks.
-        if (int(batch_descriptor.num_tokens) != int(num_input_tokens)
-                or synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value):
-            aclgraph_runtime_mode, batch_descriptor = \
-                self.runner.cudagraph_dispatcher.dispatch(
-                    num_tokens=num_input_tokens,
-                    uniform_decode=uniform_decode,
-                    has_lora=has_lora,
-                    disable_full=synced_cudagraph_mode
-                    <= CUDAGraphMode.PIECEWISE.value)
-            if not self.use_cuda_graph:
-                aclgraph_runtime_mode = CUDAGraphMode.NONE
-                batch_descriptor = BatchDescriptor(num_input_tokens)
-            num_input_tokens = batch_descriptor.num_tokens
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs(
         ) and aclgraph_runtime_mode == CUDAGraphMode.FULL:
