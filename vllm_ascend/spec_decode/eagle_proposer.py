@@ -100,6 +100,7 @@ class EagleProposer(VllmEagleProposer):
             self.vllm_config.compilation_config.mode
             == CompilationMode.VLLM_COMPILE
             and not self.vllm_config.model_config.enforce_eager
+            and not self.use_async_scheduling
             and not self.vllm_config.speculative_config.enforce_eager)
 
         self.cudagraph_batch_sizes = list(

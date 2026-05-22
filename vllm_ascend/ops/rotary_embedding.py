@@ -116,10 +116,7 @@ def get_cos_and_sin_mla(positions, use_cache=False):
     num_tokens = positions.size(0)
     _cos_mla[:num_tokens, ...] = cos
     _sin_mla[:num_tokens, ...] = sin
-    # Own tensor per caller: DBO builds one metadata per micro-batch into the
-    # same staging buffer; views would alias and corrupt earlier slices.
-    return (_cos_mla[:num_tokens, ...].clone(),
-            _sin_mla[:num_tokens, ...].clone())
+    return _cos_mla[:num_tokens, ...], _sin_mla[:num_tokens, ...]
 
 
 def _record_cos_sin_cache(cos_sin_cache):

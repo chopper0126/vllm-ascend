@@ -326,8 +326,6 @@ class UBatchWrapper(GPUUBatchWrapper):
             forward_context.afd_metadata = afd_metadata
             forward_context.num_ubatches = len(ubatch_slices)
             forward_context.num_tokens = ubatch_slice.num_tokens
-            forward_context.afd_expected_a2e_rows = int(
-                ubatch_slice.num_tokens)
             forward_context.afd_comm_event = torch.npu.Event()
             forward_contexts.append(forward_context)
 
