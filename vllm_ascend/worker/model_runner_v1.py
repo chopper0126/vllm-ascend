@@ -524,7 +524,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, cudagraph_mode
 
-        if self._skip_all_reduce_across_dp_group():
+        if self._skip_all_reduce_across_dp_group() and self.afd_config is None:
             num_tokens_after_padding = torch.tensor([num_tokens] *
                                                     self.dp_size,
                                                     device="cpu",
@@ -836,10 +836,8 @@ class NPUModelRunner(GPUModelRunner):
             self.parallel_config.num_ubatches,
         )
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        pad_for_graph = cudagraph_mode == CUDAGraphMode.FULL
         ubatch_slices_attn = (
-            ubatch_slices_padded
-            if pad_for_graph and ubatch_slices is not None else ubatch_slices
+            ubatch_slices_padded if ubatch_slices is not None else None
         )
         ubatch_slices_forward = ubatch_slices_attn
 
