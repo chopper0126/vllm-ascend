@@ -44,11 +44,7 @@ class MtpProposer(EagleProposer):
             _,
         ) = self.runner._sync_metadata_across_dp(num_tokens, with_prefill)
         if not self.use_cuda_graph:
-            # there is synchronization between mtp steps when enabling aclgraph,
-            # disable aclgraph when use async scheduling to avoid the
-            # synchronization overhead.
-            # NOTE: we need to set aclgraph_runtime_mode to None in both dummy_run
-            # and _propose.
+            # Eager / non-graph path: keep aclgraph off for multi-step MTP.
             aclgraph_runtime_mode = CUDAGraphMode.NONE
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             if len(self.runner.attn_groups) > 0:
@@ -270,11 +266,7 @@ class MtpProposer(EagleProposer):
                 uniform_decode=uniform_decode,
                 has_lora=has_lora)
         if not self.use_cuda_graph:
-            # there is synchronization between mtp steps when enabling aclgraph,
-            # disable aclgraph when use async scheduling to avoid the
-            # synchronization overhead.
-            # NOTE: we need to set aclgraph_runtime_mode to None in both dummy_run
-            # and _propose.
+            # Eager / non-graph path: keep aclgraph off for multi-step MTP.
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = BatchDescriptor(num_tokens_unpadded)
 
