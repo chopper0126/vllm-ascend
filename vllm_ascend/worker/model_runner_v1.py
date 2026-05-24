@@ -524,7 +524,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, cudagraph_mode
 
-        if self._skip_all_reduce_across_dp_group():
+        if self._skip_all_reduce_across_dp_group() and self.afd_config is None:
             num_tokens_after_padding = torch.tensor([num_tokens] *
                                                     self.dp_size,
                                                     device="cpu",
@@ -814,16 +814,6 @@ class NPUModelRunner(GPUModelRunner):
             num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
         )
 
-        # AFD + DP (scheme 2): ``coordinate_batch_across_dp`` may agree on a
-        # padded token count above this rank's value after
-        # ``_sync_metadata_across_dp`` (e.g. DBO + skip-allreduce). Realign
-        # only when ``batch_descriptor`` disagrees so eager batches that already
-        # match are unchanged.
-        if (self.afd_config and self.parallel_config.data_parallel_size > 1
-                and int(batch_descriptor.num_tokens) != int(num_input_tokens)):
-            num_input_tokens = int(batch_descriptor.num_tokens)
-            maybe_padded_num_tokens = num_input_tokens
-
         logger.info(
             "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
             "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -846,8 +836,10 @@ class NPUModelRunner(GPUModelRunner):
             self.parallel_config.num_ubatches,
         )
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
-        ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+        ubatch_slices_attn = (
+            ubatch_slices_padded if ubatch_slices is not None else None
+        )
+        ubatch_slices_forward = ubatch_slices_attn
 
         self.is_ubatch = should_ubatch
 
@@ -863,24 +855,6 @@ class NPUModelRunner(GPUModelRunner):
                                 cu_num_tokens)
         self.positions.cpu[total_num_scheduled_tokens:num_input_tokens].zero_()
         self.positions.copy_to_gpu()
-        if num_input_tokens > total_num_scheduled_tokens:
-            pad_id = 0
-            try:
-                hf_cfg = (getattr(self.model_config, "hf_text_config", None)
-                          or getattr(self.model_config, "hf_config", None))
-                if hf_cfg is not None and getattr(hf_cfg, "pad_token_id",
-                                                  None) is not None:
-                    pad_id = int(hf_cfg.pad_token_id)
-            except Exception:
-                pad_id = 0
-            t0, t1 = total_num_scheduled_tokens, num_input_tokens
-            # Pad on NPU only: CPU slice fill + ``copy_to_gpu`` can issue
-            # host memcpy that Ascend rejects under graph capture (rtMemcpy
-            # 107030: capture mode does not support this operation).
-            self.input_ids.gpu[t0:t1].fill_(pad_id)
-            if self.enable_prompt_embeds:
-                self.inputs_embeds.gpu[t0:t1].zero_()
-                self.is_token_ids.gpu[t0:t1].zero_()
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
@@ -975,8 +949,6 @@ class NPUModelRunner(GPUModelRunner):
             # then the embedding layer is not included in the ACL graph.
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
-        if inputs_embeds is not None and num_input_tokens > total_num_scheduled_tokens:
-            inputs_embeds[total_num_scheduled_tokens:].zero_()
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
         elif self.uses_xdrope_dim > 0:
@@ -1069,9 +1041,6 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
         else:
             logger.debug(f"ubatch_slices is None")
-
-        # pad_attn = self.compilation_config.cudagraph_mode.value == CUDAGraphMode.FULL.value
-        # ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
         # Used in the below loop.
         self.spec_decode_common_attn_metadata = None
@@ -1282,14 +1251,15 @@ class NPUModelRunner(GPUModelRunner):
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
-        afd_metadata = self._build_afd_metadata(ubatch_slices_padded, maybe_padded_num_tokens)
+        afd_metadata = self._build_afd_metadata(
+            ubatch_slices_forward, maybe_padded_num_tokens)
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
                 input_ids, inputs_embeds, intermediate_tensors,
                 max_num_scheduled_tokens, synced_cudagraph_mode,
-                model_kwargs, afd_metadata, ubatch_slices_padded)
+                model_kwargs, afd_metadata, ubatch_slices_forward)
 
     # all-gather one hidden-states in sp scene
     @staticmethod
