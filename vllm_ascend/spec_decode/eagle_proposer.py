@@ -91,16 +91,14 @@ class EagleProposer(VllmEagleProposer):
         super().__init__(vllm_config, device, runner)
 
         self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
-        # there is synchronization between mtp steps when enabling aclgraph,
-        # disable aclgraph when use async scheduling to avoid the
-        # synchronization overhead.
-        # NOTE: we need to set aclgraph_runtime_mode to None in both dummy_run
-        # and _propose.
+        # Draft aclgraph is enabled when VLLM_COMPILE is on and eager is off.
+        # Multi-step speculative decode may still drop to NONE after the first
+        # step; when use_cuda_graph is False, dummy_run/_propose force
+        # aclgraph_runtime_mode to NONE.
         self.use_cuda_graph = (
             self.vllm_config.compilation_config.mode
             == CompilationMode.VLLM_COMPILE
             and not self.vllm_config.model_config.enforce_eager
-            and not self.use_async_scheduling
             and not self.vllm_config.speculative_config.enforce_eager)
 
         self.cudagraph_batch_sizes = list(

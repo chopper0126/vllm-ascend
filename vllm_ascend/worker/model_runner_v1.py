@@ -524,7 +524,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, cudagraph_mode
 
-        if self._skip_all_reduce_across_dp_group():
+        if self._skip_all_reduce_across_dp_group() and self.afd_config is None:
             num_tokens_after_padding = torch.tensor([num_tokens] *
                                                     self.dp_size,
                                                     device="cpu",
@@ -836,8 +836,10 @@ class NPUModelRunner(GPUModelRunner):
             self.parallel_config.num_ubatches,
         )
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
-        ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+        ubatch_slices_attn = (
+            ubatch_slices_padded if ubatch_slices is not None else None
+        )
+        ubatch_slices_forward = ubatch_slices_attn
 
         self.is_ubatch = should_ubatch
 
@@ -1039,9 +1041,6 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
         else:
             logger.debug(f"ubatch_slices is None")
-
-        # pad_attn = self.compilation_config.cudagraph_mode.value == CUDAGraphMode.FULL.value
-        # ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
         # Used in the below loop.
         self.spec_decode_common_attn_metadata = None
@@ -1252,14 +1251,15 @@ class NPUModelRunner(GPUModelRunner):
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
-        afd_metadata = self._build_afd_metadata(ubatch_slices_padded, maybe_padded_num_tokens)
+        afd_metadata = self._build_afd_metadata(
+            ubatch_slices_forward, maybe_padded_num_tokens)
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
                 input_ids, inputs_embeds, intermediate_tensors,
                 max_num_scheduled_tokens, synced_cudagraph_mode,
-                model_kwargs, afd_metadata, ubatch_slices_padded)
+                model_kwargs, afd_metadata, ubatch_slices_forward)
 
     # all-gather one hidden-states in sp scene
     @staticmethod

@@ -37,6 +37,7 @@ class AscendDeepseekV2MoE(DeepseekV2MoE, nn.Module):
         parallel_config: ParallelConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_mtp: bool = False,
     ):
         nn.Module.__init__(self)
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -58,7 +59,10 @@ class AscendDeepseekV2MoE(DeepseekV2MoE, nn.Module):
 
         vllm_config = get_current_vllm_config()
         self.afd_config = getattr(vllm_config, "afd_config", None)
-        if self.afd_config is None or not self.afd_config.compute_gate_on_attention:
+        # Match upstream DeepseekV2MoE: MTP draft runs gate inside the MoE module;
+        # main-model MoE can omit gate when AFD computes routing on the attention side.
+        if (self.afd_config is None or not self.afd_config.compute_gate_on_attention
+                or is_mtp):
             self.gate = ReplicatedLinear(
                 config.hidden_size,
                 config.n_routed_experts,
